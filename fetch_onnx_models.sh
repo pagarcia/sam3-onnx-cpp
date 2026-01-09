@@ -5,7 +5,16 @@ set -euo pipefail
 REPO_ID="onnx-community/sam3-tracker-ONNX"
 OUTDIR="checkpoints/sam3"
 
-VARIANT="${1:-fp32}"   # fp32 | fp16
+VARIANT="${1:-fp32}"   # fp32 | fp16 | clean
+
+if [[ "${VARIANT}" == "clean" ]]; then
+  echo "[INFO] Cleaning ${OUTDIR} ..."
+  rm -rf "${OUTDIR}"
+  echo "[OK] Cleaned."
+  exit 0
+fi
+
+mkdir -p "${OUTDIR}"
 
 ENC="onnx/vision_encoder.onnx"
 ENC_DATA="onnx/vision_encoder.onnx_data"
@@ -23,10 +32,8 @@ elif [[ "${VARIANT}" != "fp32" ]]; then
 fi
 
 echo "[INFO] Variant: ${VARIANT}"
-echo "[INFO] Cleaning old ${OUTDIR} ..."
-rm -rf "${OUTDIR}"
+echo "[INFO] Downloading to ${OUTDIR} ..."
 
-echo "[INFO] Downloading ONNX files to ${OUTDIR} ..."
 python -c "
 from huggingface_hub import hf_hub_download
 import os

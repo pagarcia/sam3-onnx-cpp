@@ -2,7 +2,6 @@
 #!/usr/bin/env python3
 import os
 
-# Limit BLAS thread pools early
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -16,6 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt5 import QtWidgets
+import onnxruntime as ort
 
 from onnx_test_utils import (
     print_system_info, set_cv2_threads,
@@ -47,34 +47,39 @@ def main():
         sys.exit("No image selected – exiting.")
     print(f"[INFO] Selected image: {img_path}")
 
-    REPO_ROOT = Path(__file__).resolve().parent.parent
-    onnx_dir = REPO_ROOT / "checkpoints" / "sam3" / "onnx"
+    repo_root = Path(__file__).resolve().parent.parent
+    onnx_dir = repo_root / "checkpoints" / "sam3" / "onnx"
 
-    # Determine which ONNX variant to use:
-    # - if SAM3_ONNX_VARIANT is set to fp16/fp32, honor it
-    # - else, if SAM3_ORT_ACCEL=cuda, prefer fp16
-    # - else, prefer fp32
-    variant = os.getenv("SAM3_ONNX_VARIANT", "").strip().lower()
-    if variant not in ("fp16", "fp32"):
+    av = ort.get_available_providers()
+    cuda_available = "CUDAExecutionProvider" in av
+
+    requested = os.getenv("SAM3_ONNX_VARIANT", "").strip().lower()
+    if requested not in ("fp16", "fp32"):
         accel = os.getenv("SAM3_ORT_ACCEL", "auto").strip().lower()
-        variant = "fp16" if accel == "cuda" else "fp32"
+        requested = "fp16" if (accel == "cuda" or (accel == "auto" and cuda_available)) else "fp32"
 
-    def pick_path(primary: Path, fallback: Path) -> Path:
+    def pick(primary: Path, fallback: Path) -> Path:
         return primary if primary.exists() else fallback
 
-    if variant == "fp16":
-        enc_path = pick_path(onnx_dir / "vision_encoder_fp16.onnx", onnx_dir / "vision_encoder.onnx")
-        dec_path = pick_path(onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx", onnx_dir / "prompt_encoder_mask_decoder.onnx")
+    if requested == "fp16":
+        enc_path = pick(onnx_dir / "vision_encoder_fp16.onnx", onnx_dir / "vision_encoder.onnx")
+        dec_path = pick(onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx", onnx_dir / "prompt_encoder_mask_decoder.onnx")
     else:
-        enc_path = pick_path(onnx_dir / "vision_encoder.onnx", onnx_dir / "vision_encoder_fp16.onnx")
-        dec_path = pick_path(onnx_dir / "prompt_encoder_mask_decoder.onnx", onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx")
+        enc_path = pick(onnx_dir / "vision_encoder.onnx", onnx_dir / "vision_encoder_fp16.onnx")
+        dec_path = pick(onnx_dir / "prompt_encoder_mask_decoder.onnx", onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx")
 
-    if not enc_path.exists():
-        sys.exit(f"ERROR: Missing encoder ONNX in {onnx_dir}")
-    if not dec_path.exists():
-        sys.exit(f"ERROR: Missing decoder ONNX in {onnx_dir}")
+    if not enc_path.exists() or not dec_path.exists():
+        sys.exit(
+            f"ERROR: Missing encoder/decoder ONNX in {onnx_dir}\n"
+            f"Tip: run .\\fetch_onnx_models.bat fp32 or fp16"
+        )
 
-    print(f"[INFO] Using ONNX variant: {variant}")
+    effective = "fp16" if "fp16" in enc_path.name.lower() else "fp32"
+    if effective != requested:
+        print(f"[WARN] Requested variant={requested} but using {effective} because of file availability.")
+
+    print(f"[INFO] ORT providers available: {av}")
+    print(f"[INFO] ONNX variant requested: {requested} | effective: {effective}")
     print(f"[INFO] Encoder ONNX: {enc_path.name}")
     print(f"[INFO] Decoder ONNX: {dec_path.name}")
 
@@ -85,17 +90,23 @@ def main():
     if img_bgr is None:
         sys.exit("ERROR: Could not read image.")
 
-    # Preprocess + encode
     pixel_values, info = preprocess_image_bgr(img_bgr, target_size=1008)
+
     t0 = time.time()
-    enc_out = run_encoder(sess_enc, pixel_values)
+    try:
+        enc_out = run_encoder(sess_enc, pixel_values)
+    except Exception as e:
+        msg = str(e)
+        if "no kernel image is available" in msg or "CUDNN_STATUS_EXECUTION_FAILED" in msg:
+            print("\n[HINT] This looks like a CUDA/cuDNN kernel support issue for your GPU.")
+            print("[HINT] If you have Pascal/Volta, use the README 'Stable stack (Pascal/Volta-friendly)'.\n")
+        raise
+
     print(f"[INFO] Encoder time: {(time.time()-t0)*1000:.1f} ms")
     print(f"[INFO] orig_hw={info.orig_hw} target={info.target_size} scale_x={info.scale_x:.6f} scale_y={info.scale_y:.6f}")
 
-    # Display base
     disp_base, disp_scale = compute_display_base(img_bgr, max_side=1200)
 
-    # Interactive state
     points: list[tuple[int, int]] = []
     labels: list[int] = []
     rect_start = rect_end = None
@@ -109,13 +120,7 @@ def main():
         in_pts, in_lbl = prepare_points(points, labels, info)
 
         t = time.time()
-        # Important: empty boxes so the model doesn't get a dummy [0,0,0,0] box
-        dec_out = run_decoder(
-            sess_dec, enc_out,
-            input_points=in_pts,
-            input_labels=in_lbl,
-            input_boxes=empty_boxes()
-        )
+        dec_out = run_decoder(sess_dec, enc_out, input_points=in_pts, input_labels=in_lbl, input_boxes=empty_boxes())
         dt = (time.time() - t) * 1000.0
 
         mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
@@ -127,8 +132,7 @@ def main():
             col = (0, 0, 255) if labels[i] == 1 else (255, 0, 0)
             cv2.circle(vis, (px, py), 6, col, -1)
 
-        vis_disp = cv2.resize(vis, (disp_base.shape[1], disp_base.shape[0]))
-        cv2.imshow("SAM3 ONNX Demo", vis_disp)
+        cv2.imshow("SAM3 ONNX Demo", cv2.resize(vis, (disp_base.shape[1], disp_base.shape[0])))
 
         iou_vec = dec_out["iou_scores"][0, 0]
         print(f"[INFO] Decoder time: {dt:.1f} ms | iou={iou_vec} | best={best_score:.3f} | points={len(points)}")
@@ -142,7 +146,6 @@ def main():
         x1d, y1d = rect_start
         x2d, y2d = rect_end
 
-        # Display coords -> original coords
         x1, y1 = int(x1d / disp_scale), int(y1d / disp_scale)
         x2, y2 = int(x2d / disp_scale), int(y2d / disp_scale)
 
@@ -150,12 +153,7 @@ def main():
         pts0, lbl0 = empty_points()
 
         t = time.time()
-        dec_out = run_decoder(
-            sess_dec, enc_out,
-            input_points=pts0,
-            input_labels=lbl0,
-            input_boxes=boxes
-        )
+        dec_out = run_decoder(sess_dec, enc_out, input_points=pts0, input_labels=lbl0, input_boxes=boxes)
         dt = (time.time() - t) * 1000.0
 
         mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
@@ -173,25 +171,20 @@ def main():
         nonlocal rect_start, rect_end, drawing
 
         if not mode_bbox:
-            # seed points mode
             if event == cv2.EVENT_MBUTTONDOWN:
                 points.clear()
                 labels.clear()
                 cv2.imshow("SAM3 ONNX Demo", disp_base)
-
             elif event == cv2.EVENT_LBUTTONDOWN:
                 points.append((int(x / disp_scale), int(y / disp_scale)))
                 labels.append(1)
                 run_with_points()
-
             elif event == cv2.EVENT_RBUTTONDOWN:
                 points.append((int(x / disp_scale), int(y / disp_scale)))
                 labels.append(0)
                 run_with_points()
-
             return
 
-        # bbox mode
         if event in (cv2.EVENT_RBUTTONDOWN, cv2.EVENT_LBUTTONDBLCLK):
             rect_start = rect_end = None
             cv2.imshow("SAM3 ONNX Demo", disp_base)
@@ -201,13 +194,11 @@ def main():
             drawing = True
             rect_start = rect_end = (x, y)
             cv2.imshow("SAM3 ONNX Demo", disp_base)
-
         elif event == cv2.EVENT_MOUSEMOVE and drawing:
             rect_end = (x, y)
             vis = disp_base.copy()
             cv2.rectangle(vis, rect_start, rect_end, (0, 255, 255), 2)
             cv2.imshow("SAM3 ONNX Demo", vis)
-
         elif event == cv2.EVENT_LBUTTONUP and drawing:
             drawing = False
             rect_end = (x, y)

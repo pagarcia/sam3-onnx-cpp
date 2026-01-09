@@ -8,7 +8,7 @@ import onnxruntime as ort
 def dump(path: Path):
     print("\n===", path.name, "===")
     sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    print("Providers:", sess.get_providers())
+    print("Providers (forced):", sess.get_providers())
     print("Inputs:")
     for i in sess.get_inputs():
         print(" -", i.name, i.type, i.shape)
@@ -21,34 +21,36 @@ def main():
     root = Path(__file__).resolve().parent.parent
     onnx_dir = root / "checkpoints" / "sam3" / "onnx"
 
-    variant = os.getenv("SAM3_ONNX_VARIANT", "").strip().lower()
-    if variant not in ("fp16", "fp32"):
-        variant = "fp32"
+    av = ort.get_available_providers()
+    cuda_available = "CUDAExecutionProvider" in av
 
-    # Pick requested variant, but fall back if not present
-    if variant == "fp16":
-        enc = onnx_dir / "vision_encoder_fp16.onnx"
-        dec = onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx"
-        if not enc.exists():
-            enc = onnx_dir / "vision_encoder.onnx"
-        if not dec.exists():
-            dec = onnx_dir / "prompt_encoder_mask_decoder.onnx"
+    requested = os.getenv("SAM3_ONNX_VARIANT", "").strip().lower()
+    if requested not in ("fp16", "fp32"):
+        accel = os.getenv("SAM3_ORT_ACCEL", "auto").strip().lower()
+        requested = "fp16" if (accel == "cuda" or (accel == "auto" and cuda_available)) else "fp32"
+
+    def pick(primary: Path, fallback: Path) -> Path:
+        return primary if primary.exists() else fallback
+
+    if requested == "fp16":
+        enc = pick(onnx_dir / "vision_encoder_fp16.onnx", onnx_dir / "vision_encoder.onnx")
+        dec = pick(onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx", onnx_dir / "prompt_encoder_mask_decoder.onnx")
     else:
-        enc = onnx_dir / "vision_encoder.onnx"
-        dec = onnx_dir / "prompt_encoder_mask_decoder.onnx"
-        if not enc.exists():
-            enc = onnx_dir / "vision_encoder_fp16.onnx"
-        if not dec.exists():
-            dec = onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx"
+        enc = pick(onnx_dir / "vision_encoder.onnx", onnx_dir / "vision_encoder_fp16.onnx")
+        dec = pick(onnx_dir / "prompt_encoder_mask_decoder.onnx", onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx")
 
     if not enc.exists() or not dec.exists():
         raise FileNotFoundError(
             f"Could not find encoder/decoder ONNX in: {onnx_dir}\n"
-            f"Expected (fp32): vision_encoder.onnx + prompt_encoder_mask_decoder.onnx\n"
-            f"or (fp16): vision_encoder_fp16.onnx + prompt_encoder_mask_decoder_fp16.onnx"
+            f"Tip: run .\\fetch_onnx_models.bat fp32 or fp16"
         )
 
-    print(f"[INFO] SAM3_ONNX_VARIANT={os.getenv('SAM3_ONNX_VARIANT','')!r} (effective: {variant})")
+    effective = "fp16" if "fp16" in enc.name.lower() else "fp32"
+    print(f"[INFO] ORT providers available: {av}")
+    print(f"[INFO] Requested variant: {requested} | Effective: {effective}")
+    print(f"[INFO] Encoder: {enc.name}")
+    print(f"[INFO] Decoder: {dec.name}")
+
     dump(enc)
     dump(dec)
 

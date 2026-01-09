@@ -5,9 +5,19 @@ setlocal EnableExtensions
 set "REPO_ID=onnx-community/sam3-tracker-ONNX"
 set "OUTDIR=checkpoints\sam3"
 
-REM Optional arg: fp32 (default) | fp16
+REM Optional arg: fp32 (default) | fp16 | clean
 set "VARIANT=%~1"
 if "%VARIANT%"=="" set "VARIANT=fp32"
+
+if /I "%VARIANT%"=="clean" (
+  echo [INFO] Cleaning "%OUTDIR%" ...
+  if exist "%OUTDIR%" rmdir /s /q "%OUTDIR%"
+  echo [OK] Cleaned.
+  pause
+  exit /b 0
+)
+
+if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
 set "ENC=onnx/vision_encoder.onnx"
 set "ENC_DATA=onnx/vision_encoder.onnx_data"
@@ -27,11 +37,9 @@ if /I "%VARIANT%"=="fp16" (
 )
 
 echo [INFO] Variant: %VARIANT%
-echo [INFO] Cleaning old "%OUTDIR%" ...
-if exist "%OUTDIR%" rmdir /s /q "%OUTDIR%"
+echo [INFO] Downloading to "%OUTDIR%" ...
 
-echo [INFO] Downloading ONNX files to "%OUTDIR%" ...
-python -c "from huggingface_hub import hf_hub_download; import os; repo=r'%REPO_ID%'; out=r'%OUTDIR%'; files=[r'%ENC%', r'%ENC_DATA%', r'%DEC%', r'%DEC_DATA%']; os.makedirs(out, exist_ok=True); [hf_hub_download(repo_id=repo, filename=f, local_dir=out) for f in files]; print('[OK] Downloaded:\\n  ' + '\\n  '.join(files))"
+python -c "from huggingface_hub import hf_hub_download; import os; repo=r'%REPO_ID%'; out=r'%OUTDIR%'; files=[r'%ENC%', r'%ENC_DATA%', r'%DEC%', r'%DEC_DATA%']; os.makedirs(out, exist_ok=True); [hf_hub_download(repo_id=repo, filename=f, local_dir=out) for f in files]; print('[OK] Downloaded:\n  ' + '\n  '.join(files))"
 
 if errorlevel 1 (
   echo [ERROR] Download failed. Make sure the venv is activated and huggingface_hub is installed.
