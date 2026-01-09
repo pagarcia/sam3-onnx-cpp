@@ -10,15 +10,15 @@ This repository provides a C++ wrapper for SAM3 **Promptable Visual Segmentation
   - **Seed points** (positive/negative clicks)
   - **Bounding boxes**
 - Uses the ONNX split:
-  - `vision_encoder.onnx` (+ `.onnx_data`)
-  - `prompt_encoder_mask_decoder.onnx` (+ `.onnx_data`)
+  - `vision_encoder*.onnx` (+ `.onnx_data`)
+  - `prompt_encoder_mask_decoder*.onnx` (+ `.onnx_data`)
 
 We start from the **pre-exported ONNX models** published as:
 - `onnx-community/sam3-tracker-ONNX`
 
-> Note on resolution:
-> The tracker config is built around **image_size=1008** (72×72 tokens with patch size 14).
-> In practice: you should resize input images to 1008×1008 for best results.
+> Note on resolution / preprocessing:
+> This ONNX export expects `pixel_values` resized directly to **1008×1008** (no padding).
+> Point/box coordinates are scaled with **scale_x** and **scale_y** accordingly.
 
 ---
 
@@ -34,36 +34,47 @@ python -m venv sam3_env
 
 ### 2) Install Dependencies
 
-#### 2.1 CPU-only
+#### 2.1 CPU-only (default)
 
 ```bash
 pip install onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
 ```
 
-#### 2.2 NVIDIA GPU (optional)
+#### 2.2 NVIDIA GPU (recommended) — CUDA/cuDNN via pip
 
+This installs ONNX Runtime GPU plus CUDA + cuDNN runtime DLLs (no full CUDA toolkit required):
+
+```bash
+pip uninstall -y onnxruntime
+pip install onnx "onnxruntime-gpu[cuda,cudnn]" huggingface_hub pillow opencv-python pyqt5 numpy
 ```
-pip install onnx onnxruntime-gpu huggingface_hub pillow opencv-python pyqt5 numpy
+
+Verify CUDA provider shows up:
+
+```bash
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
 ```
 
-### 3) Download the Pre-exported ONNX Models
+You want to see `CUDAExecutionProvider` in the list.
 
-Run:
+### 3) Download the ONNX Models
+
+#### 3.1 CPU weights (FP32, bigger download)
 
 ```bash
 .\fetch_onnx_models.bat
 ```
 
-This downloads:
+#### 3.2 GPU-friendly weights (FP16, recommended for CUDA)
 
-* `checkpoints/sam3/onnx/vision_encoder.onnx`
-* `checkpoints/sam3/onnx/vision_encoder.onnx_data`
-* `checkpoints/sam3/onnx/prompt_encoder_mask_decoder.onnx`
-* `checkpoints/sam3/onnx/prompt_encoder_mask_decoder.onnx_data`
+```bash
+.\fetch_onnx_models.bat fp16
+```
+
+This downloads into:
+`checkpoints/sam3/onnx/`
 
 ### 4) Sanity-check ONNX model I/O
-
-Run:
 
 ```bash
 python python\inspect_onnx_io.py
@@ -71,14 +82,9 @@ python python\inspect_onnx_io.py
 
 Expected highlights:
 
-* `vision_encoder.onnx` input: `pixel_values` `[B,3,1008,1008]`
-* `prompt_encoder_mask_decoder.onnx` inputs include:
-
-  * `input_points`, `input_labels`, `input_boxes`
-  * `image_embeddings.0/.1/.2`
-* outputs include:
-
-  * `iou_scores`, `pred_masks`, `object_score_logits`
+* Encoder input: `pixel_values` `[B,3,1008,1008]`
+* Decoder inputs: `input_points`, `input_labels`, `input_boxes`, plus `image_embeddings.0/.1/.2`
+* Outputs: `iou_scores`, `pred_masks`, `object_score_logits`
 
 ### 5) Run Python Image Demo
 
@@ -102,10 +108,17 @@ Optional:
 python python\onnx_test_image.py --prompt seed_points --safe
 ```
 
-* Force CUDA (if you installed onnxruntime-gpu):
+* Force CUDA:
 
 ```bash
 $env:SAM3_ORT_ACCEL="cuda"
+python python\onnx_test_image.py --prompt seed_points
+```
+
+* Force a specific model variant:
+
+```bash
+$env:SAM3_ONNX_VARIANT="fp16"   # fp16 | fp32
 python python\onnx_test_image.py --prompt seed_points
 ```
 
@@ -126,11 +139,19 @@ source sam3_env/bin/activate
 pip install onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
 ```
 
-### 3) Download the Pre-exported ONNX Models
+### 3) Download the ONNX Models
+
+CPU (FP32):
 
 ```bash
 chmod +x fetch_onnx_models.sh
 ./fetch_onnx_models.sh
+```
+
+GPU-friendly (FP16) (useful on platforms that support CUDA EP):
+
+```bash
+./fetch_onnx_models.sh fp16
 ```
 
 ### 4) Sanity-check ONNX model I/O
@@ -144,13 +165,6 @@ python python/inspect_onnx_io.py
 ```bash
 python python/onnx_test_image.py --prompt seed_points
 python python/onnx_test_image.py --prompt bounding_box
-```
-
-Optional (CUDA on platforms that support it):
-
-```bash
-export SAM3_ORT_ACCEL=cuda
-python python/onnx_test_image.py --prompt seed_points
 ```
 
 ---

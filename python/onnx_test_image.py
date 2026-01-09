@@ -49,12 +49,34 @@ def main():
 
     REPO_ROOT = Path(__file__).resolve().parent.parent
     onnx_dir = REPO_ROOT / "checkpoints" / "sam3" / "onnx"
-    enc_path = onnx_dir / "vision_encoder.onnx"
-    dec_path = onnx_dir / "prompt_encoder_mask_decoder.onnx"
+
+    # Determine which ONNX variant to use:
+    # - if SAM3_ONNX_VARIANT is set to fp16/fp32, honor it
+    # - else, if SAM3_ORT_ACCEL=cuda, prefer fp16
+    # - else, prefer fp32
+    variant = os.getenv("SAM3_ONNX_VARIANT", "").strip().lower()
+    if variant not in ("fp16", "fp32"):
+        accel = os.getenv("SAM3_ORT_ACCEL", "auto").strip().lower()
+        variant = "fp16" if accel == "cuda" else "fp32"
+
+    def pick_path(primary: Path, fallback: Path) -> Path:
+        return primary if primary.exists() else fallback
+
+    if variant == "fp16":
+        enc_path = pick_path(onnx_dir / "vision_encoder_fp16.onnx", onnx_dir / "vision_encoder.onnx")
+        dec_path = pick_path(onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx", onnx_dir / "prompt_encoder_mask_decoder.onnx")
+    else:
+        enc_path = pick_path(onnx_dir / "vision_encoder.onnx", onnx_dir / "vision_encoder_fp16.onnx")
+        dec_path = pick_path(onnx_dir / "prompt_encoder_mask_decoder.onnx", onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx")
+
     if not enc_path.exists():
-        sys.exit(f"ERROR: Missing {enc_path}")
+        sys.exit(f"ERROR: Missing encoder ONNX in {onnx_dir}")
     if not dec_path.exists():
-        sys.exit(f"ERROR: Missing {dec_path}")
+        sys.exit(f"ERROR: Missing decoder ONNX in {onnx_dir}")
+
+    print(f"[INFO] Using ONNX variant: {variant}")
+    print(f"[INFO] Encoder ONNX: {enc_path.name}")
+    print(f"[INFO] Decoder ONNX: {dec_path.name}")
 
     sess_enc = make_session(str(enc_path), tag="vision_encoder", safe=args.safe)
     sess_dec = make_session(str(dec_path), tag="prompt_encoder_mask_decoder", safe=args.safe)
@@ -88,12 +110,13 @@ def main():
 
         t = time.time()
         # Important: empty boxes so the model doesn't get a dummy [0,0,0,0] box
-        dec_out = run_decoder(sess_dec, enc_out, input_points=in_pts, input_labels=in_lbl, input_boxes=empty_boxes())
+        dec_out = run_decoder(
+            sess_dec, enc_out,
+            input_points=in_pts,
+            input_labels=in_lbl,
+            input_boxes=empty_boxes()
+        )
         dt = (time.time() - t) * 1000.0
-
-        if "pred_masks" not in dec_out or "iou_scores" not in dec_out:
-            print("[ERROR] Decoder outputs missing 'pred_masks' or 'iou_scores'. Got:", list(dec_out.keys()))
-            return
 
         mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
         mask255 = postprocess_mask_to_original(mask2d, info)
@@ -107,7 +130,6 @@ def main():
         vis_disp = cv2.resize(vis, (disp_base.shape[1], disp_base.shape[0]))
         cv2.imshow("SAM3 ONNX Demo", vis_disp)
 
-        # show full iou vector (usually 3 values)
         iou_vec = dec_out["iou_scores"][0, 0]
         print(f"[INFO] Decoder time: {dt:.1f} ms | iou={iou_vec} | best={best_score:.3f} | points={len(points)}")
 
@@ -128,7 +150,12 @@ def main():
         pts0, lbl0 = empty_points()
 
         t = time.time()
-        dec_out = run_decoder(sess_dec, enc_out, input_points=pts0, input_labels=lbl0, input_boxes=boxes)
+        dec_out = run_decoder(
+            sess_dec, enc_out,
+            input_points=pts0,
+            input_labels=lbl0,
+            input_boxes=boxes
+        )
         dt = (time.time() - t) * 1000.0
 
         mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
@@ -199,6 +226,7 @@ def main():
             break
 
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

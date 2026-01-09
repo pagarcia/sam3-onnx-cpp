@@ -39,6 +39,14 @@ from onnxruntime import InferenceSession
 
 ACCEL = os.getenv("SAM3_ORT_ACCEL", "auto").lower()  # auto|cpu|cuda
 
+# If onnxruntime-gpu is installed and CUDA EP is available, try preloading DLLs.
+# This helps when CUDA/cuDNN are provided via pip packages or PyTorch.
+try:
+    if hasattr(ort, "preload_dlls") and "CUDAExecutionProvider" in ort.get_available_providers():
+        ort.preload_dlls()
+except Exception:
+    pass
+
 # Normalize like the HF config for this ONNX export: mean=0.5 std=0.5 after rescale 1/255
 _MEAN = np.array([0.5, 0.5, 0.5], np.float32)
 _STD  = np.array([0.5, 0.5, 0.5], np.float32)
@@ -90,19 +98,23 @@ def make_session(path: str, tag: str = "model", safe: bool = False) -> Inference
     av = ort.get_available_providers()
     providers = ["CPUExecutionProvider"]
 
-    if ACCEL == "cuda":
+    if ACCEL == "cpu":
+        providers = ["CPUExecutionProvider"]
+    elif ACCEL == "cuda":
         if "CUDAExecutionProvider" in av:
             providers = _cuda_providers()
-    elif ACCEL == "auto":
+        else:
+            providers = ["CPUExecutionProvider"]
+    else:  # auto
         if "CUDAExecutionProvider" in av:
             providers = _cuda_providers()
+        else:
+            providers = ["CPUExecutionProvider"]
 
     path = str(Path(path).resolve())
     print(f"[INFO] Loading {os.path.basename(path)} [{tag}] providers={providers}")
     sess = InferenceSession(path, sess_options=so, providers=list(providers))
     print("[INFO] Active providers:", sess.get_providers())
-    print("[INFO] Inputs :", [(i.name, i.shape, i.type) for i in sess.get_inputs()])
-    print("[INFO] Outputs:", [(o.name, o.shape, o.type) for o in sess.get_outputs()])
     return sess
 
 
@@ -278,7 +290,7 @@ def pick_best_mask(pred_masks: np.ndarray, iou_scores: np.ndarray, which_prompt:
     We pick the best mask for batch=0 and prompt index `which_prompt`.
     """
     m = pred_masks[0, which_prompt]  # [M,H,W]
-    s = iou_scores[0, which_prompt]  # [M] or [3]
+    s = iou_scores[0, which_prompt]  # [3]
     best = int(np.argmax(s))
     return m[best], float(s[best])
 
