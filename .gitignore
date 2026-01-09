@@ -6,8 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
-# Environments
+# Environments and checkpoints
 sam3_env/
+checkpoints/
 
 # Distribution / packaging
 .Python
