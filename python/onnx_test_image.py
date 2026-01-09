@@ -1,8 +1,8 @@
 # sam3-onnx-cpp/python/onnx_test_image.py
 #!/usr/bin/env python3
-
 import os
-# Limit thread pools early
+
+# Limit BLAS thread pools early
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -21,7 +21,8 @@ from onnx_test_utils import (
     print_system_info, set_cv2_threads,
     make_session,
     preprocess_image_bgr,
-    prepare_points, prepare_box_as_points,
+    prepare_points, prepare_boxes,
+    empty_points, empty_boxes,
     run_encoder, run_decoder,
     pick_best_mask, postprocess_mask_to_original,
     compute_display_base, green_overlay,
@@ -48,7 +49,6 @@ def main():
 
     REPO_ROOT = Path(__file__).resolve().parent.parent
     onnx_dir = REPO_ROOT / "checkpoints" / "sam3" / "onnx"
-
     enc_path = onnx_dir / "vision_encoder.onnx"
     dec_path = onnx_dir / "prompt_encoder_mask_decoder.onnx"
     if not enc_path.exists():
@@ -62,14 +62,13 @@ def main():
     img_bgr = cv2.imread(img_path)
     if img_bgr is None:
         sys.exit("ERROR: Could not read image.")
-    H_org, W_org = img_bgr.shape[:2]
 
     # Preprocess + encode
     pixel_values, info = preprocess_image_bgr(img_bgr, target_size=1008)
     t0 = time.time()
     enc_out = run_encoder(sess_enc, pixel_values)
     print(f"[INFO] Encoder time: {(time.time()-t0)*1000:.1f} ms")
-    print(f"[INFO] orig_hw={info.orig_hw} resized_hw={info.resized_hw} target={info.target_size} scale={info.scale:.5f}")
+    print(f"[INFO] orig_hw={info.orig_hw} target={info.target_size} scale_x={info.scale_x:.6f} scale_y={info.scale_y:.6f}")
 
     # Display base
     disp_base, disp_scale = compute_display_base(img_bgr, max_side=1200)
@@ -88,15 +87,15 @@ def main():
         in_pts, in_lbl = prepare_points(points, labels, info)
 
         t = time.time()
-        dec_out = run_decoder(sess_dec, enc_out, in_pts, in_lbl)
+        # Important: empty boxes so the model doesn't get a dummy [0,0,0,0] box
+        dec_out = run_decoder(sess_dec, enc_out, input_points=in_pts, input_labels=in_lbl, input_boxes=empty_boxes())
         dt = (time.time() - t) * 1000.0
 
-        # Expect outputs include pred_masks + iou_scores
         if "pred_masks" not in dec_out or "iou_scores" not in dec_out:
             print("[ERROR] Decoder outputs missing 'pred_masks' or 'iou_scores'. Got:", list(dec_out.keys()))
             return
 
-        mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"])
+        mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
         mask255 = postprocess_mask_to_original(mask2d, info)
         overlay = green_overlay(img_bgr, mask255, alpha=0.5)
 
@@ -108,7 +107,9 @@ def main():
         vis_disp = cv2.resize(vis, (disp_base.shape[1], disp_base.shape[0]))
         cv2.imshow("SAM3 ONNX Demo", vis_disp)
 
-        print(f"[INFO] Decoder time: {dt:.1f} ms | best_score={best_score:.3f} | points={len(points)}")
+        # show full iou vector (usually 3 values)
+        iou_vec = dec_out["iou_scores"][0, 0]
+        print(f"[INFO] Decoder time: {dt:.1f} ms | iou={iou_vec} | best={best_score:.3f} | points={len(points)}")
 
     def run_with_box():
         nonlocal rect_start, rect_end
@@ -123,17 +124,14 @@ def main():
         x1, y1 = int(x1d / disp_scale), int(y1d / disp_scale)
         x2, y2 = int(x2d / disp_scale), int(y2d / disp_scale)
 
-        in_pts, in_lbl = prepare_box_as_points((x1, y1, x2, y2), info)
+        boxes = prepare_boxes((x1, y1, x2, y2), info)
+        pts0, lbl0 = empty_points()
 
         t = time.time()
-        dec_out = run_decoder(sess_dec, enc_out, in_pts, in_lbl)
+        dec_out = run_decoder(sess_dec, enc_out, input_points=pts0, input_labels=lbl0, input_boxes=boxes)
         dt = (time.time() - t) * 1000.0
 
-        if "pred_masks" not in dec_out or "iou_scores" not in dec_out:
-            print("[ERROR] Decoder outputs missing 'pred_masks' or 'iou_scores'. Got:", list(dec_out.keys()))
-            return
-
-        mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"])
+        mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
         mask255 = postprocess_mask_to_original(mask2d, info)
         overlay = green_overlay(img_bgr, mask255, alpha=0.5)
 
@@ -141,7 +139,8 @@ def main():
         cv2.rectangle(disp, rect_start, rect_end, (0, 255, 255), 2)
         cv2.imshow("SAM3 ONNX Demo", disp)
 
-        print(f"[INFO] Decoder time: {dt:.1f} ms | best_score={best_score:.3f}")
+        iou_vec = dec_out["iou_scores"][0, 0]
+        print(f"[INFO] Decoder time: {dt:.1f} ms | iou={iou_vec} | best={best_score:.3f}")
 
     def mouse_cb(event, x, y, flags, param):
         nonlocal rect_start, rect_end, drawing
@@ -152,14 +151,17 @@ def main():
                 points.clear()
                 labels.clear()
                 cv2.imshow("SAM3 ONNX Demo", disp_base)
+
             elif event == cv2.EVENT_LBUTTONDOWN:
                 points.append((int(x / disp_scale), int(y / disp_scale)))
                 labels.append(1)
                 run_with_points()
+
             elif event == cv2.EVENT_RBUTTONDOWN:
                 points.append((int(x / disp_scale), int(y / disp_scale)))
                 labels.append(0)
                 run_with_points()
+
             return
 
         # bbox mode
@@ -187,13 +189,15 @@ def main():
     cv2.namedWindow("SAM3 ONNX Demo", cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback("SAM3 ONNX Demo", mouse_cb)
     cv2.imshow("SAM3 ONNX Demo", disp_base)
+
     print("[INFO] Interactive mode ready. ESC to quit.")
     print("[INFO] seed_points: left=pos, right=neg, middle=clear")
-    print("[INFO] bounding_box: drag LMB to draw, RMB to clear")
+    print("[INFO] bounding_box: drag LMB to draw, RMB or double-click to clear")
 
     while True:
         if cv2.waitKey(20) & 0xFF == 27:
             break
+
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":

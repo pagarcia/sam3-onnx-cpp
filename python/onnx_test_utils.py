@@ -2,14 +2,23 @@
 """
 Utilities for SAM3-Tracker ONNX (image-only) testing.
 
-We use a SAM-style preprocessing:
-- Resize longest side to target_size=1008 (preserve aspect ratio)
-- Pad to 1008x1008 (top-left anchored)
-- RGB, rescale 1/255, normalize mean/std=0.5  => roughly [-1, 1]
+This repo uses the ONNX split from:
+  onnx-community/sam3-tracker-ONNX
 
-Prompts:
-- Points: labels 1 (pos), 0 (neg)
-- Box: encoded as two points with labels 2 and 3 (top-left, bottom-right)
+Important behavior for THIS ONNX:
+- The encoder expects pixel_values shaped [B, 3, 1008, 1008]
+- The preprocessor config for this export resizes directly to 1008x1008
+  (no aspect-ratio padding).
+- The decoder takes three prompt inputs:
+    input_points: [B, 1, N, 2]
+    input_labels: [B, 1, N]   (int64)
+    input_boxes : [B, M, 4]
+  and the image_embeddings.{0,1,2} from the encoder.
+
+Very important:
+- In seed-point mode, you MUST pass input_boxes as an EMPTY tensor [B,0,4]
+  to avoid a dummy box affecting results.
+- In bbox mode, you MUST pass points as EMPTY tensors [B,1,0,2] and [B,1,0].
 
 Env toggles:
   SAM3_ORT_ACCEL = auto | cpu | cuda   (default: auto)
@@ -28,17 +37,15 @@ import numpy as np
 import onnxruntime as ort
 from onnxruntime import InferenceSession
 
-# Make pip-provided CUDA/cuDNN/TensorRT DLLs discoverable for this process (Windows)
-try:
-    ort.preload_dlls()
-except Exception:
-    pass
-
 ACCEL = os.getenv("SAM3_ORT_ACCEL", "auto").lower()  # auto|cpu|cuda
+
+# Normalize like the HF config for this ONNX export: mean=0.5 std=0.5 after rescale 1/255
+_MEAN = np.array([0.5, 0.5, 0.5], np.float32)
+_STD  = np.array([0.5, 0.5, 0.5], np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Session helpers
+# Info / sessions
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_system_info() -> None:
@@ -69,7 +76,7 @@ def _cuda_providers(device_id: int = 0):
 def make_session(path: str, tag: str = "model", safe: bool = False) -> InferenceSession:
     """
     safe=False: ORT_ENABLE_EXTENDED
-    safe=True : ORT_DISABLE_ALL (more conservative; useful if some optimizations misbehave)
+    safe=True : ORT_DISABLE_ALL (more conservative)
     """
     so = ort.SessionOptions()
     so.graph_optimization_level = (
@@ -104,103 +111,7 @@ def as_f32c(a: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(a)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Preprocessing (resize longest side + pad) to 1008
-# ──────────────────────────────────────────────────────────────────────────────
-
-_MEAN = np.array([0.5, 0.5, 0.5], np.float32)
-_STD  = np.array([0.5, 0.5, 0.5], np.float32)
-
-@dataclass(frozen=True)
-class PrepInfo:
-    orig_hw: Tuple[int, int]       # (H, W) original
-    resized_hw: Tuple[int, int]    # (H, W) after resize (before pad)
-    target_size: int               # 1008
-    scale: float                   # target_size / max(orig_h, orig_w)
-
-
-def preprocess_image_bgr(img_bgr: np.ndarray, target_size: int = 1008) -> Tuple[np.ndarray, PrepInfo]:
-    """
-    Returns:
-      pixel_values: float32 [1,3,target_size,target_size]
-      info: sizes + scale
-    """
-    H, W = img_bgr.shape[:2]
-    scale = float(target_size) / float(max(H, W))
-    new_h = int(round(H * scale))
-    new_w = int(round(W * scale))
-
-    img_resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-    # RGB -> float, rescale, normalize
-    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB).astype(np.float32) * (1.0 / 255.0)
-    img_rgb = (img_rgb - _MEAN) / _STD
-
-    # Pad to square (top-left anchored)
-    padded = np.zeros((target_size, target_size, 3), dtype=np.float32)
-    padded[:new_h, :new_w, :] = img_rgb
-
-    # NHWC -> NCHW
-    pixel_values = np.transpose(padded, (2, 0, 1))[None, ...]
-
-    info = PrepInfo(
-        orig_hw=(H, W),
-        resized_hw=(new_h, new_w),
-        target_size=target_size,
-        scale=scale,
-    )
-    return as_f32c(pixel_values), info
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Prompt prep (original image coords -> resized/padded coords)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def prepare_points(points_xy: Iterable[Tuple[int, int]],
-                   labels: Iterable[int],
-                   info: PrepInfo) -> Tuple[np.ndarray, np.ndarray]:
-    pts = np.asarray(list(points_xy), dtype=np.float32)
-    lbl = np.asarray(list(labels), dtype=np.int64)
-
-    if pts.size == 0:
-        pts = np.zeros((0, 2), np.float32)
-        lbl = np.zeros((0,), np.int64)
-
-    # scale from original to resized
-    pts[:, 0] = pts[:, 0] * info.scale
-    pts[:, 1] = pts[:, 1] * info.scale
-
-    # shape to [1,1,N,2] and [1,1,N]
-    pts = pts[None, None, :, :]
-    lbl = lbl[None, None, :]
-
-    return np.ascontiguousarray(pts), np.ascontiguousarray(lbl)
-
-
-def prepare_box_as_points(rect_xyxy: Tuple[int, int, int, int],
-                          info: PrepInfo) -> Tuple[np.ndarray, np.ndarray]:
-    x1, y1, x2, y2 = rect_xyxy
-    x1, x2 = sorted((x1, x2))
-    y1, y2 = sorted((y1, y2))
-
-    pts = [(x1, y1), (x2, y2)]
-    lbl = [2, 3]  # top-left, bottom-right
-    return prepare_points(pts, lbl, info)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Inference runners
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_encoder(sess_enc: InferenceSession, pixel_values: np.ndarray) -> Dict[str, np.ndarray]:
-    inp0 = sess_enc.get_inputs()[0].name
-    outs = sess_enc.run(None, {inp0: as_f32c(pixel_values)})
-    out_names = [o.name for o in sess_enc.get_outputs()]
-    return dict(zip(out_names, outs))
-
-
 def _dtype_from_ort(ort_type: str):
-    # Common ORT type strings: 'tensor(float)', 'tensor(float16)', 'tensor(int64)', ...
     if "float16" in ort_type:
         return np.float16
     if "float" in ort_type:
@@ -214,57 +125,141 @@ def _dtype_from_ort(ort_type: str):
     return np.float32
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Preprocessing (direct resize to 1008x1008)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PrepInfo:
+    orig_hw: Tuple[int, int]   # (H, W) original
+    target_size: int           # 1008
+    scale_x: float             # target_size / W
+    scale_y: float             # target_size / H
+
+
+def preprocess_image_bgr(img_bgr: np.ndarray, target_size: int = 1008) -> Tuple[np.ndarray, PrepInfo]:
+    """
+    Preprocess for this ONNX export:
+      - resize directly to (1008,1008)
+      - RGB
+      - rescale 1/255
+      - normalize mean/std 0.5
+    Returns:
+      pixel_values: float32 [1,3,1008,1008]
+      info: orig size + per-axis scales for prompt coordinates
+    """
+    H, W = img_bgr.shape[:2]
+    scale_x = float(target_size) / float(W)
+    scale_y = float(target_size) / float(H)
+
+    img_resized = cv2.resize(img_bgr, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB).astype(np.float32) * (1.0 / 255.0)
+    img_rgb = (img_rgb - _MEAN) / _STD
+
+    pixel_values = np.transpose(img_rgb, (2, 0, 1))[None, ...]  # [1,3,H,W]
+    info = PrepInfo(orig_hw=(H, W), target_size=target_size, scale_x=scale_x, scale_y=scale_y)
+    return as_f32c(pixel_values), info
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Prompt prep
+# ──────────────────────────────────────────────────────────────────────────────
+
+def empty_points() -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.zeros((1, 1, 0, 2), dtype=np.float32)
+    lbl = np.zeros((1, 1, 0), dtype=np.int64)
+    return pts, lbl
+
+
+def empty_boxes() -> np.ndarray:
+    return np.zeros((1, 0, 4), dtype=np.float32)
+
+
+def prepare_points(points_xy: Iterable[Tuple[int, int]],
+                   labels: Iterable[int],
+                   info: PrepInfo) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(list(points_xy), dtype=np.float32)
+    lbl = np.asarray(list(labels), dtype=np.int64)
+
+    if pts.size == 0:
+        return empty_points()
+
+    # Scale to 1008x1008 coordinates
+    pts[:, 0] = pts[:, 0] * info.scale_x
+    pts[:, 1] = pts[:, 1] * info.scale_y
+
+    # [B, 1, N, 2] and [B, 1, N]
+    pts = pts[None, None, :, :]
+    lbl = lbl[None, None, :]
+    return np.ascontiguousarray(pts), np.ascontiguousarray(lbl)
+
+
+def prepare_boxes(rect_xyxy: Tuple[int, int, int, int], info: PrepInfo) -> np.ndarray:
+    x1, y1, x2, y2 = rect_xyxy
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+
+    box = np.array([[
+        x1 * info.scale_x,
+        y1 * info.scale_y,
+        x2 * info.scale_x,
+        y2 * info.scale_y,
+    ]], dtype=np.float32)  # [1,4]
+
+    return np.ascontiguousarray(box[None, :, :])  # [B, M(=1), 4]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Inference runners
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_encoder(sess_enc: InferenceSession, pixel_values: np.ndarray) -> Dict[str, np.ndarray]:
+    inp_name = sess_enc.get_inputs()[0].name
+    outs = sess_enc.run(None, {inp_name: as_f32c(pixel_values)})
+    out_names = [o.name for o in sess_enc.get_outputs()]
+    return dict(zip(out_names, outs))
+
+
 def run_decoder(sess_dec: InferenceSession,
                 enc_out: Dict[str, np.ndarray],
-                input_points: np.ndarray,
-                input_labels: np.ndarray) -> Dict[str, np.ndarray]:
+                input_points: Optional[np.ndarray] = None,
+                input_labels: Optional[np.ndarray] = None,
+                input_boxes: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
     """
-    Feeds:
-      - all decoder inputs that match encoder outputs by name
-      - plus input_points / input_labels (name-matched by substring)
-      - any remaining inputs get a conservative default (zeros)
+    Decoder contract (from inspect_onnx_io.py):
+      Inputs:
+        input_points [B,1,N,2] float
+        input_labels [B,1,N]   int64
+        input_boxes  [B,M,4]   float
+        image_embeddings.0/.1/.2
+      Outputs:
+        iou_scores [B, num_boxes_or_points, 3]
+        pred_masks [B, num_boxes_or_points, num_masks, H, W]
+        object_score_logits [B, num_boxes_or_points, 1]
+
+    Use:
+      - seed points: pass points/labels; pass input_boxes = empty_boxes()
+      - box: pass input_boxes; pass points/labels = empty_points()
     """
-    feed: Dict[str, np.ndarray] = {}
-    inputs = sess_dec.get_inputs()
+    if input_points is None or input_labels is None:
+        input_points, input_labels = empty_points()
+    if input_boxes is None:
+        input_boxes = empty_boxes()
 
-    def _zeros(shape, dtype):
-        # Replace dynamic dims (None) with 1
-        shp = [(d if isinstance(d, int) and d >= 0 else 1) for d in shape]
-        return np.zeros(shp, dtype=dtype)
+    # Cast to the exact expected dtypes
+    inps = sess_dec.get_inputs()
+    dtype_points = _dtype_from_ort(inps[0].type)
+    dtype_labels = _dtype_from_ort(inps[1].type)
+    dtype_boxes  = _dtype_from_ort(inps[2].type)
 
-    for inp in inputs:
-        name = inp.name
-        dtype = _dtype_from_ort(inp.type)
-
-        if name in enc_out:
-            arr = enc_out[name]
-            # cast if needed
-            if arr.dtype != dtype:
-                arr = arr.astype(dtype)
-            feed[name] = np.ascontiguousarray(arr)
-            continue
-
-        # Prompt inputs (common names in HF exports)
-        lname = name.lower()
-        if "input_points" in lname or "point_coords" in lname:
-            feed[name] = np.ascontiguousarray(input_points.astype(dtype, copy=False))
-            continue
-        if "input_labels" in lname or "point_labels" in lname:
-            feed[name] = np.ascontiguousarray(input_labels.astype(dtype, copy=False))
-            continue
-
-        # Optional mask-prompt inputs (set to "no mask")
-        if "has_mask" in lname:
-            z = _zeros(inp.shape, dtype)
-            feed[name] = z
-            continue
-        if "mask_input" in lname or ("input_mask" in lname and "input_masks" in lname) or "input_masks" in lname:
-            z = _zeros(inp.shape, dtype)
-            feed[name] = z
-            continue
-
-        # Fallback zeros
-        feed[name] = _zeros(inp.shape, dtype)
+    feed = {
+        "input_points": np.ascontiguousarray(input_points.astype(dtype_points, copy=False)),
+        "input_labels": np.ascontiguousarray(input_labels.astype(dtype_labels, copy=False)),
+        "input_boxes":  np.ascontiguousarray(input_boxes.astype(dtype_boxes,  copy=False)),
+        "image_embeddings.0": np.ascontiguousarray(enc_out["image_embeddings.0"]),
+        "image_embeddings.1": np.ascontiguousarray(enc_out["image_embeddings.1"]),
+        "image_embeddings.2": np.ascontiguousarray(enc_out["image_embeddings.2"]),
+    }
 
     outs = sess_dec.run(None, feed)
     out_names = [o.name for o in sess_dec.get_outputs()]
@@ -272,59 +267,43 @@ def run_decoder(sess_dec: InferenceSession,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Post-processing (approximate Sam*Processor.post_process_masks)
+# Post-processing
 # ──────────────────────────────────────────────────────────────────────────────
 
-def pick_best_mask(pred_masks: np.ndarray, iou_scores: np.ndarray) -> Tuple[np.ndarray, float]:
+def pick_best_mask(pred_masks: np.ndarray, iou_scores: np.ndarray, which_prompt: int = 0) -> Tuple[np.ndarray, float]:
     """
-    Returns: (mask_logits_2d, best_score)
-    Handles common shapes:
-      pred_masks: [B,Obj,M,H,W] or [B,M,H,W] or [M,H,W]
-      iou_scores: [B,Obj,M] or [B,M] or [M]
+    Expected shapes (from ONNX):
+      pred_masks: [B, P, M, H, W]
+      iou_scores: [B, P, 3]   (often 3 masks)
+    We pick the best mask for batch=0 and prompt index `which_prompt`.
     """
-    m = pred_masks
-    s = iou_scores
-
-    # squeeze batch/object dims
-    while m.ndim > 3:
-        m = m[0]
-    if m.ndim == 2:
-        m = m[None, :, :]
-
-    while s.ndim > 1:
-        s = s[0]
-    if s.ndim == 0:
-        s = np.asarray([float(s)], dtype=np.float32)
-
+    m = pred_masks[0, which_prompt]  # [M,H,W]
+    s = iou_scores[0, which_prompt]  # [M] or [3]
     best = int(np.argmax(s))
     return m[best], float(s[best])
 
 
 def postprocess_mask_to_original(mask_logits_2d: np.ndarray, info: PrepInfo) -> np.ndarray:
     """
-    mask_logits_2d: [mask_h, mask_w] float
-    returns: uint8 mask [H_orig, W_orig] with values 0 or 255
+    Since we resized directly to 1008x1008 (no padding), we:
+      - upsample mask logits to 1008x1008
+      - resize to original HxW
+      - threshold at 0
     """
     H0, W0 = info.orig_hw
-    Hr, Wr = info.resized_hw
     T = info.target_size
 
-    # 1) upsample to padded square
     up = cv2.resize(mask_logits_2d, (T, T), interpolation=cv2.INTER_LINEAR)
-
-    # 2) crop padding (top-left)
-    up = up[:Hr, :Wr]
-
-    # 3) resize back to original
     up0 = cv2.resize(up, (W0, H0), interpolation=cv2.INTER_LINEAR)
+    return (up0 > 0.0).astype(np.uint8) * 255
 
-    # threshold logits at 0
-    mask = (up0 > 0.0).astype(np.uint8) * 255
-    return mask
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def green_overlay(bgr: np.ndarray, mask255: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-    fg = mask255 > 0
+    fg = (mask255 > 0)
     color = np.zeros_like(bgr)
     color[fg] = (0, 255, 0)
     return cv2.addWeighted(bgr, 1.0, color, alpha, 0)
