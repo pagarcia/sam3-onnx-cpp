@@ -1,20 +1,3 @@
-You’re right to question it — the **“~12.9 + cuDNN ~9.14”** recipe is a *modern* stack (good for Ampere/Ada), **not** the “legacy / Pascal” fix. Your crash (`no kernel image is available`) is exactly what happens when a cuDNN build no longer ships kernels for your GPU; NVIDIA’s current cuDNN backend release notes explicitly say **Maxwell/Pascal/Volta are no longer supported**. ([NVIDIA Docs][1])
-
-Also, `onnxruntime-gpu==1.22.1` doesn’t exist on PyPI (only `1.22.0` in that series). ([PyPI][2])
-
-Below are **full drop-in files** updated to:
-
-* Use **onnxruntime-gpu==1.22.0** for the stable/Pascal-friendly stack (not 1.22.1) ([PyPI][2])
-* Keep a **modern GPU** path using `onnxruntime-gpu[cuda,cudnn]` per ORT docs ([ONNX Runtime][3])
-* Explain why Pascal may fail with the newest cuDNN ([NVIDIA Docs][1])
-* Fix print statements to show **requested vs effective** model variant and prevent “fp32” while loading fp16 confusion
-* Fix fetch scripts so they **don’t delete** the folder (so fp32 and fp16 can coexist), and print newlines correctly
-
----
-
-# ✅ `README.md` (full)
-
-````md
 # sam3-onnx-cpp
 
 **Segment Anything Model 3 (SAM3) C++ ONNX Wrapper (Image / 2D)**
