@@ -28,7 +28,7 @@ import numpy as np
 import onnxruntime as ort
 from onnxruntime import InferenceSession
 
-ACCEL = os.getenv("SAM3_ORT_ACCEL", "auto").lower()  # auto|cpu|cuda
+ACCEL = os.getenv("SAM3_ORT_ACCEL", "auto").lower()  # auto|cpu|cuda|trt
 
 # Try preloading DLLs when CUDA EP exists (helps with pip-provided runtime DLLs)
 try:
@@ -68,6 +68,21 @@ def _cuda_providers(device_id: int = 0):
     ]
 
 
+def _tensorrt_providers(model_path: str, device_id: int = 0):
+    cache_root = Path(model_path).resolve().parent / "trt_cache" / Path(model_path).stem
+    cache_root.mkdir(parents=True, exist_ok=True)
+    use_fp16 = os.getenv("SAM3_TRT_FP16", "0").lower() not in ("0", "false", "no", "")
+    return [
+        ("TensorrtExecutionProvider", {
+            "device_id": device_id,
+            "trt_engine_cache_enable": "1",
+            "trt_engine_cache_path": str(cache_root),
+            "trt_fp16_enable": "1" if use_fp16 else "0",
+        }),
+        *_cuda_providers(device_id=device_id),
+    ]
+
+
 def make_session(path: str, tag: str = "model", safe: bool = False) -> InferenceSession:
     so = ort.SessionOptions()
     so.graph_optimization_level = (
@@ -78,17 +93,34 @@ def make_session(path: str, tag: str = "model", safe: bool = False) -> Inference
     so.inter_op_num_threads = 1
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
+    path = str(Path(path).resolve())
     av = ort.get_available_providers()
     if ACCEL == "cpu":
         providers = ["CPUExecutionProvider"]
+    elif ACCEL == "trt":
+        if "TensorrtExecutionProvider" in av:
+            providers = _tensorrt_providers(path)
+        elif "CUDAExecutionProvider" in av:
+            providers = _cuda_providers()
+        else:
+            providers = ["CPUExecutionProvider"]
     elif ACCEL == "cuda":
         providers = _cuda_providers() if "CUDAExecutionProvider" in av else ["CPUExecutionProvider"]
     else:  # auto
         providers = _cuda_providers() if "CUDAExecutionProvider" in av else ["CPUExecutionProvider"]
 
-    path = str(Path(path).resolve())
     print(f"[INFO] Loading {os.path.basename(path)} [{tag}] providers={providers}")
     sess = InferenceSession(path, sess_options=so, providers=list(providers))
+    if (
+        ACCEL == "trt"
+        and sess.get_providers() == ["CPUExecutionProvider"]
+        and "CUDAExecutionProvider" in av
+    ):
+        print(
+            "[WARN] TensorRT EP was requested but is not usable in this environment; "
+            "retrying with CUDAExecutionProvider."
+        )
+        sess = InferenceSession(path, sess_options=so, providers=list(_cuda_providers()))
     print("[INFO] Active providers:", sess.get_providers())
     return sess
 
