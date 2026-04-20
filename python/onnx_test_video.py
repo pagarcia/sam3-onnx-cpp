@@ -29,6 +29,8 @@ from PyQt5 import QtWidgets
 
 NUM_MASKMEM = 7
 MAX_OBJ_PTRS = 16
+FAST_DEFAULT_MAX_MEM_FRAMES = 2
+FAST_DEFAULT_MAX_OBJ_PTRS = 16
 
 
 def _as_f32c(arr: np.ndarray) -> np.ndarray:
@@ -497,14 +499,14 @@ def main():
     parser.add_argument(
         "--max_mem_frames",
         type=int,
-        default=0,
-        help="Optional cap on the number of spatial memory frames used by ONNX attention.",
+        default=FAST_DEFAULT_MAX_MEM_FRAMES,
+        help="Cap on spatial memory frames used by ONNX attention. Defaults to the fast preset (2).",
     )
     parser.add_argument(
         "--max_obj_ptrs",
         type=int,
-        default=0,
-        help="Optional cap on the number of object pointers used by ONNX attention.",
+        default=FAST_DEFAULT_MAX_OBJ_PTRS,
+        help="Cap on object pointers used by ONNX attention. Defaults to the fast preset (16).",
     )
     parser.add_argument(
         "--points",
@@ -553,6 +555,7 @@ def main():
         NUM_MASKMEM = max(1, min(NUM_MASKMEM, int(args.max_mem_frames)))
     if args.max_obj_ptrs > 0:
         MAX_OBJ_PTRS = max(1, min(MAX_OBJ_PTRS, int(args.max_obj_ptrs)))
+    print(f"[INFO] ONNX runtime caps: max_mem_frames={NUM_MASKMEM}, max_obj_ptrs={MAX_OBJ_PTRS}")
     enc_path = _resolve_encoder_path(onnx_dir)
     dec_path = onnx_dir / "image_decoder.onnx"
     mat_path = onnx_dir / "memory_attention.onnx"

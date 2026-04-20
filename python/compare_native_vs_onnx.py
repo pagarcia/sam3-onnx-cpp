@@ -23,6 +23,8 @@ DEFAULT_CKPT = Path(
     r"C:\Users\Pablo\.cache\huggingface\hub\models--facebook--sam3\snapshots\3c879f39826c281e95690f02c7821c4de09afae7\sam3.pt"
 )
 TARGET_SIZE = 1008
+ONNX_FAST_DEFAULT_MAX_MEM_FRAMES = 2
+ONNX_FAST_DEFAULT_MAX_OBJ_PTRS = 16
 
 
 def _sync_cuda():
@@ -586,14 +588,14 @@ def main():
     parser.add_argument(
         "--onnx_max_mem_frames",
         type=int,
-        default=0,
-        help="Optional cap on ONNX spatial memory frames. 0 keeps the exported tracker default.",
+        default=ONNX_FAST_DEFAULT_MAX_MEM_FRAMES,
+        help="Cap on ONNX spatial memory frames. Defaults to the fast preset (2).",
     )
     parser.add_argument(
         "--onnx_max_obj_ptrs",
         type=int,
-        default=0,
-        help="Optional cap on ONNX object pointers. 0 keeps the exported tracker default.",
+        default=ONNX_FAST_DEFAULT_MAX_OBJ_PTRS,
+        help="Cap on ONNX object pointers. Defaults to the fast preset (16).",
     )
     parser.add_argument(
         "--outdir",
