@@ -1,4 +1,3 @@
-# sam3-onnx-cpp/python/onnx_test_video.py
 #!/usr/bin/env python3
 import os
 
@@ -10,203 +9,36 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-
-from onnx_test_utils import (
-    PrepInfo,
-    compute_display_base,
-    green_overlay,
-    make_session,
-    preprocess_image_bgr,
-    print_system_info,
-    set_cv2_threads,
-)
 from PyQt5 import QtWidgets
 
-NUM_MASKMEM = 7
-MAX_OBJ_PTRS = 16
-FAST_DEFAULT_MAX_MEM_FRAMES = 2
-FAST_DEFAULT_MAX_OBJ_PTRS = 16
+from onnx_test_utils import compute_display_base, green_overlay, print_system_info, set_cv2_threads
+from sam3_onnx_session import (
+    FAST_DEFAULT_MAX_MEM_FRAMES,
+    FAST_DEFAULT_MAX_OBJ_PTRS,
+    Sam3OnnxTrackerSession,
+    load_prompt_spec,
+    mask_to_overlay,
+    parse_box_text,
+    parse_points_text,
+    prepare_prompt_box,
+    prepare_prompt_points,
+    save_prompt_spec,
+)
 
 
-def _as_f32c(arr: np.ndarray) -> np.ndarray:
-    return np.ascontiguousarray(arr.astype(np.float32, copy=False))
-
-
-def _as_i32c(arr: np.ndarray) -> np.ndarray:
-    return np.ascontiguousarray(arr.astype(np.int32, copy=False))
-
-
-def _empty_prompt():
-    return np.zeros((1, 0, 2), np.float32), np.zeros((1, 0), np.int32)
-
-
-def _prepare_prompt_points(points_xy, labels, info: PrepInfo):
-    if not points_xy:
-        return _empty_prompt()
-    points = np.asarray(points_xy, dtype=np.float32)
-    point_labels = np.asarray(labels, dtype=np.int32)
-    points[:, 0] *= info.scale_x
-    points[:, 1] *= info.scale_y
-    return np.ascontiguousarray(points[None, ...]), np.ascontiguousarray(point_labels[None, ...])
-
-
-def _prepare_prompt_box(rect_xyxy, info: PrepInfo):
-    if rect_xyxy is None:
-        return _empty_prompt()
-    x1, y1, x2, y2 = rect_xyxy
-    x1, x2 = sorted((x1, x2))
-    y1, y2 = sorted((y1, y2))
-    points = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-    points[:, 0] *= info.scale_x
-    points[:, 1] *= info.scale_y
-    labels = np.array([2, 3], dtype=np.int32)
-    return np.ascontiguousarray(points[None, ...]), np.ascontiguousarray(labels[None, ...])
-
-
-def _run_encoder(session, pixel_values):
-    input_name = session.get_inputs()[0].name
-    output_names = [out.name for out in session.get_outputs()]
-    values = session.run(None, {input_name: _as_f32c(pixel_values)})
-    return dict(zip(output_names, values))
-
-
-def _normalize_encoder_outputs(raw_outputs, constants):
-    if "image_embeddings" in raw_outputs:
-        return raw_outputs
-
-    current_vision_feat = raw_outputs["image_embeddings.2"]
-    return {
-        "image_embeddings": current_vision_feat + constants["no_mem_embed_bchw"],
-        "high_res_features0": raw_outputs["image_embeddings.0"],
-        "high_res_features1": raw_outputs["image_embeddings.1"],
-        "current_vision_feat": current_vision_feat,
-        "current_vision_pos_embed": constants["current_vision_pos_embed"],
-    }
-
-
-def _run_decoder(session, point_coords, point_labels, image_embed, high_res_0, high_res_1):
-    if point_coords is None or point_labels is None:
-        point_coords, point_labels = _empty_prompt()
-
-    feed = {
-        "point_coords": _as_f32c(point_coords),
-        "point_labels": _as_i32c(point_labels),
-        "image_embed": _as_f32c(image_embed),
-        "high_res_feats_0": _as_f32c(high_res_0),
-        "high_res_feats_1": _as_f32c(high_res_1),
-    }
-    values = session.run(None, feed)
-    names = [out.name for out in session.get_outputs()]
-    return dict(zip(names, values))
-
-
-def _run_memory_attention(
-    session,
-    current_vision_feat,
-    current_vision_pos_embed,
-    memory_obj_ptrs,
-    memory_obj_tpos,
-    memory_mask_feats,
-    memory_mask_pos,
-    memory_mask_tpos_idx,
-):
-    feed = {
-        "current_vision_feat": _as_f32c(current_vision_feat),
-        "current_vision_pos_embed": _as_f32c(current_vision_pos_embed),
-        "memory_obj_ptrs": _as_f32c(memory_obj_ptrs),
-        "memory_obj_tpos": _as_f32c(memory_obj_tpos),
-        "memory_mask_feats": _as_f32c(memory_mask_feats),
-        "memory_mask_pos": _as_f32c(memory_mask_pos),
-        "memory_mask_tpos_idx": np.ascontiguousarray(
-            memory_mask_tpos_idx.astype(np.int64, copy=False)
-        ),
-    }
-    return session.run(None, feed)[0]
-
-
-def _run_memory_encoder(
-    session,
-    pred_mask_high_res,
-    current_vision_feat,
-    object_score_logits,
-    is_mask_from_points,
-):
-    feed = {
-        "pred_mask_high_res": _as_f32c(pred_mask_high_res),
-        "current_vision_feat": _as_f32c(current_vision_feat),
-        "object_score_logits": _as_f32c(object_score_logits),
-        "is_mask_from_points": np.ascontiguousarray(
-            np.array([1.0 if is_mask_from_points else 0.0], dtype=np.float32)
-        ),
-    }
-    values = session.run(None, feed)
-    names = [out.name for out in session.get_outputs()]
-    return dict(zip(names, values))
-
-
-def _mask_to_overlay(frame_bgr: np.ndarray, mask_logits_high_res: np.ndarray, info: PrepInfo):
-    mask_uint8 = _mask_to_uint8(mask_logits_high_res, info)
-    return green_overlay(frame_bgr, mask_uint8, alpha=0.5)
-
-
-def _mask_to_uint8(mask_logits_high_res: np.ndarray, info: PrepInfo) -> np.ndarray:
-    mask_logits = mask_logits_high_res[0, 0]
-    mask_resized = cv2.resize(
-        mask_logits,
-        (info.orig_hw[1], info.orig_hw[0]),
-        interpolation=cv2.INTER_LINEAR,
-    )
-    return (mask_resized > 0.0).astype(np.uint8) * 255
-
-
-def _parse_points_text(text: str):
-    points, labels = [], []
-    if not text.strip():
-        return points, labels
-    for item in text.split(";"):
-        x_str, y_str, label_str = [part.strip() for part in item.split(",")]
-        points.append((int(float(x_str)), int(float(y_str))))
-        labels.append(int(label_str))
-    return points, labels
-
-
-def _parse_box_text(text: str):
-    parts = [int(float(part.strip())) for part in text.split(",")]
-    if len(parts) != 4:
-        raise ValueError("--box expects x1,y1,x2,y2")
-    return tuple(parts)
-
-
-def _load_prompt_spec(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        spec = json.load(f)
-    if "prompt" not in spec:
-        raise SystemExit(f"Prompt JSON is missing 'prompt': {path}")
-    return spec
-
-
-def _save_prompt_spec(path: Path, spec) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(spec, f, indent=2)
-
-
-def _interactive_select_points(first_bgr, sess_enc, sess_dec, constants):
-    pixel_values, info = preprocess_image_bgr(first_bgr, target_size=1008)
-    enc = _normalize_encoder_outputs(_run_encoder(sess_enc, pixel_values), constants)
-
+def _interactive_select_points(first_bgr, tracker: Sam3OnnxTrackerSession):
+    prepared = tracker.prepare_frame(first_bgr)
     base, scale = compute_display_base(first_bgr, max_side=1200)
     points, labels = [], []
 
     def render(mask_logits=None):
         vis = base.copy()
         if mask_logits is not None:
-            overlay = _mask_to_overlay(first_bgr, mask_logits, info)
+            overlay = mask_to_overlay(first_bgr, mask_logits, prepared.info)
             vis = cv2.resize(overlay, (base.shape[1], base.shape[0]))
         for idx, (px, py) in enumerate(points):
             color = (0, 0, 255) if labels[idx] == 1 else (255, 0, 0)
@@ -217,16 +49,8 @@ def _interactive_select_points(first_bgr, sess_enc, sess_dec, constants):
         if not points:
             render()
             return
-        prompt_points, prompt_labels = _prepare_prompt_points(points, labels, info)
-        out = _run_decoder(
-            sess_dec,
-            prompt_points,
-            prompt_labels,
-            enc["image_embeddings"],
-            enc["high_res_features0"],
-            enc["high_res_features1"],
-        )
-        render(out["pred_mask_high_res"])
+        prompt_points, prompt_labels = prepare_prompt_points(points, labels, prepared.info)
+        render(tracker.preview_prompt_mask(prepared, prompt_points, prompt_labels))
 
     def mouse_cb(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -252,18 +76,16 @@ def _interactive_select_points(first_bgr, sess_enc, sess_dec, constants):
             break
     cv2.destroyAllWindows()
 
-    prompt_points, prompt_labels = _prepare_prompt_points(points, labels, info)
+    prompt_points, prompt_labels = prepare_prompt_points(points, labels, prepared.info)
     prompt_spec = {
         "prompt": "seed_points",
         "points": [[int(px), int(py), int(label)] for (px, py), label in zip(points, labels)],
     }
-    return enc, info, prompt_points, prompt_labels, prompt_spec
+    return prepared, prompt_points, prompt_labels, prompt_spec
 
 
-def _interactive_select_box(first_bgr, sess_enc, sess_dec, constants):
-    pixel_values, info = preprocess_image_bgr(first_bgr, target_size=1008)
-    enc = _normalize_encoder_outputs(_run_encoder(sess_enc, pixel_values), constants)
-
+def _interactive_select_box(first_bgr, tracker: Sam3OnnxTrackerSession):
+    prepared = tracker.prepare_frame(first_bgr)
     base, scale = compute_display_base(first_bgr, max_side=1200)
     rect_start = None
     rect_end = None
@@ -283,7 +105,7 @@ def _interactive_select_box(first_bgr, sess_enc, sess_dec, constants):
     def render(mask_logits=None):
         vis = base.copy()
         if mask_logits is not None:
-            overlay = _mask_to_overlay(first_bgr, mask_logits, info)
+            overlay = mask_to_overlay(first_bgr, mask_logits, prepared.info)
             vis = cv2.resize(overlay, (base.shape[1], base.shape[0]))
         if rect_start is not None and rect_end is not None:
             cv2.rectangle(vis, rect_start, rect_end, (0, 255, 255), 2)
@@ -294,16 +116,8 @@ def _interactive_select_box(first_bgr, sess_enc, sess_dec, constants):
         if box is None:
             render()
             return
-        prompt_points, prompt_labels = _prepare_prompt_box(box, info)
-        out = _run_decoder(
-            sess_dec,
-            prompt_points,
-            prompt_labels,
-            enc["image_embeddings"],
-            enc["high_res_features0"],
-            enc["high_res_features1"],
-        )
-        render(out["pred_mask_high_res"])
+        prompt_points, prompt_labels = prepare_prompt_box(box, prepared.info)
+        render(tracker.preview_prompt_mask(prepared, prompt_points, prompt_labels))
 
     def mouse_cb(event, x, y, _flags, _param):
         nonlocal rect_start, rect_end, drawing
@@ -335,81 +149,12 @@ def _interactive_select_box(first_bgr, sess_enc, sess_dec, constants):
     cv2.destroyAllWindows()
 
     box = current_box()
-    prompt_points, prompt_labels = _prepare_prompt_box(box, info)
+    prompt_points, prompt_labels = prepare_prompt_box(box, prepared.info)
     prompt_spec = {
         "prompt": "bounding_box",
         "box": list(box) if box is not None else None,
     }
-    return enc, info, prompt_points, prompt_labels, prompt_spec
-
-
-def _prepare_prompt_from_spec(first_bgr, sess_enc, constants, prompt_spec):
-    pixel_values, info = preprocess_image_bgr(first_bgr, target_size=1008)
-    enc = _normalize_encoder_outputs(_run_encoder(sess_enc, pixel_values), constants)
-    prompt_kind = prompt_spec["prompt"]
-    if prompt_kind == "bounding_box":
-        box = prompt_spec.get("box")
-        prompt_points, prompt_labels = _prepare_prompt_box(tuple(box) if box is not None else None, info)
-    elif prompt_kind == "seed_points":
-        raw_points = prompt_spec.get("points", [])
-        points = [(int(item[0]), int(item[1])) for item in raw_points]
-        labels = [int(item[2]) for item in raw_points]
-        prompt_points, prompt_labels = _prepare_prompt_points(points, labels, info)
-    else:
-        raise SystemExit(f"Unsupported prompt kind in prompt JSON: {prompt_kind}")
-    return enc, info, prompt_points, prompt_labels
-
-
-def _select_memory_inputs(frame_idx, cond_states, non_cond_states):
-    spatial_items = []
-    if 0 in cond_states and frame_idx > 0:
-        spatial_items.append((cond_states[0], NUM_MASKMEM - 1))
-
-    for t_pos in range(1, NUM_MASKMEM):
-        prev_idx = frame_idx - (NUM_MASKMEM - t_pos)
-        if prev_idx < 0:
-            continue
-        state = non_cond_states.get(prev_idx)
-        if state is None:
-            continue
-        spatial_items.append((state, NUM_MASKMEM - t_pos - 1))
-
-    if not spatial_items:
-        raise RuntimeError("No spatial memory was available for memory attention.")
-
-    memory_mask_feats = np.concatenate(
-        [item[0]["maskmem_features"] for item in spatial_items], axis=0
-    )
-    memory_mask_pos = np.concatenate(
-        [item[0]["maskmem_pos_enc"] for item in spatial_items], axis=0
-    )
-    memory_mask_tpos_idx = np.array([item[1] for item in spatial_items], dtype=np.int64)
-
-    pointer_items = []
-    if 0 in cond_states and frame_idx > 0:
-        pointer_items.append((cond_states[0], float(frame_idx)))
-    for t_diff in range(1, MAX_OBJ_PTRS):
-        prev_idx = frame_idx - t_diff
-        if prev_idx < 0:
-            break
-        state = non_cond_states.get(prev_idx)
-        if state is not None:
-            pointer_items.append((state, float(t_diff)))
-
-    if pointer_items:
-        memory_obj_ptrs = np.concatenate([item[0]["obj_ptr"] for item in pointer_items], axis=0)
-        memory_obj_tpos = np.array([item[1] for item in pointer_items], dtype=np.float32)
-    else:
-        memory_obj_ptrs = np.zeros((0, 256), np.float32)
-        memory_obj_tpos = np.zeros((0,), np.float32)
-
-    return {
-        "memory_obj_ptrs": memory_obj_ptrs,
-        "memory_obj_tpos": memory_obj_tpos,
-        "memory_mask_feats": memory_mask_feats,
-        "memory_mask_pos": memory_mask_pos,
-        "memory_mask_tpos_idx": memory_mask_tpos_idx,
-    }
+    return prepared, prompt_points, prompt_labels, prompt_spec
 
 
 def _resolve_video(args):
@@ -434,44 +179,6 @@ def _resolve_video(args):
     return video_path
 
 
-def _load_video_constants(onnx_dir: Path):
-    constants_path = onnx_dir / "video_constants.npz"
-    if not constants_path.exists():
-        raise SystemExit(
-            f"Missing {constants_path}. Run export\\onnx_export.py first to generate the video constants bundle."
-        )
-
-    with np.load(constants_path) as data:
-        constants = {key: np.ascontiguousarray(data[key]) for key in data.files}
-
-    global NUM_MASKMEM, MAX_OBJ_PTRS
-    NUM_MASKMEM = int(constants.get("num_maskmem", np.array([NUM_MASKMEM]))[0])
-    MAX_OBJ_PTRS = int(constants.get("max_obj_ptrs", np.array([MAX_OBJ_PTRS]))[0])
-    return constants
-
-
-def _resolve_encoder_path(onnx_dir: Path) -> Path:
-    custom_encoder = onnx_dir / "image_encoder.onnx"
-    if custom_encoder.exists():
-        return custom_encoder
-
-    repo_root = Path(__file__).resolve().parent.parent
-    shared_dir = repo_root / "checkpoints" / "sam3" / "onnx"
-    for candidate in (
-        shared_dir / "vision_encoder.onnx",
-        shared_dir / "vision_encoder_fp16.onnx",
-    ):
-        # The bundled encoder models use external data sidecars. Skip any
-        # half-downloaded .onnx file so we can fall back to a complete variant.
-        sidecar = candidate.with_name(candidate.name + "_data")
-        if candidate.exists() and sidecar.exists():
-            return candidate
-
-    raise SystemExit(
-        "Could not find a complete encoder ONNX pair. Expected image_encoder.onnx in the video export dir or vision_encoder*.onnx plus .onnx_data under checkpoints/sam3/onnx."
-    )
-
-
 def main():
     print_system_info()
     set_cv2_threads(1)
@@ -484,6 +191,11 @@ def main():
         "--onnx_dir",
         default=str(Path(__file__).resolve().parent.parent / "checkpoints" / "sam3" / "video_onnx"),
         help="Directory containing image_encoder.onnx, image_decoder.onnx, memory_attention.onnx, memory_encoder.onnx.",
+    )
+    parser.add_argument(
+        "--onnx_variant",
+        default=os.getenv("SAM3_ONNX_VARIANT", "").strip(),
+        help="Optional tracker ONNX variant suffix such as fp16, fast, quality, or quality_fp16.",
     )
     parser.add_argument(
         "--prompt",
@@ -500,13 +212,13 @@ def main():
         "--max_mem_frames",
         type=int,
         default=FAST_DEFAULT_MAX_MEM_FRAMES,
-        help="Cap on spatial memory frames used by ONNX attention. Defaults to the fast preset (2).",
+        help="Cap on spatial memory frames used by ONNX attention. Defaults to the fast preset (2), but fixed-shape variants can override it.",
     )
     parser.add_argument(
         "--max_obj_ptrs",
         type=int,
         default=FAST_DEFAULT_MAX_OBJ_PTRS,
-        help="Cap on object pointers used by ONNX attention. Defaults to the fast preset (16).",
+        help="Cap on object pointers used by ONNX attention. Defaults to the fast preset (16), but fixed-shape variants can override it.",
     )
     parser.add_argument(
         "--points",
@@ -548,26 +260,17 @@ def main():
     video_path = _resolve_video(args)
     print(f"[INFO] Video: {video_path}")
 
-    onnx_dir = Path(args.onnx_dir).resolve()
-    constants = _load_video_constants(onnx_dir)
-    global NUM_MASKMEM, MAX_OBJ_PTRS
-    if args.max_mem_frames > 0:
-        NUM_MASKMEM = max(1, min(NUM_MASKMEM, int(args.max_mem_frames)))
-    if args.max_obj_ptrs > 0:
-        MAX_OBJ_PTRS = max(1, min(MAX_OBJ_PTRS, int(args.max_obj_ptrs)))
-    print(f"[INFO] ONNX runtime caps: max_mem_frames={NUM_MASKMEM}, max_obj_ptrs={MAX_OBJ_PTRS}")
-    enc_path = _resolve_encoder_path(onnx_dir)
-    dec_path = onnx_dir / "image_decoder.onnx"
-    mat_path = onnx_dir / "memory_attention.onnx"
-    men_path = onnx_dir / "memory_encoder.onnx"
-    for path in (enc_path, dec_path, mat_path, men_path):
-        if not path.exists():
-            raise SystemExit(f"Missing ONNX file: {path}")
-
-    sess_enc = make_session(str(enc_path), tag="video_image_encoder", safe=args.safe)
-    sess_dec = make_session(str(dec_path), tag="video_image_decoder", safe=args.safe)
-    sess_mat = make_session(str(mat_path), tag="video_memory_attention", safe=args.safe)
-    sess_men = make_session(str(men_path), tag="video_memory_encoder", safe=args.safe)
+    tracker = Sam3OnnxTrackerSession(
+        Path(args.onnx_dir),
+        safe=args.safe,
+        max_mem_frames=args.max_mem_frames,
+        max_obj_ptrs=args.max_obj_ptrs,
+        variant=args.onnx_variant,
+    )
+    print(
+        f"[INFO] ONNX runtime caps: max_mem_frames={tracker.num_maskmem}, "
+        f"max_obj_ptrs={tracker.max_obj_ptrs}, iobinding={'on' if tracker.uses_iobinding else 'off'}"
+    )
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -582,40 +285,28 @@ def main():
         raise SystemExit("The selected video is empty.")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    prompt_spec = None
     if args.prompt_json:
-        prompt_spec = _load_prompt_spec(Path(args.prompt_json).resolve())
-        enc0, info0, init_points, init_labels = _prepare_prompt_from_spec(
-            first_frame, sess_enc, constants, prompt_spec
-        )
+        prompt_spec = load_prompt_spec(Path(args.prompt_json).resolve())
+        prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
     elif args.box:
-        prompt_spec = {"prompt": "bounding_box", "box": list(_parse_box_text(args.box))}
-        enc0, info0, init_points, init_labels = _prepare_prompt_from_spec(
-            first_frame, sess_enc, constants, prompt_spec
-        )
+        prompt_spec = {"prompt": "bounding_box", "box": list(parse_box_text(args.box))}
+        prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
     elif args.points:
-        points, labels = _parse_points_text(args.points)
+        points, labels = parse_points_text(args.points)
         prompt_spec = {
             "prompt": "seed_points",
             "points": [[int(px), int(py), int(label)] for (px, py), label in zip(points, labels)],
         }
-        enc0, info0, init_points, init_labels = _prepare_prompt_from_spec(
-            first_frame, sess_enc, constants, prompt_spec
-        )
+        prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
     elif args.prompt == "bounding_box":
-        enc0, info0, init_points, init_labels, prompt_spec = _interactive_select_box(
-            first_frame, sess_enc, sess_dec, constants
-        )
+        prepared0, init_points, init_labels, prompt_spec = _interactive_select_box(first_frame, tracker)
     else:
-        enc0, info0, init_points, init_labels, prompt_spec = _interactive_select_points(
-            first_frame, sess_enc, sess_dec, constants
-        )
+        prepared0, init_points, init_labels, prompt_spec = _interactive_select_points(first_frame, tracker)
 
     if args.save_prompt_json:
-        _save_prompt_spec(Path(args.save_prompt_json).resolve(), prompt_spec)
+        save_prompt_spec(Path(args.save_prompt_json).resolve(), prompt_spec)
 
-    cond_states = {}
-    non_cond_states = {}
+    tracker.reset()
 
     output_path = str(Path(video_path).with_name(Path(video_path).stem + "_sam3_onnx_overlay.mkv"))
     writer = None
@@ -643,90 +334,38 @@ def main():
             break
         if args.max_frames > 0 and frame_idx >= args.max_frames:
             break
-        t_total = time.time()
 
         if frame_idx == 0:
-            enc = enc0
-            info = info0
-            fused_embed = enc["image_embeddings"]
-            prompt_points = init_points
-            prompt_labels = init_labels
-            is_mask_from_points = True
-            attn_ms = 0.0
-            enc_ms = 0.0
-        else:
-            pixel_values, info = preprocess_image_bgr(frame_bgr, target_size=1008)
-            t_enc = time.time()
-            enc = _normalize_encoder_outputs(_run_encoder(sess_enc, pixel_values), constants)
-            enc_ms = (time.time() - t_enc) * 1000.0
-
-            mem_inputs = _select_memory_inputs(frame_idx, cond_states, non_cond_states)
-            t_attn = time.time()
-            fused_embed = _run_memory_attention(
-                sess_mat,
-                enc["current_vision_feat"],
-                enc["current_vision_pos_embed"],
-                mem_inputs["memory_obj_ptrs"],
-                mem_inputs["memory_obj_tpos"],
-                mem_inputs["memory_mask_feats"],
-                mem_inputs["memory_mask_pos"],
-                mem_inputs["memory_mask_tpos_idx"],
+            result = tracker.process_frame(
+                frame_idx,
+                frame_bgr,
+                prepared=prepared0,
+                prompt_points=init_points,
+                prompt_labels=init_labels,
             )
-            attn_ms = (time.time() - t_attn) * 1000.0
-            prompt_points, prompt_labels = _empty_prompt()
-            is_mask_from_points = False
-
-        t_dec = time.time()
-        dec = _run_decoder(
-            sess_dec,
-            prompt_points,
-            prompt_labels,
-            fused_embed,
-            enc["high_res_features0"],
-            enc["high_res_features1"],
-        )
-        dec_ms = (time.time() - t_dec) * 1000.0
-
-        t_mem = time.time()
-        mem = _run_memory_encoder(
-            sess_men,
-            dec["pred_mask_high_res"],
-            enc["current_vision_feat"],
-            dec["object_score_logits"],
-            is_mask_from_points=is_mask_from_points,
-        )
-        mem_ms = (time.time() - t_mem) * 1000.0
-
-        state = {
-            "maskmem_features": mem["maskmem_features"],
-            "maskmem_pos_enc": mem["maskmem_pos_enc"],
-            "obj_ptr": dec["obj_ptr"],
-            "pred_mask_high_res": dec["pred_mask_high_res"],
-            "object_score_logits": dec["object_score_logits"],
-        }
-        if frame_idx == 0:
-            cond_states[frame_idx] = state
         else:
-            non_cond_states[frame_idx] = state
+            result = tracker.process_frame(frame_idx, frame_bgr)
 
-        mask_uint8 = _mask_to_uint8(dec["pred_mask_high_res"], info)
         if writer is not None:
-            writer.write(green_overlay(frame_bgr, mask_uint8, alpha=0.5))
+            writer.write(green_overlay(frame_bgr, result.mask_uint8, alpha=0.5))
 
-        saved_masks.append(mask_uint8)
-        saved_enc_ms.append(enc_ms)
-        saved_attn_ms.append(attn_ms)
-        saved_dec_ms.append(dec_ms)
-        saved_mem_ms.append(mem_ms)
-        saved_total_ms.append((time.time() - t_total) * 1000.0)
+        saved_masks.append(result.mask_uint8)
+        saved_enc_ms.append(result.timings.enc_ms)
+        saved_attn_ms.append(result.timings.attn_ms)
+        saved_dec_ms.append(result.timings.dec_ms)
+        saved_mem_ms.append(result.timings.mem_ms)
+        saved_total_ms.append(result.timings.total_ms)
 
         if frame_idx == 0:
             print(
-                f"Frame {frame_idx:03d} | Dec:{dec_ms:.1f} ms | MemEnc:{mem_ms:.1f} ms"
+                f"Frame {frame_idx:03d} | Dec:{result.timings.dec_ms:.1f} ms | "
+                f"MemEnc:{result.timings.mem_ms:.1f} ms"
             )
         else:
             print(
-                f"Frame {frame_idx:03d} | Enc:{enc_ms:.1f} ms | Attn:{attn_ms:.1f} ms | Dec:{dec_ms:.1f} ms | MemEnc:{mem_ms:.1f} ms"
+                f"Frame {frame_idx:03d} | Enc:{result.timings.enc_ms:.1f} ms | "
+                f"Attn:{result.timings.attn_ms:.1f} ms | Dec:{result.timings.dec_ms:.1f} ms | "
+                f"MemEnc:{result.timings.mem_ms:.1f} ms"
             )
 
         frame_idx += 1

@@ -47,6 +47,8 @@ def print_system_info() -> None:
     print("[INFO] ORT providers (available):", ort.get_available_providers())
     print("[INFO] SAM3_ORT_ACCEL:", ACCEL)
     print("[INFO] SAM3_ONNX_VARIANT:", os.getenv("SAM3_ONNX_VARIANT", ""))
+    print("[INFO] SAM3_ORT_GRAPH_OPT:", os.getenv("SAM3_ORT_GRAPH_OPT", "extended"))
+    print("[INFO] SAM3_ORT_IO_BINDING:", os.getenv("SAM3_ORT_IO_BINDING", "auto"))
 
 
 def set_cv2_threads(n: int = 1) -> None:
@@ -83,15 +85,56 @@ def _tensorrt_providers(model_path: str, device_id: int = 0):
     ]
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    return value
+
+
+def _resolve_graph_optimization_level(safe: bool):
+    if safe:
+        return ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+
+    value = os.getenv("SAM3_ORT_GRAPH_OPT", "extended").strip().lower()
+    if value in ("disable", "disabled", "none", "off"):
+        return ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    if value in ("basic",):
+        return ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    if value in ("extended",):
+        return ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    if value in ("all", "full", "aggressive"):
+        return ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    raise ValueError(
+        "SAM3_ORT_GRAPH_OPT must be one of: disable, basic, extended, all."
+    )
+
+
 def make_session(path: str, tag: str = "model", safe: bool = False) -> InferenceSession:
     so = ort.SessionOptions()
-    so.graph_optimization_level = (
-        ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        if safe else ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    so.graph_optimization_level = _resolve_graph_optimization_level(safe)
+    so.intra_op_num_threads = _env_int(
+        "SAM3_ORT_INTRA_OP_THREADS",
+        max(1, (os.cpu_count() or 8) - 1),
     )
-    so.intra_op_num_threads = max(1, (os.cpu_count() or 8) - 1)
-    so.inter_op_num_threads = 1
+    so.inter_op_num_threads = _env_int("SAM3_ORT_INTER_OP_THREADS", 1)
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    so.enable_cpu_mem_arena = os.getenv("SAM3_ORT_CPU_ARENA", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "",
+    )
+    so.enable_mem_pattern = os.getenv("SAM3_ORT_MEM_PATTERN", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "",
+    )
 
     path = str(Path(path).resolve())
     av = ort.get_available_providers()

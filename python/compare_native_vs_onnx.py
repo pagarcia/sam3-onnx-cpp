@@ -485,6 +485,7 @@ def _run_onnx_subprocess(
     onnx_accel: str,
     onnx_max_mem_frames: int,
     onnx_max_obj_ptrs: int,
+    onnx_variant: str,
 ):
     cmd = [
         str(REPO_ROOT / "sam3_env" / "Scripts" / "python.exe"),
@@ -501,6 +502,8 @@ def _run_onnx_subprocess(
         str(max_frames),
         "--no_output_video",
     ]
+    if onnx_variant:
+        cmd.extend(["--onnx_variant", onnx_variant])
     if safe:
         cmd.append("--safe")
     if onnx_max_mem_frames > 0:
@@ -549,6 +552,112 @@ def _summarize_timings(prefix: str, data):
     return summary
 
 
+def run_compare(
+    *,
+    video_path: str,
+    onnx_dir: Path,
+    checkpoint: str,
+    sam3_repo: Path,
+    prompt_spec,
+    outdir: Path,
+    max_frames: int,
+    safe: bool,
+    onnx_accel: str,
+    onnx_max_mem_frames: int,
+    onnx_max_obj_ptrs: int,
+    onnx_variant: str = "",
+    prompt_json_path: Path | None = None,
+):
+    outdir = Path(outdir).resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    video = _load_video_frames(video_path, max_frames)
+    prompt_json = (
+        Path(prompt_json_path).resolve() if prompt_json_path else outdir / "prompt.json"
+    )
+    _save_prompt_spec(prompt_json, prompt_spec)
+
+    native_npz = outdir / "native.npz"
+    onnx_npz = outdir / "onnx.npz"
+    summary_json = outdir / "summary.json"
+
+    print(f"[INFO] Output dir: {outdir}")
+    print("[INFO] Running native PyTorch tracker...")
+    _run_native_tracker(
+        video=video,
+        prompt_spec=prompt_spec,
+        checkpoint=str(Path(checkpoint).resolve()),
+        sam3_repo=Path(sam3_repo).resolve(),
+        save_path=native_npz,
+        video_path=video_path,
+    )
+    print("[INFO] Running ONNX tracker...")
+    _run_onnx_subprocess(
+        video_path=video_path,
+        onnx_dir=Path(onnx_dir).resolve(),
+        prompt_json=prompt_json,
+        save_path=onnx_npz,
+        max_frames=len(video.raw_frames),
+        safe=safe,
+        onnx_accel=onnx_accel,
+        onnx_max_mem_frames=onnx_max_mem_frames,
+        onnx_max_obj_ptrs=onnx_max_obj_ptrs,
+        onnx_variant=onnx_variant,
+    )
+
+    native = _load_npz(native_npz)
+    onnx = _load_npz(onnx_npz)
+    native_frame_count = len(native["masks"])
+    onnx_frame_count = len(onnx["masks"])
+    frame_count = min(native_frame_count, onnx_frame_count)
+    frame_summaries = [
+        _frame_metrics(native["masks"][idx], onnx["masks"][idx]) for idx in range(frame_count)
+    ]
+    if frame_summaries:
+        mean_iou = float(np.mean([item["iou"] for item in frame_summaries]))
+        min_iou = float(np.min([item["iou"] for item in frame_summaries]))
+        mean_dice = float(np.mean([item["dice"] for item in frame_summaries]))
+        mean_pixel_acc = float(np.mean([item["pixel_acc"] for item in frame_summaries]))
+        worst_frame_idx = int(np.argmin([item["iou"] for item in frame_summaries]))
+        worst_frame = {"frame_idx": worst_frame_idx, **frame_summaries[worst_frame_idx]}
+    else:
+        mean_iou = 0.0
+        min_iou = 0.0
+        mean_dice = 0.0
+        mean_pixel_acc = 0.0
+        worst_frame = None
+
+    summary = {
+        "video": str(video_path),
+        "frame_count": frame_count,
+        "native_frame_count": native_frame_count,
+        "onnx_frame_count": onnx_frame_count,
+        "prompt": prompt_spec,
+        "onnx_variant": onnx_variant,
+        "onnx_max_mem_frames": int(onnx_max_mem_frames),
+        "onnx_max_obj_ptrs": int(onnx_max_obj_ptrs),
+        "mean_iou": mean_iou,
+        "min_iou": min_iou,
+        "mean_dice": mean_dice,
+        "mean_pixel_acc": mean_pixel_acc,
+        "worst_frame": worst_frame,
+        "frame_metrics": frame_summaries,
+    }
+    summary.update(_summarize_timings("native", native))
+    summary.update(_summarize_timings("onnx", onnx))
+
+    with summary_json.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    return {
+        "summary": summary,
+        "summary_json": summary_json,
+        "prompt_json": prompt_json,
+        "native_npz": native_npz,
+        "onnx_npz": onnx_npz,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare native SAM3 tracker propagation against the ONNX wrapper."
@@ -586,6 +695,11 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
+        "--onnx_variant",
+        default=os.getenv("SAM3_ONNX_VARIANT", "").strip(),
+        help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
+    )
+    parser.add_argument(
         "--onnx_max_mem_frames",
         type=int,
         default=ONNX_FAST_DEFAULT_MAX_MEM_FRAMES,
@@ -616,78 +730,29 @@ def main():
 
     video = _load_video_frames(args.video, args.max_frames)
     prompt_spec = _resolve_prompt(args, video.raw_frames[0])
-    prompt_json_path = Path(args.save_prompt_json).resolve() if args.save_prompt_json else outdir / "prompt.json"
-    _save_prompt_spec(prompt_json_path, prompt_spec)
-
-    native_npz = outdir / "native.npz"
-    onnx_npz = outdir / "onnx.npz"
-    summary_json = outdir / "summary.json"
-
-    print(f"[INFO] Output dir: {outdir}")
-    print("[INFO] Running native PyTorch tracker...")
-    _run_native_tracker(
-        video=video,
-        prompt_spec=prompt_spec,
-        checkpoint=str(Path(args.checkpoint).resolve()),
-        sam3_repo=Path(args.sam3_repo).resolve(),
-        save_path=native_npz,
-        video_path=args.video,
-    )
-    print("[INFO] Running ONNX tracker...")
-    _run_onnx_subprocess(
+    run = run_compare(
         video_path=args.video,
         onnx_dir=Path(args.onnx_dir).resolve(),
-        prompt_json=prompt_json_path,
-        save_path=onnx_npz,
+        checkpoint=str(Path(args.checkpoint).resolve()),
+        sam3_repo=Path(args.sam3_repo).resolve(),
+        prompt_spec=prompt_spec,
+        outdir=outdir,
         max_frames=len(video.raw_frames),
         safe=args.safe,
         onnx_accel=args.onnx_accel,
         onnx_max_mem_frames=args.onnx_max_mem_frames,
         onnx_max_obj_ptrs=args.onnx_max_obj_ptrs,
+        onnx_variant=args.onnx_variant,
+        prompt_json_path=Path(args.save_prompt_json).resolve() if args.save_prompt_json else None,
     )
-
-    native = _load_npz(native_npz)
-    onnx = _load_npz(onnx_npz)
-    native_frame_count = len(native["masks"])
-    onnx_frame_count = len(onnx["masks"])
-    frame_count = min(native_frame_count, onnx_frame_count)
-    frame_summaries = [
-        _frame_metrics(native["masks"][idx], onnx["masks"][idx]) for idx in range(frame_count)
-    ]
-    if frame_summaries:
-        mean_iou = float(np.mean([item["iou"] for item in frame_summaries]))
-        min_iou = float(np.min([item["iou"] for item in frame_summaries]))
-        mean_dice = float(np.mean([item["dice"] for item in frame_summaries]))
-        mean_pixel_acc = float(np.mean([item["pixel_acc"] for item in frame_summaries]))
-        worst_frame_idx = int(np.argmin([item["iou"] for item in frame_summaries]))
-        worst_frame = {"frame_idx": worst_frame_idx, **frame_summaries[worst_frame_idx]}
-    else:
-        mean_iou = 0.0
-        min_iou = 0.0
-        mean_dice = 0.0
-        mean_pixel_acc = 0.0
-        worst_frame = None
-
-    summary = {
-        "video": str(args.video),
-        "frame_count": frame_count,
-        "native_frame_count": native_frame_count,
-        "onnx_frame_count": onnx_frame_count,
-        "prompt": prompt_spec,
-        "onnx_max_mem_frames": int(args.onnx_max_mem_frames),
-        "onnx_max_obj_ptrs": int(args.onnx_max_obj_ptrs),
-        "mean_iou": mean_iou,
-        "min_iou": min_iou,
-        "mean_dice": mean_dice,
-        "mean_pixel_acc": mean_pixel_acc,
-        "worst_frame": worst_frame,
-        "frame_metrics": frame_summaries,
-    }
-    summary.update(_summarize_timings("native", native))
-    summary.update(_summarize_timings("onnx", onnx))
-
-    with summary_json.open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    summary = run["summary"]
+    summary_json = run["summary_json"]
+    native_npz = run["native_npz"]
+    onnx_npz = run["onnx_npz"]
+    mean_iou = summary["mean_iou"]
+    min_iou = summary["min_iou"]
+    mean_dice = summary["mean_dice"]
+    mean_pixel_acc = summary["mean_pixel_acc"]
 
     print(f"[INFO] Mean IoU      : {mean_iou:.4f}")
     print(f"[INFO] Min IoU       : {min_iou:.4f}")

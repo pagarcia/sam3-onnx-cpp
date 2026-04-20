@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "name": "sample_points_fast",
+      "video": "C:\\path\\to\\clip.mp4",
+      "points": "320,240,1;420,300,0",
+      "max_frames": 20,
+      "onnx_max_mem_frames": 2,
+      "onnx_max_obj_ptrs": 16,
+      "thresholds": {
+        "min": {
+          "mean_iou": 0.95,
+          "min_iou": 0.85
+        },
+        "max": {
+          "onnx_mean_total_ms": 1300.0
+        }
+      }
+    },
+    {
+      "name": "sample_box_quality",
+      "video": "C:\\path\\to\\clip.mp4",
+      "box": "120,80,520,430",
+      "max_frames": 20,
+      "onnx_max_mem_frames": 7,
+      "onnx_max_obj_ptrs": 16,
+      "thresholds": {
+        "min": {
+          "mean_iou": 0.95
+        }
+      }
+    }
+  ]
+}

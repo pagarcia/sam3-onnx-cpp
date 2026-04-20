@@ -9,6 +9,34 @@ import numpy as np
 import torch
 
 
+VARIANT_PRESETS = {
+    "default": {
+        "name": "",
+        "max_mem_frames": None,
+        "max_obj_ptrs": None,
+        "static_memory_shapes": False,
+    },
+    "fast": {
+        "name": "fast",
+        "max_mem_frames": 2,
+        "max_obj_ptrs": 16,
+        "static_memory_shapes": True,
+    },
+    "quality": {
+        "name": "quality",
+        "max_mem_frames": 7,
+        "max_obj_ptrs": 16,
+        "static_memory_shapes": True,
+    },
+    "parity": {
+        "name": "parity",
+        "max_mem_frames": None,
+        "max_obj_ptrs": None,
+        "static_memory_shapes": True,
+    },
+}
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -121,7 +149,45 @@ def _build_model(args):
     return model
 
 
-def _save_video_constants(model, outdir: Path) -> None:
+def _parse_csv(text: str) -> list[str]:
+    values = []
+    for item in text.split(","):
+        value = item.strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _build_export_variants(model, variant_names: list[str], precisions: list[str]):
+    from src.utils import ExportVariant
+
+    tracker = model.inst_interactive_predictor.model
+    native_mem = int(tracker.num_maskmem)
+    native_obj_ptrs = int(tracker.max_obj_ptrs_in_encoder)
+    variants = []
+
+    for variant_name in variant_names:
+        if variant_name not in VARIANT_PRESETS:
+            raise SystemExit(
+                f"Unsupported variant {variant_name!r}. Expected one of: {', '.join(sorted(VARIANT_PRESETS))}."
+            )
+        preset = VARIANT_PRESETS[variant_name]
+        for precision in precisions:
+            if precision not in ("fp32", "fp16"):
+                raise SystemExit("--precisions must contain only fp32 and/or fp16.")
+            variants.append(
+                ExportVariant(
+                    name=preset["name"],
+                    precision=precision,
+                    max_mem_frames=preset["max_mem_frames"] or native_mem,
+                    max_obj_ptrs=preset["max_obj_ptrs"] or native_obj_ptrs,
+                    static_memory_shapes=bool(preset["static_memory_shapes"]),
+                )
+            )
+    return variants
+
+
+def _save_video_constants(model, outdir: Path, variant) -> None:
     tracker = model.inst_interactive_predictor.model
     with torch.no_grad():
         dummy = torch.zeros(1, 3, 1008, 1008, dtype=torch.float32)
@@ -136,15 +202,17 @@ def _save_video_constants(model, outdir: Path) -> None:
         )
         _, _feats, pos_embeds, _feat_sizes = tracker._prepare_backbone_features(backbone_out)
 
-    constants_path = outdir / "video_constants.npz"
+    constants_path = outdir / variant.filename("video_constants.npz")
     np.savez(
         constants_path,
         no_mem_embed_bchw=tracker.no_mem_embed.detach().cpu().numpy().reshape(1, 256, 1, 1),
         current_vision_pos_embed=pos_embeds[-1].detach().cpu().numpy(),
         num_maskmem=np.array([tracker.num_maskmem], dtype=np.int64),
         max_obj_ptrs=np.array([tracker.max_obj_ptrs_in_encoder], dtype=np.int64),
+        export_max_mem_frames=np.array([int(variant.max_mem_frames or tracker.num_maskmem)], dtype=np.int64),
+        export_max_obj_ptrs=np.array([int(variant.max_obj_ptrs or tracker.max_obj_ptrs_in_encoder)], dtype=np.int64),
     )
-    print(f"[INFO] Saved video constants: {constants_path}")
+    print(f"[INFO] Saved video constants [{variant.token or 'default'}]: {constants_path}")
 
 
 def main(args) -> None:
@@ -180,10 +248,22 @@ def main(args) -> None:
     mem_attn = MemAttention(model).eval().cpu()
     mem_enc = MemEncoder(model).eval().cpu()
 
-    export_image_decoder(decoder, str(outdir))
-    export_memory_attention(mem_attn, str(outdir))
-    export_memory_encoder(mem_enc, str(outdir))
-    _save_video_constants(model, outdir)
+    variant_names = _parse_csv(args.variants)
+    precisions = _parse_csv(args.precisions)
+    export_variants = _build_export_variants(model, variant_names, precisions)
+    if not export_variants:
+        raise SystemExit("No export variants were selected.")
+
+    print(
+        "[INFO] Variants    : "
+        + ", ".join(variant.token or "default" for variant in export_variants)
+    )
+
+    for variant in export_variants:
+        export_image_decoder(decoder, str(outdir), variant)
+        export_memory_attention(mem_attn, str(outdir), variant)
+        export_memory_encoder(mem_enc, str(outdir), variant)
+        _save_video_constants(model, outdir, variant)
 
     print("[INFO] Export complete.")
 
@@ -211,5 +291,15 @@ if __name__ == "__main__":
         "--outdir",
         default=str(_repo_root() / "checkpoints" / "sam3" / "video_onnx"),
         help="Directory where the exported ONNX files will be written.",
+    )
+    parser.add_argument(
+        "--variants",
+        default="default",
+        help="Comma-separated export presets: default, fast, quality, parity.",
+    )
+    parser.add_argument(
+        "--precisions",
+        default="fp32",
+        help="Comma-separated precisions to emit for each selected variant: fp32 and/or fp16.",
     )
     main(parser.parse_args())

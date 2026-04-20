@@ -106,6 +106,11 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
+        "--onnx_variant",
+        default="",
+        help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
+    )
+    parser.add_argument(
         "--outdir",
         default="",
         help="Optional output directory for the preset benchmark outputs.",
@@ -177,6 +182,7 @@ def main():
                 onnx_accel=args.onnx_accel,
                 onnx_max_mem_frames=preset["max_mem_frames"],
                 onnx_max_obj_ptrs=preset["max_obj_ptrs"],
+                onnx_variant=args.onnx_variant,
             )
             onnx_runs.append(_load_npz(onnx_npz))
 
@@ -211,6 +217,7 @@ def main():
         "prompt": prompt_spec,
         "presets": {name: PRESETS[name] for name in args.presets},
         "onnx_accel": args.onnx_accel,
+        "onnx_variant": args.onnx_variant,
         "repeats": int(args.repeats),
         "fastest": fastest,
         "best_iou": best_iou,
