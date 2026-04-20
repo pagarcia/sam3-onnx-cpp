@@ -7,44 +7,62 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+import argparse
 import sys
 import time
-import argparse
 from pathlib import Path
 
 import cv2
-import numpy as np
-from PyQt5 import QtWidgets
 import onnxruntime as ort
+from PyQt5 import QtWidgets
 
 from onnx_test_utils import (
-    print_system_info, set_cv2_threads,
+    compute_display_base,
+    empty_boxes,
+    empty_points,
+    green_overlay,
     make_session,
+    pick_best_mask,
+    postprocess_mask_to_original,
+    prepare_boxes,
+    prepare_points,
     preprocess_image_bgr,
-    prepare_points, prepare_boxes,
-    empty_points, empty_boxes,
-    run_encoder, run_decoder,
-    pick_best_mask, postprocess_mask_to_original,
-    compute_display_base, green_overlay,
+    print_system_info,
+    run_decoder,
+    run_encoder,
+    set_cv2_threads,
 )
 
-def main():
-    print_system_info()
-    set_cv2_threads(1)
 
-    ap = argparse.ArgumentParser(description="SAM3-Tracker ONNX (image) – seed points / bounding box")
-    ap.add_argument("--prompt", default="seed_points", choices=["seed_points", "bounding_box"])
-    ap.add_argument("--safe", action="store_true", help="Disable ORT graph optimizations (more conservative).")
-    args = ap.parse_args()
-    mode_bbox = args.prompt == "bounding_box"
-    print(f"[INFO] Prompt mode: {'bounding_box' if mode_bbox else 'seed_points'}")
+def _resolve_image_path(arg_value: str) -> str:
+    if arg_value:
+        image_path = Path(arg_value).expanduser().resolve()
+        if not image_path.exists():
+            sys.exit(f"ERROR: Image file does not exist: {image_path}")
+        return str(image_path)
 
     app = QtWidgets.QApplication(sys.argv)
     img_path, _ = QtWidgets.QFileDialog.getOpenFileName(
         None, "Select an Image", "", "Images (*.jpg *.jpeg *.png *.bmp);;All files (*)"
     )
     if not img_path:
-        sys.exit("No image selected – exiting.")
+        sys.exit("No image selected - exiting.")
+    return img_path
+
+
+def main():
+    print_system_info()
+    set_cv2_threads(1)
+
+    ap = argparse.ArgumentParser(description="SAM3-Tracker ONNX (image) - seed points / bounding box")
+    ap.add_argument("--prompt", default="seed_points", choices=["seed_points", "bounding_box"])
+    ap.add_argument("--image", default="", help="Optional image path. If omitted, a file picker is shown.")
+    ap.add_argument("--safe", action="store_true", help="Disable ORT graph optimizations (more conservative).")
+    args = ap.parse_args()
+    mode_bbox = args.prompt == "bounding_box"
+    print(f"[INFO] Prompt mode: {'bounding_box' if mode_bbox else 'seed_points'}")
+
+    img_path = _resolve_image_path(args.image)
     print(f"[INFO] Selected image: {img_path}")
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -63,10 +81,16 @@ def main():
 
     if requested == "fp16":
         enc_path = pick(onnx_dir / "vision_encoder_fp16.onnx", onnx_dir / "vision_encoder.onnx")
-        dec_path = pick(onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx", onnx_dir / "prompt_encoder_mask_decoder.onnx")
+        dec_path = pick(
+            onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx",
+            onnx_dir / "prompt_encoder_mask_decoder.onnx",
+        )
     else:
         enc_path = pick(onnx_dir / "vision_encoder.onnx", onnx_dir / "vision_encoder_fp16.onnx")
-        dec_path = pick(onnx_dir / "prompt_encoder_mask_decoder.onnx", onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx")
+        dec_path = pick(
+            onnx_dir / "prompt_encoder_mask_decoder.onnx",
+            onnx_dir / "prompt_encoder_mask_decoder_fp16.onnx",
+        )
 
     if not enc_path.exists() or not dec_path.exists():
         sys.exit(
@@ -102,8 +126,11 @@ def main():
             print("[HINT] If you have Pascal/Volta, use the README 'Stable stack (Pascal/Volta-friendly)'.\n")
         raise
 
-    print(f"[INFO] Encoder time: {(time.time()-t0)*1000:.1f} ms")
-    print(f"[INFO] orig_hw={info.orig_hw} target={info.target_size} scale_x={info.scale_x:.6f} scale_y={info.scale_y:.6f}")
+    print(f"[INFO] Encoder time: {(time.time() - t0) * 1000:.1f} ms")
+    print(
+        f"[INFO] orig_hw={info.orig_hw} target={info.target_size} "
+        f"scale_x={info.scale_x:.6f} scale_y={info.scale_y:.6f}"
+    )
 
     disp_base, disp_scale = compute_display_base(img_bgr, max_side=1200)
 
@@ -120,7 +147,13 @@ def main():
         in_pts, in_lbl = prepare_points(points, labels, info)
 
         t = time.time()
-        dec_out = run_decoder(sess_dec, enc_out, input_points=in_pts, input_labels=in_lbl, input_boxes=empty_boxes())
+        dec_out = run_decoder(
+            sess_dec,
+            enc_out,
+            input_points=in_pts,
+            input_labels=in_lbl,
+            input_boxes=empty_boxes(),
+        )
         dt = (time.time() - t) * 1000.0
 
         mask2d, best_score = pick_best_mask(dec_out["pred_masks"], dec_out["iou_scores"], which_prompt=0)
