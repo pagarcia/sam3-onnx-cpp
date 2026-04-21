@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from prompt_spec_utils import prompt_annotations_from_spec
+try:
+    from prompt_spec_utils import prompt_annotations_from_spec
+except ModuleNotFoundError:
+    from .prompt_spec_utils import prompt_annotations_from_spec
 
 
 DEFAULT_MAX_MEM_FRAMES = 2
 MULTI_ANNOTATION_MAX_MEM_FRAMES = 4
 DEFAULT_MAX_OBJ_PTRS = 16
+SINGLE_GRAPH_PROFILE = "single"
+MULTI_GRAPH_PROFILE = "multi"
 
 
 def prompt_annotation_count(prompt_spec: dict[str, Any]) -> int:
@@ -19,6 +24,14 @@ def recommended_max_mem_frames(annotation_count: int) -> int:
         MULTI_ANNOTATION_MAX_MEM_FRAMES
         if int(annotation_count) > 1
         else DEFAULT_MAX_MEM_FRAMES
+    )
+
+
+def recommended_graph_profile(annotation_count: int) -> str:
+    return (
+        MULTI_GRAPH_PROFILE
+        if int(annotation_count) > 1
+        else SINGLE_GRAPH_PROFILE
     )
 
 

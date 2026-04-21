@@ -36,10 +36,14 @@ These are the models used by the image-only ONNX demo.
 
 The exporter in `export/` builds tracker-specific ONNX modules from a local SAM3 checkout:
 
-- `checkpoints/sam3/video_onnx/image_decoder.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder.onnx`
-- `checkpoints/sam3/video_onnx/video_constants.npz`
+- `checkpoints/sam3/video_onnx/image_decoder_single.onnx`
+- `checkpoints/sam3/video_onnx/memory_attention_single.onnx`
+- `checkpoints/sam3/video_onnx/memory_encoder_single.onnx`
+- `checkpoints/sam3/video_onnx/video_constants_single.npz`
+- `checkpoints/sam3/video_onnx/image_decoder_multi.onnx`
+- `checkpoints/sam3/video_onnx/memory_attention_multi.onnx`
+- `checkpoints/sam3/video_onnx/memory_encoder_multi.onnx`
+- `checkpoints/sam3/video_onnx/video_constants_multi.npz`
 
 Important limitation:
 
@@ -57,7 +61,8 @@ Important limitation:
 ### Video ONNX path
 
 - Tracker propagation over video frames.
-- First-frame prompt can be seed points or a box.
+- Supports single-frame and multi-frame prompt annotations.
+- Uses an internal `single` graph for one annotation and a `multi` graph for multi-annotation clips.
 - Uses the downloaded vision encoder plus repo-exported tracker modules.
 
 ### Native reference path
@@ -77,7 +82,7 @@ sam3-onnx-cpp/
 |   |-- onnx_test_video.py
 |   |-- inspect_onnx_io.py
 |   |-- compare_native_vs_onnx.py
-|   |-- benchmark_onnx_presets.py
+|   |-- benchmark_onnx_default.py
 |   |-- sweep_onnx_mem_frames.py
 |   |-- sweep_onnx_obj_ptrs.py
 |   `-- api_test_image.py
@@ -258,10 +263,14 @@ python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_po
 
 The video path expects:
 
-- `checkpoints/sam3/video_onnx/image_decoder.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder.onnx`
-- `checkpoints/sam3/video_onnx/video_constants.npz`
+- `checkpoints/sam3/video_onnx/image_decoder_single.onnx`
+- `checkpoints/sam3/video_onnx/memory_attention_single.onnx`
+- `checkpoints/sam3/video_onnx/memory_encoder_single.onnx`
+- `checkpoints/sam3/video_onnx/video_constants_single.npz`
+- `checkpoints/sam3/video_onnx/image_decoder_multi.onnx`
+- `checkpoints/sam3/video_onnx/memory_attention_multi.onnx`
+- `checkpoints/sam3/video_onnx/memory_encoder_multi.onnx`
+- `checkpoints/sam3/video_onnx/video_constants_multi.npz`
 - A complete `vision_encoder*.onnx` plus matching `.onnx_data` under `checkpoints/sam3/onnx`
 
 Example with interactive first-frame points:
@@ -276,16 +285,11 @@ Example with a noninteractive box:
 python python\onnx_test_video.py --video "C:\path\to\video.mp4" --box "120,80,520,430"
 ```
 
-Fast preset controls:
+Default runtime behavior:
 
-- `--max_mem_frames 2`
-- `--max_obj_ptrs 16`
-
-Quality-oriented spatial memory:
-
-```powershell
-python python\onnx_test_video.py --video "C:\path\to\video.mp4" --prompt seed_points --max_mem_frames 7 --max_obj_ptrs 16
-```
+- Single annotation: uses the internal `single` graph and defaults to `--max_mem_frames 2`.
+- Multi-annotation: uses the internal `multi` graph and defaults to `--max_mem_frames 4`.
+- `--max_obj_ptrs` defaults to `16`.
 
 ## Export the Tracker ONNX Modules
 
@@ -317,6 +321,11 @@ By default this writes to:
 checkpoints/sam3/video_onnx
 ```
 
+The exporter writes two internal tracker bundles:
+
+- `single`: static 2-slot memory graph for the common one-annotation path
+- `multi`: static 4-slot memory graph for multi-annotation clips
+
 ## Run the Native Image Reference Demo
 
 This is useful for checking native SAM3 behavior outside ONNX:
@@ -335,10 +344,10 @@ This is useful for checking native SAM3 behavior outside ONNX:
   --prompt seed_points
 ```
 
-## Benchmark ONNX Presets
+## Benchmark The Default ONNX Runtime
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe python\benchmark_onnx_presets.py `
+.\sam3_api_env\Scripts\python.exe python\benchmark_onnx_default.py `
   --video "C:\path\to\video.mp4" `
   --sam3_repo "..\sam3" `
   --checkpoint "C:\path\to\sam3.pt"

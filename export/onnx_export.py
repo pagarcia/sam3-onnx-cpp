@@ -132,6 +132,7 @@ def _parse_csv(text: str) -> list[str]:
 
 def _build_export_variants(model, precisions: list[str]):
     from src.utils import ExportVariant
+    from python.onnx_runtime_policy import DEFAULT_MAX_MEM_FRAMES, MULTI_ANNOTATION_MAX_MEM_FRAMES
 
     tracker = model.inst_interactive_predictor.model
     native_mem = int(tracker.num_maskmem)
@@ -141,14 +142,23 @@ def _build_export_variants(model, precisions: list[str]):
     for precision in precisions:
         if precision not in ("fp32", "fp16"):
             raise SystemExit("--precisions must contain only fp32 and/or fp16.")
-        variants.append(
-            ExportVariant(
-                name="",
-                precision=precision,
-                max_mem_frames=native_mem,
-                max_obj_ptrs=native_obj_ptrs,
-                static_memory_shapes=False,
-            )
+        variants.extend(
+            [
+                ExportVariant(
+                    name="single",
+                    precision=precision,
+                    max_mem_frames=min(native_mem, DEFAULT_MAX_MEM_FRAMES),
+                    max_obj_ptrs=native_obj_ptrs,
+                    static_memory_shapes=True,
+                ),
+                ExportVariant(
+                    name="multi",
+                    precision=precision,
+                    max_mem_frames=min(native_mem, MULTI_ANNOTATION_MAX_MEM_FRAMES),
+                    max_obj_ptrs=native_obj_ptrs,
+                    static_memory_shapes=True,
+                ),
+            ]
         )
     return variants
 
@@ -268,6 +278,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--precisions",
         default="fp32",
-        help="Comma-separated precisions to emit for the default dynamic tracker export: fp32 and/or fp16.",
+        help="Comma-separated precisions to emit for the internal single/multi tracker bundles: fp32 and/or fp16.",
     )
     main(parser.parse_args())

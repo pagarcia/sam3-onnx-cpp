@@ -12,7 +12,12 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from onnx_runtime_policy import DEFAULT_MAX_MEM_FRAMES, DEFAULT_MAX_OBJ_PTRS
+from onnx_runtime_policy import (
+    DEFAULT_MAX_MEM_FRAMES,
+    DEFAULT_MAX_OBJ_PTRS,
+    MULTI_GRAPH_PROFILE,
+    SINGLE_GRAPH_PROFILE,
+)
 from onnx_test_utils import PrepInfo, green_overlay, make_session, preprocess_image_bgr
 
 
@@ -349,7 +354,7 @@ class Sam3OnnxTrackerSession:
     ) -> None:
         self.onnx_dir = Path(onnx_dir).resolve()
         self.mode = "default"
-        self.graph_profile = self._resolve_graph_profile(self.onnx_dir, int(max_mem_frames))
+        self.graph_profile = self._resolve_graph_profile(int(max_mem_frames))
         self.constants = self._load_video_constants(self.onnx_dir, self.graph_profile)
 
         native_num_maskmem = int(
@@ -1026,41 +1031,32 @@ class Sam3OnnxTrackerSession:
         return f"{stem}_{graph_profile}{suffix}"
 
     @classmethod
-    def _bundle_exists(cls, onnx_dir: Path, graph_profile: str) -> bool:
-        required = (
-            "image_decoder.onnx",
-            "memory_attention.onnx",
-            "memory_encoder.onnx",
-            "video_constants.npz",
-        )
-        return all(
-            (onnx_dir / cls._profiled_name(base_name, graph_profile)).exists()
-            for base_name in required
+    def _resolve_graph_profile(cls, requested_max_mem_frames: int) -> str:
+        return (
+            MULTI_GRAPH_PROFILE
+            if int(requested_max_mem_frames) > DEFAULT_MAX_MEM_FRAMES
+            else SINGLE_GRAPH_PROFILE
         )
 
     @classmethod
-    def _resolve_graph_profile(cls, onnx_dir: Path, requested_max_mem_frames: int) -> str:
-        candidates = (
-            ["quality", "parity", "fast", "default"]
-            if int(requested_max_mem_frames) > DEFAULT_MAX_MEM_FRAMES
-            else ["fast", "quality", "parity", "default"]
-        )
-        for graph_profile in candidates:
-            if graph_profile == "default":
-                return "default"
-            if cls._bundle_exists(onnx_dir, graph_profile):
-                return graph_profile
-        return "default"
+    def _candidate_graph_profiles(cls, graph_profile: str) -> tuple[str, ...]:
+        # Keep a narrow compatibility bridge for workspaces that still have the old
+        # preset-era exports and have not been regenerated yet.
+        if graph_profile == SINGLE_GRAPH_PROFILE:
+            return (SINGLE_GRAPH_PROFILE, "fast", "default")
+        if graph_profile == MULTI_GRAPH_PROFILE:
+            return (MULTI_GRAPH_PROFILE, "quality", "default")
+        return (graph_profile, "default")
 
     @classmethod
     def _resolve_model_path(cls, onnx_dir: Path, base_name: str, graph_profile: str) -> Path:
-        candidate = onnx_dir / cls._profiled_name(base_name, graph_profile)
-        if candidate.exists():
-            return candidate
-        fallback = onnx_dir / base_name
-        if fallback.exists():
-            return fallback
-        return candidate
+        last_candidate = onnx_dir / base_name
+        for candidate_profile in cls._candidate_graph_profiles(graph_profile):
+            candidate = onnx_dir / cls._profiled_name(base_name, candidate_profile)
+            last_candidate = candidate
+            if candidate.exists():
+                return candidate
+        return last_candidate
 
     @classmethod
     def _resolve_encoder_path(cls, onnx_dir: Path) -> Path:
