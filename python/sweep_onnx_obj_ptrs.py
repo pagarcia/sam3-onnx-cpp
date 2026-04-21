@@ -182,15 +182,15 @@ def main():
 
         print(
             f"[INFO] obj_ptrs={obj_ptrs} | IoU={summary['mean_iou']:.4f} | "
-            f"median ONNX={summary['onnx_median_total_ms']:.1f} ms/frame | "
-            f"median native={summary['native_median_total_ms']:.1f} ms/frame | "
-            f"repeat-median speedup={summary['speedup_vs_native_repeat_median_mean']:.2f}x"
+            f"steady ONNX={summary.get('onnx_repeat_median_mean_steady_total_ms', summary['onnx_repeat_median_mean_total_ms']):.1f} ms/frame | "
+            f"steady native={summary.get('native_repeat_median_mean_steady_total_ms', summary['native_repeat_median_mean_total_ms']):.1f} ms/frame | "
+            f"steady speedup={summary.get('speedup_vs_native_repeat_median_mean_steady', summary['speedup_vs_native_repeat_median_mean']):.2f}x"
         )
 
     ranking = sorted(
         rows,
         key=lambda item: (
-            item["onnx_repeat_median_mean_total_ms"],
+            item.get("onnx_repeat_median_mean_steady_total_ms", item["onnx_repeat_median_mean_total_ms"]),
             -item["repeat_mean_iou_median"],
         ),
     )
@@ -223,8 +223,9 @@ def main():
     if best_stable_speed is not None:
         print(
             f"[INFO] Best stable speed: obj_ptrs={best_stable_speed['onnx_max_obj_ptrs']} "
-            f"at repeat-median mean {best_stable_speed['onnx_repeat_median_mean_total_ms']:.1f} ms/frame "
-            f"({best_stable_speed['speedup_vs_native_repeat_median_mean']:.2f}x native)"
+            f"at repeat-median steady mean "
+            f"{best_stable_speed.get('onnx_repeat_median_mean_steady_total_ms', best_stable_speed['onnx_repeat_median_mean_total_ms']):.1f} ms/frame "
+            f"({best_stable_speed.get('speedup_vs_native_repeat_median_mean_steady', best_stable_speed['speedup_vs_native_repeat_median_mean']):.2f}x native)"
         )
     if best_iou is not None:
         print(

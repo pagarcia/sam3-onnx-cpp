@@ -12,6 +12,7 @@ from compare_native_vs_onnx import (
     DEFAULT_ONNX_DIR,
     DEFAULT_SAM3_REPO,
     REPO_ROOT,
+    _decode_json_scalar,
     _frame_metrics,
     _load_npz,
     _load_video_frames,
@@ -22,7 +23,7 @@ from compare_native_vs_onnx import (
 )
 
 
-TIMING_KEYS = ("enc_ms", "attn_ms", "dec_ms", "mem_ms", "total_ms")
+TIMING_KEYS = ("prep_ms", "enc_ms", "attn_ms", "dec_ms", "mem_ms", "total_ms")
 
 
 def _parse_mem_frames(text: str) -> list[int]:
@@ -41,34 +42,72 @@ def _parse_mem_frames(text: str) -> list[int]:
     return values
 
 
+def _summarize_timing_series(prefix: str, key: str, arrays: list[np.ndarray], summary: dict) -> None:
+    non_empty = [arr for arr in arrays if arr.size > 0]
+    if not non_empty:
+        return
+
+    stacked = np.concatenate(non_empty, axis=0)
+    repeat_means = np.asarray([arr.mean() for arr in non_empty], dtype=np.float32)
+    repeat_medians = np.asarray([np.median(arr) for arr in non_empty], dtype=np.float32)
+
+    summary[f"{prefix}_mean_{key}"] = float(stacked.mean())
+    summary[f"{prefix}_median_{key}"] = float(np.median(stacked))
+    summary[f"{prefix}_p90_{key}"] = float(np.percentile(stacked, 90))
+    summary[f"{prefix}_repeat_mean_{key}"] = float(repeat_means.mean())
+    summary[f"{prefix}_repeat_median_mean_{key}"] = float(np.median(repeat_means))
+    summary[f"{prefix}_repeat_std_mean_{key}"] = float(repeat_means.std())
+    summary[f"{prefix}_repeat_median_{key}"] = float(repeat_medians.mean())
+    summary[f"{prefix}_repeat_median_median_{key}"] = float(np.median(repeat_medians))
+    summary[f"{prefix}_repeat_std_median_{key}"] = float(repeat_medians.std())
+
+
 def _aggregate_timing_arrays(prefix: str, runs: list[dict]) -> dict:
     summary = {
         f"{prefix}_repeat_count": int(len(runs)),
     }
+    arrays_by_key: dict[str, list[np.ndarray]] = {}
     for key in TIMING_KEYS:
-        arrays = [np.asarray(run[key], dtype=np.float32) for run in runs]
-        stacked = np.concatenate(arrays, axis=0)
-        repeat_means = np.asarray([arr.mean() for arr in arrays], dtype=np.float32)
-        repeat_medians = np.asarray([np.median(arr) for arr in arrays], dtype=np.float32)
+        arrays = [np.asarray(run[key], dtype=np.float32) for run in runs if key in run]
+        arrays_by_key[key] = arrays
+        _summarize_timing_series(prefix, key, arrays, summary)
 
-        summary[f"{prefix}_mean_{key}"] = float(stacked.mean())
-        summary[f"{prefix}_median_{key}"] = float(np.median(stacked))
-        summary[f"{prefix}_p90_{key}"] = float(np.percentile(stacked, 90))
-        summary[f"{prefix}_repeat_mean_{key}"] = float(repeat_means.mean())
-        summary[f"{prefix}_repeat_median_mean_{key}"] = float(np.median(repeat_means))
-        summary[f"{prefix}_repeat_std_mean_{key}"] = float(repeat_means.std())
-        summary[f"{prefix}_repeat_median_{key}"] = float(repeat_medians.mean())
-        summary[f"{prefix}_repeat_median_median_{key}"] = float(np.median(repeat_medians))
-        summary[f"{prefix}_repeat_std_median_{key}"] = float(repeat_medians.std())
+    total_arrays = arrays_by_key.get("total_ms", [])
+    _summarize_timing_series(
+        prefix,
+        "frame0_total_ms",
+        [arr[:1] for arr in total_arrays if arr.size > 0],
+        summary,
+    )
+    _summarize_timing_series(
+        prefix,
+        "steady_total_ms",
+        [arr[1:] if arr.size > 1 else arr for arr in total_arrays if arr.size > 0],
+        summary,
+    )
 
-    mean_total = summary[f"{prefix}_mean_total_ms"]
-    median_total = summary[f"{prefix}_median_total_ms"]
-    repeat_median_mean_total = summary[f"{prefix}_repeat_median_mean_total_ms"]
+    mean_total = summary.get(f"{prefix}_mean_total_ms")
+    median_total = summary.get(f"{prefix}_median_total_ms")
+    repeat_median_mean_total = summary.get(f"{prefix}_repeat_median_mean_total_ms")
+    mean_steady_total = summary.get(f"{prefix}_mean_steady_total_ms")
+    repeat_median_mean_steady_total = summary.get(f"{prefix}_repeat_median_mean_steady_total_ms")
 
-    summary[f"{prefix}_fps"] = float(1000.0 / mean_total) if mean_total > 0 else 0.0
-    summary[f"{prefix}_median_fps"] = float(1000.0 / median_total) if median_total > 0 else 0.0
+    summary[f"{prefix}_fps"] = float(1000.0 / mean_total) if mean_total and mean_total > 0 else 0.0
+    summary[f"{prefix}_median_fps"] = (
+        float(1000.0 / median_total) if median_total and median_total > 0 else 0.0
+    )
     summary[f"{prefix}_repeat_median_mean_fps"] = (
-        float(1000.0 / repeat_median_mean_total) if repeat_median_mean_total > 0 else 0.0
+        float(1000.0 / repeat_median_mean_total)
+        if repeat_median_mean_total and repeat_median_mean_total > 0
+        else 0.0
+    )
+    summary[f"{prefix}_steady_fps"] = (
+        float(1000.0 / mean_steady_total) if mean_steady_total and mean_steady_total > 0 else 0.0
+    )
+    summary[f"{prefix}_repeat_median_mean_steady_fps"] = (
+        float(1000.0 / repeat_median_mean_steady_total)
+        if repeat_median_mean_steady_total and repeat_median_mean_steady_total > 0
+        else 0.0
     )
     return summary
 
@@ -114,8 +153,13 @@ def _aggregate_quality(native_ref: dict, onnx_runs: list[dict]) -> dict:
         min_iou = float(np.min([item["iou"] for item in all_frame_summaries]))
         mean_dice = float(np.mean([item["dice"] for item in all_frame_summaries]))
         mean_pixel_acc = float(np.mean([item["pixel_acc"] for item in all_frame_summaries]))
-        worst_frame_idx = int(np.argmin([item["iou"] for item in all_frame_summaries])) % frame_count
-        worst_frame = {"frame_idx": worst_frame_idx, **all_frame_summaries[worst_frame_idx]}
+        worst_global_idx = int(np.argmin([item["iou"] for item in all_frame_summaries]))
+        worst_frame_idx = worst_global_idx % frame_count
+        worst_frame = {
+            "repeat_idx": int(worst_global_idx // frame_count) + 1,
+            "frame_idx": worst_frame_idx,
+            **all_frame_summaries[worst_global_idx],
+        }
     else:
         mean_iou = 0.0
         min_iou = 0.0
@@ -161,6 +205,11 @@ def _aggregate_summary(native_runs: list[dict], onnx_runs: list[dict], mem_frame
     summary.update(quality)
     summary.update(_aggregate_timing_arrays("native", native_runs))
     summary.update(_aggregate_timing_arrays("onnx", onnx_runs))
+    onnx_runtime = _decode_json_scalar(onnx_runs[0], "runtime_json") if onnx_runs else None
+    if isinstance(onnx_runtime, dict):
+        summary["onnx_variant"] = onnx_runtime.get("resolved_variant", "")
+        summary["onnx_preset_requested"] = onnx_runtime.get("requested_preset", "")
+        summary["onnx_runtime"] = onnx_runtime
 
     native_mean_total = summary["native_mean_total_ms"]
     onnx_mean_total = summary["onnx_mean_total_ms"]
@@ -168,6 +217,16 @@ def _aggregate_summary(native_runs: list[dict], onnx_runs: list[dict], mem_frame
     onnx_median_total = summary["onnx_median_total_ms"]
     native_repeat_median_mean_total = summary["native_repeat_median_mean_total_ms"]
     onnx_repeat_median_mean_total = summary["onnx_repeat_median_mean_total_ms"]
+    native_mean_steady_total = summary.get("native_mean_steady_total_ms", native_mean_total)
+    onnx_mean_steady_total = summary.get("onnx_mean_steady_total_ms", onnx_mean_total)
+    native_repeat_median_mean_steady_total = summary.get(
+        "native_repeat_median_mean_steady_total_ms",
+        native_repeat_median_mean_total,
+    )
+    onnx_repeat_median_mean_steady_total = summary.get(
+        "onnx_repeat_median_mean_steady_total_ms",
+        onnx_repeat_median_mean_total,
+    )
 
     summary["speedup_vs_native_mean"] = float(native_mean_total / onnx_mean_total) if onnx_mean_total > 0 else 0.0
     summary["speedup_vs_native_median"] = (
@@ -178,14 +237,25 @@ def _aggregate_summary(native_runs: list[dict], onnx_runs: list[dict], mem_frame
         if onnx_repeat_median_mean_total > 0
         else 0.0
     )
+    summary["speedup_vs_native_mean_steady"] = (
+        float(native_mean_steady_total / onnx_mean_steady_total) if onnx_mean_steady_total > 0 else 0.0
+    )
+    summary["speedup_vs_native_repeat_median_mean_steady"] = (
+        float(native_repeat_median_mean_steady_total / onnx_repeat_median_mean_steady_total)
+        if onnx_repeat_median_mean_steady_total > 0
+        else 0.0
+    )
     summary["onnx_total_delta_mean_ms"] = float(onnx_mean_total - native_mean_total)
     summary["onnx_total_delta_median_ms"] = float(onnx_median_total - native_median_total)
+    summary["onnx_steady_total_delta_mean_ms"] = float(onnx_mean_steady_total - native_mean_steady_total)
     return summary
 
 
 def _write_csv(path: Path, rows) -> None:
     fieldnames = [
         "onnx_max_mem_frames",
+        "onnx_variant",
+        "onnx_preset_requested",
         "repeat_count",
         "mean_iou",
         "repeat_mean_iou_median",
@@ -198,15 +268,25 @@ def _write_csv(path: Path, rows) -> None:
         "repeat_mean_dice_std",
         "native_mean_total_ms",
         "native_median_total_ms",
+        "native_mean_frame0_total_ms",
+        "native_mean_steady_total_ms",
         "native_repeat_median_mean_total_ms",
+        "native_repeat_median_mean_steady_total_ms",
         "native_repeat_std_mean_total_ms",
         "onnx_mean_total_ms",
         "onnx_median_total_ms",
+        "onnx_mean_frame0_total_ms",
+        "onnx_mean_steady_total_ms",
         "onnx_repeat_median_mean_total_ms",
+        "onnx_repeat_median_mean_steady_total_ms",
         "onnx_repeat_std_mean_total_ms",
         "speedup_vs_native_mean",
         "speedup_vs_native_median",
         "speedup_vs_native_repeat_median_mean",
+        "speedup_vs_native_mean_steady",
+        "speedup_vs_native_repeat_median_mean_steady",
+        "native_mean_prep_ms",
+        "onnx_mean_prep_ms",
         "native_mean_attn_ms",
         "native_median_attn_ms",
         "onnx_mean_attn_ms",
@@ -375,15 +455,15 @@ def main():
 
         print(
             f"[INFO] mem={mem_frames} | IoU={summary['mean_iou']:.4f} | "
-            f"median ONNX={summary['onnx_median_total_ms']:.1f} ms/frame | "
-            f"median native={summary['native_median_total_ms']:.1f} ms/frame | "
-            f"repeat-median speedup={summary['speedup_vs_native_repeat_median_mean']:.2f}x"
+            f"steady ONNX={summary.get('onnx_repeat_median_mean_steady_total_ms', summary['onnx_repeat_median_mean_total_ms']):.1f} ms/frame | "
+            f"steady native={summary.get('native_repeat_median_mean_steady_total_ms', summary['native_repeat_median_mean_total_ms']):.1f} ms/frame | "
+            f"steady speedup={summary.get('speedup_vs_native_repeat_median_mean_steady', summary['speedup_vs_native_repeat_median_mean']):.2f}x"
         )
 
     ranking = sorted(
         rows,
         key=lambda item: (
-            item["onnx_repeat_median_mean_total_ms"],
+            item.get("onnx_repeat_median_mean_steady_total_ms", item["onnx_repeat_median_mean_total_ms"]),
             -item["repeat_mean_iou_median"],
         ),
     )
@@ -416,8 +496,9 @@ def main():
     if best_stable_speed is not None:
         print(
             f"[INFO] Best stable speed: mem={best_stable_speed['onnx_max_mem_frames']} "
-            f"at repeat-median mean {best_stable_speed['onnx_repeat_median_mean_total_ms']:.1f} ms/frame "
-            f"({best_stable_speed['speedup_vs_native_repeat_median_mean']:.2f}x native)"
+            f"at repeat-median steady mean "
+            f"{best_stable_speed.get('onnx_repeat_median_mean_steady_total_ms', best_stable_speed['onnx_repeat_median_mean_total_ms']):.1f} ms/frame "
+            f"({best_stable_speed.get('speedup_vs_native_repeat_median_mean_steady', best_stable_speed['speedup_vs_native_repeat_median_mean']):.2f}x native)"
         )
     if best_iou is not None:
         print(

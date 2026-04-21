@@ -20,6 +20,7 @@ from sam3_onnx_session import (
     FAST_DEFAULT_MAX_MEM_FRAMES,
     FAST_DEFAULT_MAX_OBJ_PTRS,
     Sam3OnnxTrackerSession,
+    VARIANT_PRESET_CAPS,
     load_prompt_spec,
     mask_to_overlay,
     parse_box_text,
@@ -28,6 +29,23 @@ from sam3_onnx_session import (
     prepare_prompt_points,
     save_prompt_spec,
 )
+
+
+def _resolve_runtime_caps(args) -> tuple[str, int, int]:
+    preset = args.preset.strip().lower()
+    max_mem_frames = args.max_mem_frames
+    max_obj_ptrs = args.max_obj_ptrs
+    if preset:
+        caps = VARIANT_PRESET_CAPS[preset]
+        if max_mem_frames is None:
+            max_mem_frames = caps["max_mem_frames"]
+        if max_obj_ptrs is None:
+            max_obj_ptrs = caps["max_obj_ptrs"]
+    if max_mem_frames is None:
+        max_mem_frames = FAST_DEFAULT_MAX_MEM_FRAMES
+    if max_obj_ptrs is None:
+        max_obj_ptrs = FAST_DEFAULT_MAX_OBJ_PTRS
+    return preset, int(max_mem_frames), int(max_obj_ptrs)
 
 
 def _interactive_select_points(first_bgr, tracker: Sam3OnnxTrackerSession):
@@ -198,6 +216,12 @@ def main():
         help="Optional tracker ONNX variant suffix such as fp16, fast, quality, or quality_fp16.",
     )
     parser.add_argument(
+        "--preset",
+        default="",
+        choices=["", *sorted(VARIANT_PRESET_CAPS.keys())],
+        help="Optional named runtime preset. When set, it fills in missing caps and prefers the matching exported variant.",
+    )
+    parser.add_argument(
         "--prompt",
         default="seed_points",
         choices=["seed_points", "bounding_box"],
@@ -211,14 +235,14 @@ def main():
     parser.add_argument(
         "--max_mem_frames",
         type=int,
-        default=FAST_DEFAULT_MAX_MEM_FRAMES,
-        help="Cap on spatial memory frames used by ONNX attention. Defaults to the fast preset (2), but fixed-shape variants can override it.",
+        default=None,
+        help="Cap on spatial memory frames used by ONNX attention. Defaults to the selected preset, or the fast preset when omitted.",
     )
     parser.add_argument(
         "--max_obj_ptrs",
         type=int,
-        default=FAST_DEFAULT_MAX_OBJ_PTRS,
-        help="Cap on object pointers used by ONNX attention. Defaults to the fast preset (16), but fixed-shape variants can override it.",
+        default=None,
+        help="Cap on object pointers used by ONNX attention. Defaults to the selected preset, or the fast preset when omitted.",
     )
     parser.add_argument(
         "--points",
@@ -259,17 +283,33 @@ def main():
 
     video_path = _resolve_video(args)
     print(f"[INFO] Video: {video_path}")
+    preset, max_mem_frames, max_obj_ptrs = _resolve_runtime_caps(args)
 
     tracker = Sam3OnnxTrackerSession(
         Path(args.onnx_dir),
         safe=args.safe,
-        max_mem_frames=args.max_mem_frames,
-        max_obj_ptrs=args.max_obj_ptrs,
+        max_mem_frames=max_mem_frames,
+        max_obj_ptrs=max_obj_ptrs,
         variant=args.onnx_variant,
+        preset=preset,
+    )
+    runtime = tracker.runtime_metadata
+    print(
+        f"[INFO] ONNX runtime: preset={runtime['requested_preset'] or 'auto'} "
+        f"variant={runtime['resolved_variant'] or 'default'} "
+        f"device={runtime['device_type']}"
+    )
+    print(
+        f"[INFO] Models: enc={runtime['model_names']['encoder']} "
+        f"dec={runtime['model_names']['decoder']} "
+        f"attn={runtime['model_names']['memory_attention']} "
+        f"mem={runtime['model_names']['memory_encoder']}"
     )
     print(
         f"[INFO] ONNX runtime caps: max_mem_frames={tracker.num_maskmem}, "
-        f"max_obj_ptrs={tracker.max_obj_ptrs}, iobinding={'on' if tracker.uses_iobinding else 'off'}"
+        f"max_obj_ptrs={tracker.max_obj_ptrs}, "
+        f"static_mem={tracker.static_num_mem_frames}, static_obj_ptrs={tracker.static_num_obj_ptrs}, "
+        f"iobinding={'on' if tracker.uses_iobinding else 'off'}"
     )
 
     cap = cv2.VideoCapture(video_path)
@@ -321,6 +361,7 @@ def main():
             raise SystemExit("Could not create the output video writer.")
 
     saved_masks = []
+    saved_prep_ms = []
     saved_enc_ms = []
     saved_attn_ms = []
     saved_dec_ms = []
@@ -350,22 +391,28 @@ def main():
             writer.write(green_overlay(frame_bgr, result.mask_uint8, alpha=0.5))
 
         saved_masks.append(result.mask_uint8)
+        saved_prep_ms.append(result.timings.prep_ms)
         saved_enc_ms.append(result.timings.enc_ms)
         saved_attn_ms.append(result.timings.attn_ms)
         saved_dec_ms.append(result.timings.dec_ms)
         saved_mem_ms.append(result.timings.mem_ms)
-        saved_total_ms.append(result.timings.total_ms)
+        frame_total_ms = result.timings.total_ms
+        if frame_idx == 0:
+            frame_total_ms += result.timings.prep_ms + result.timings.enc_ms
+        saved_total_ms.append(frame_total_ms)
 
         if frame_idx == 0:
             print(
-                f"Frame {frame_idx:03d} | Dec:{result.timings.dec_ms:.1f} ms | "
-                f"MemEnc:{result.timings.mem_ms:.1f} ms"
+                f"Frame {frame_idx:03d} | Prep:{result.timings.prep_ms:.1f} ms | "
+                f"Enc:{result.timings.enc_ms:.1f} ms | Dec:{result.timings.dec_ms:.1f} ms | "
+                f"MemEnc:{result.timings.mem_ms:.1f} ms | Total:{frame_total_ms:.1f} ms"
             )
         else:
             print(
-                f"Frame {frame_idx:03d} | Enc:{result.timings.enc_ms:.1f} ms | "
+                f"Frame {frame_idx:03d} | Prep:{result.timings.prep_ms:.1f} ms | "
+                f"Enc:{result.timings.enc_ms:.1f} ms | "
                 f"Attn:{result.timings.attn_ms:.1f} ms | Dec:{result.timings.dec_ms:.1f} ms | "
-                f"MemEnc:{result.timings.mem_ms:.1f} ms"
+                f"MemEnc:{result.timings.mem_ms:.1f} ms | Total:{frame_total_ms:.1f} ms"
             )
 
         frame_idx += 1
@@ -383,11 +430,13 @@ def main():
         np.savez_compressed(
             save_path,
             masks=np.stack(saved_masks).astype(np.uint8, copy=False),
+            prep_ms=np.asarray(saved_prep_ms, dtype=np.float32),
             enc_ms=np.asarray(saved_enc_ms, dtype=np.float32),
             attn_ms=np.asarray(saved_attn_ms, dtype=np.float32),
             dec_ms=np.asarray(saved_dec_ms, dtype=np.float32),
             mem_ms=np.asarray(saved_mem_ms, dtype=np.float32),
             total_ms=np.asarray(saved_total_ms, dtype=np.float32),
+            runtime_json=np.array(json.dumps(runtime)),
             prompt_json=np.array(json.dumps(prompt_spec)),
             video_path=np.array(str(video_path)),
         )

@@ -209,6 +209,13 @@ def _save_video_constants(model, outdir: Path, variant) -> None:
         current_vision_pos_embed=pos_embeds[-1].detach().cpu().numpy(),
         num_maskmem=np.array([tracker.num_maskmem], dtype=np.int64),
         max_obj_ptrs=np.array([tracker.max_obj_ptrs_in_encoder], dtype=np.int64),
+        max_cond_frames_in_attn=np.array([tracker.max_cond_frames_in_attn], dtype=np.int64),
+        keep_first_cond_frame=np.array([1 if tracker.keep_first_cond_frame else 0], dtype=np.int64),
+        memory_temporal_stride_for_eval=np.array(
+            [tracker.memory_temporal_stride_for_eval],
+            dtype=np.int64,
+        ),
+        use_memory_selection=np.array([1 if tracker.use_memory_selection else 0], dtype=np.int64),
         export_max_mem_frames=np.array([int(variant.max_mem_frames or tracker.num_maskmem)], dtype=np.int64),
         export_max_obj_ptrs=np.array([int(variant.max_obj_ptrs or tracker.max_obj_ptrs_in_encoder)], dtype=np.int64),
     )

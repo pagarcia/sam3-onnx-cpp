@@ -19,6 +19,22 @@ DEFAULT_NUM_MASKMEM = 7
 DEFAULT_MAX_OBJ_PTRS = 16
 FAST_DEFAULT_MAX_MEM_FRAMES = 2
 FAST_DEFAULT_MAX_OBJ_PTRS = 16
+DEFAULT_MAX_COND_FRAMES_IN_ATTN = 4
+DEFAULT_MEMORY_TEMPORAL_STRIDE_FOR_EVAL = 1
+
+VARIANT_PRESET_CAPS = {
+    "fast": {"max_mem_frames": 2, "max_obj_ptrs": 16},
+    "quality": {"max_mem_frames": 7, "max_obj_ptrs": 16},
+    "parity": {"max_mem_frames": 7, "max_obj_ptrs": 16},
+}
+
+ORT_TENSOR_TYPE_TO_NUMPY = {
+    "tensor(float)": np.float32,
+    "tensor(float16)": np.float16,
+    "tensor(int32)": np.int32,
+    "tensor(int64)": np.int64,
+    "tensor(bool)": np.bool_,
+}
 
 
 def _as_f32c(arr: np.ndarray) -> np.ndarray:
@@ -33,6 +49,56 @@ def _to_numpy(value: np.ndarray | ort.OrtValue) -> np.ndarray:
     if isinstance(value, np.ndarray):
         return value
     return np.ascontiguousarray(value.numpy())
+
+
+def _fixed_meta_shape(shape: list[Any] | tuple[Any, ...]) -> tuple[int, ...] | None:
+    dims: list[int] = []
+    for dim in shape:
+        if not isinstance(dim, int) or dim <= 0:
+            return None
+        dims.append(int(dim))
+    return tuple(dims)
+
+
+def _select_closest_cond_frames(
+    frame_idx: int,
+    cond_frame_outputs: dict[int, Any],
+    max_cond_frame_num: int,
+    *,
+    keep_first_cond_frame: bool = False,
+) -> tuple[dict[int, Any], dict[int, Any]]:
+    if max_cond_frame_num == -1 or len(cond_frame_outputs) <= max_cond_frame_num:
+        return cond_frame_outputs, {}
+
+    if max_cond_frame_num < 2:
+        raise ValueError("max_cond_frame_num must be -1 or >= 2")
+
+    selected_outputs: dict[int, Any] = {}
+    if keep_first_cond_frame:
+        idx_first = min((t for t in cond_frame_outputs if t < frame_idx), default=None)
+        if idx_first is None:
+            idx_first = max((t for t in cond_frame_outputs if t > frame_idx), default=None)
+        if idx_first is not None:
+            selected_outputs[idx_first] = cond_frame_outputs[idx_first]
+
+    idx_before = max((t for t in cond_frame_outputs if t < frame_idx), default=None)
+    if idx_before is not None:
+        selected_outputs[idx_before] = cond_frame_outputs[idx_before]
+
+    idx_after = min((t for t in cond_frame_outputs if t >= frame_idx), default=None)
+    if idx_after is not None:
+        selected_outputs[idx_after] = cond_frame_outputs[idx_after]
+
+    num_remain = max_cond_frame_num - len(selected_outputs)
+    inds_remain = sorted(
+        (t for t in cond_frame_outputs if t not in selected_outputs),
+        key=lambda value: abs(value - frame_idx),
+    )[:num_remain]
+    selected_outputs.update((t, cond_frame_outputs[t]) for t in inds_remain)
+    unselected_outputs = {
+        t: value for t, value in cond_frame_outputs.items() if t not in selected_outputs
+    }
+    return selected_outputs, unselected_outputs
 
 
 def empty_prompt() -> tuple[np.ndarray, np.ndarray]:
@@ -117,15 +183,15 @@ def mask_to_overlay(frame_bgr: np.ndarray, mask_logits_high_res: np.ndarray, inf
 
 
 def normalize_encoder_outputs(
-    raw_outputs: dict[str, np.ndarray],
+    raw_outputs: dict[str, np.ndarray | ort.OrtValue],
     constants: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
+) -> dict[str, np.ndarray | ort.OrtValue]:
     if "image_embeddings" in raw_outputs:
         return raw_outputs
 
     current_vision_feat = raw_outputs["image_embeddings.2"]
     return {
-        "image_embeddings": current_vision_feat + constants["no_mem_embed_bchw"],
+        "image_embeddings": _as_f32c(_to_numpy(current_vision_feat) + constants["no_mem_embed_bchw"]),
         "high_res_features0": raw_outputs["image_embeddings.0"],
         "high_res_features1": raw_outputs["image_embeddings.1"],
         "current_vision_feat": current_vision_feat,
@@ -135,21 +201,25 @@ def normalize_encoder_outputs(
 
 @dataclass(frozen=True)
 class PreparedFrame:
-    encoder_outputs: dict[str, np.ndarray]
+    encoder_outputs: dict[str, np.ndarray | ort.OrtValue]
     info: PrepInfo
+    prep_ms: float
+    enc_ms: float
 
 
 @dataclass(frozen=True)
 class TrackerFrameState:
-    maskmem_features: np.ndarray
-    maskmem_pos_enc: np.ndarray
-    obj_ptr: np.ndarray
-    pred_mask_high_res: np.ndarray
-    object_score_logits: np.ndarray
+    maskmem_features: np.ndarray | ort.OrtValue
+    maskmem_pos_enc: np.ndarray | ort.OrtValue
+    obj_ptr: np.ndarray | ort.OrtValue
+    pred_mask_high_res: np.ndarray | ort.OrtValue
+    object_score_logits: np.ndarray | ort.OrtValue
+    eff_iou_score: float | None = None
 
 
 @dataclass(frozen=True)
 class FrameTimings:
+    prep_ms: float
     enc_ms: float
     attn_ms: float
     dec_ms: float
@@ -164,6 +234,18 @@ class FrameResult:
     state: TrackerFrameState
     mask_uint8: np.ndarray
     timings: FrameTimings
+
+
+@dataclass
+class _InputBuffer:
+    array: np.ndarray
+    ortvalue: ort.OrtValue | None
+
+    def sync(self) -> np.ndarray | ort.OrtValue:
+        if self.ortvalue is not None:
+            self.ortvalue.update_inplace(self.array)
+            return self.ortvalue
+        return self.array
 
 
 class _OrtSessionRunner:
@@ -183,6 +265,11 @@ class _OrtSessionRunner:
         self.enable_iobinding = io_binding_pref == "on" or (
             io_binding_pref == "auto" and self.device_type != "cpu"
         )
+        self._output_buffers: dict[str, ort.OrtValue] = {}
+        self._static_output_shapes = {
+            output.name: _fixed_meta_shape(output.shape)
+            for output in self.session.get_outputs()
+        }
 
     def _bind_input(self, binding, name: str, value, owned_inputs: list[ort.OrtValue]) -> None:
         if isinstance(value, ort.OrtValue):
@@ -220,7 +307,27 @@ class _OrtSessionRunner:
         bind_device = (
             self.device_type if output_device == "session" and self.device_type != "cpu" else "cpu"
         )
+        bound_outputs: dict[str, ort.OrtValue] = {}
         for output_name in output_names:
+            if bind_device != "cpu":
+                output_meta = next(
+                    output for output in self.session.get_outputs() if output.name == output_name
+                )
+                shape = self._static_output_shapes.get(output_name)
+                dtype = ORT_TENSOR_TYPE_TO_NUMPY.get(output_meta.type)
+                if shape is not None and dtype is not None:
+                    buffer = self._output_buffers.get(output_name)
+                    if buffer is None:
+                        buffer = ort.OrtValue.ortvalue_from_shape_and_type(
+                            shape,
+                            dtype,
+                            bind_device,
+                            0,
+                        )
+                        self._output_buffers[output_name] = buffer
+                    binding.bind_ortvalue_output(output_name, buffer)
+                    bound_outputs[output_name] = buffer
+                    continue
             binding.bind_output(output_name, bind_device, 0)
 
         self.session.run_with_iobinding(binding)
@@ -229,6 +336,8 @@ class _OrtSessionRunner:
             return dict(zip(output_names, values))
 
         binding.synchronize_outputs()
+        if len(bound_outputs) == len(output_names):
+            return {name: bound_outputs[name] for name in output_names}
         values = list(binding.get_outputs())
         return dict(zip(output_names, values))
 
@@ -242,9 +351,18 @@ class Sam3OnnxTrackerSession:
         max_mem_frames: int = FAST_DEFAULT_MAX_MEM_FRAMES,
         max_obj_ptrs: int = FAST_DEFAULT_MAX_OBJ_PTRS,
         variant: str = "",
+        preset: str = "",
     ) -> None:
         self.onnx_dir = Path(onnx_dir).resolve()
-        self.variant = variant.strip()
+        self.requested_variant = variant.strip()
+        self.requested_preset = preset.strip().lower()
+        self.variant = self._resolve_runtime_variant(
+            self.onnx_dir,
+            requested_variant=self.requested_variant,
+            requested_preset=self.requested_preset,
+            max_mem_frames=max_mem_frames,
+            max_obj_ptrs=max_obj_ptrs,
+        )
         self.constants = self._load_video_constants(self.onnx_dir, self.variant)
 
         native_num_maskmem = int(
@@ -273,14 +391,22 @@ class Sam3OnnxTrackerSession:
             if not path.exists():
                 raise SystemExit(f"Missing ONNX file: {path}")
 
+        self.model_paths = {
+            "encoder": enc_path,
+            "decoder": dec_path,
+            "memory_attention": mat_path,
+            "memory_encoder": men_path,
+        }
         self.sess_enc = make_session(str(enc_path), tag="video_image_encoder", safe=safe)
         self.sess_dec = make_session(str(dec_path), tag="video_image_decoder", safe=safe)
         self.sess_mat = make_session(str(mat_path), tag="video_memory_attention", safe=safe)
         self.sess_men = make_session(str(men_path), tag="video_memory_encoder", safe=safe)
 
+        self._enc_runner = _OrtSessionRunner(self.sess_enc, "video_image_encoder")
         self._dec_runner = _OrtSessionRunner(self.sess_dec, "video_image_decoder")
         self._mat_runner = _OrtSessionRunner(self.sess_mat, "video_memory_attention")
         self._men_runner = _OrtSessionRunner(self.sess_men, "video_memory_encoder")
+        self.device_type = self._mat_runner.device_type
 
         self.static_num_mem_frames = self._fixed_input_dim(self.sess_mat, "memory_mask_feats", 0)
         self.static_num_obj_ptrs = self._fixed_input_dim(self.sess_mat, "memory_obj_ptrs", 0)
@@ -294,30 +420,94 @@ class Sam3OnnxTrackerSession:
             if self.static_num_obj_ptrs is not None
             else requested_max_obj_ptrs
         )
+        self.max_cond_frames_in_attn = int(
+            self.constants.get(
+                "max_cond_frames_in_attn",
+                np.array([DEFAULT_MAX_COND_FRAMES_IN_ATTN], dtype=np.int64),
+            )[0]
+        )
+        self.keep_first_cond_frame = bool(
+            int(self.constants.get("keep_first_cond_frame", np.array([0], dtype=np.int64))[0])
+        )
+        self.memory_temporal_stride_for_eval = int(
+            self.constants.get(
+                "memory_temporal_stride_for_eval",
+                np.array([DEFAULT_MEMORY_TEMPORAL_STRIDE_FOR_EVAL], dtype=np.int64),
+            )[0]
+        )
+        self.use_memory_selection = bool(
+            int(self.constants.get("use_memory_selection", np.array([0], dtype=np.int64))[0])
+        )
+        self._constant_ortvalues: dict[str, ort.OrtValue] = {}
+        if self.device_type != "cpu" and "current_vision_pos_embed" in self.constants:
+            self._constant_ortvalues["current_vision_pos_embed"] = ort.OrtValue.ortvalue_from_numpy(
+                np.ascontiguousarray(self.constants["current_vision_pos_embed"]),
+                self.device_type,
+                0,
+            )
+        self._memory_input_buffers = self._build_memory_input_buffers()
 
         self.reset()
 
     @property
     def uses_iobinding(self) -> bool:
         return (
-            self._dec_runner.enable_iobinding
+            self._enc_runner.enable_iobinding
+            or self._dec_runner.enable_iobinding
             or self._mat_runner.enable_iobinding
             or self._men_runner.enable_iobinding
         )
+
+    @property
+    def runtime_metadata(self) -> dict[str, Any]:
+        return {
+            "requested_variant": self.requested_variant,
+            "requested_preset": self.requested_preset,
+            "resolved_variant": self.variant,
+            "model_names": {name: path.name for name, path in self.model_paths.items()},
+            "model_paths": {name: str(path) for name, path in self.model_paths.items()},
+            "providers": {
+                "encoder": self.sess_enc.get_providers(),
+                "decoder": self.sess_dec.get_providers(),
+                "memory_attention": self.sess_mat.get_providers(),
+                "memory_encoder": self.sess_men.get_providers(),
+            },
+            "device_type": self.device_type,
+            "uses_iobinding": self.uses_iobinding,
+            "static_num_mem_frames": self.static_num_mem_frames,
+            "static_num_obj_ptrs": self.static_num_obj_ptrs,
+            "effective_max_mem_frames": self.num_maskmem,
+            "effective_max_obj_ptrs": self.max_obj_ptrs,
+            "max_cond_frames_in_attn": self.max_cond_frames_in_attn,
+            "keep_first_cond_frame": self.keep_first_cond_frame,
+            "memory_temporal_stride_for_eval": self.memory_temporal_stride_for_eval,
+            "use_memory_selection": self.use_memory_selection,
+        }
 
     def reset(self) -> None:
         self.cond_states: dict[int, TrackerFrameState] = {}
         self.non_cond_states: dict[int, TrackerFrameState] = {}
 
     def prepare_frame(self, frame_bgr: np.ndarray) -> PreparedFrame:
+        t_prep = time.time()
         pixel_values, info = preprocess_image_bgr(frame_bgr, target_size=1008)
+        prep_ms = (time.time() - t_prep) * 1000.0
+
         input_name = self.sess_enc.get_inputs()[0].name
-        output_names = [output.name for output in self.sess_enc.get_outputs()]
-        values = self.sess_enc.run(None, {input_name: _as_f32c(pixel_values)})
-        raw_outputs = dict(zip(output_names, values))
+        output_device = "session" if self._enc_runner.device_type != "cpu" else "cpu"
+        t_enc = time.time()
+        raw_outputs = self._enc_runner.run({input_name: _as_f32c(pixel_values)}, output_device=output_device)
+        enc_ms = (time.time() - t_enc) * 1000.0
+        encoder_outputs = normalize_encoder_outputs(raw_outputs, self.constants)
+        if "current_vision_pos_embed" in self._constant_ortvalues:
+            encoder_outputs["current_vision_pos_embed"] = self._constant_ortvalues[
+                "current_vision_pos_embed"
+            ]
         return PreparedFrame(
-            encoder_outputs=normalize_encoder_outputs(raw_outputs, self.constants),
+            encoder_outputs=encoder_outputs,
             info=info,
+            prep_ms=prep_ms,
+            enc_ms=enc_ms,
         )
 
     def prepare_prompt_from_spec(
@@ -374,18 +564,20 @@ class Sam3OnnxTrackerSession:
                 prepared = self.prepare_frame(frame_bgr)
             enc = prepared.encoder_outputs
             info = prepared.info
+            prep_ms = prepared.prep_ms
+            enc_ms = prepared.enc_ms
             fused_embed = enc["image_embeddings"]
             prompt_points = prompt_points if prompt_points is not None else empty_prompt()[0]
             prompt_labels = prompt_labels if prompt_labels is not None else empty_prompt()[1]
             is_mask_from_points = True
             attn_ms = 0.0
-            enc_ms = 0.0
         else:
-            t_enc = time.time()
-            prepared = self.prepare_frame(frame_bgr)
+            if prepared is None:
+                prepared = self.prepare_frame(frame_bgr)
             enc = prepared.encoder_outputs
             info = prepared.info
-            enc_ms = (time.time() - t_enc) * 1000.0
+            prep_ms = prepared.prep_ms
+            enc_ms = prepared.enc_ms
 
             mem_inputs = self._select_memory_inputs(frame_idx)
             t_attn = time.time()
@@ -442,6 +634,7 @@ class Sam3OnnxTrackerSession:
             state=state,
             mask_uint8=mask_to_uint8(state.pred_mask_high_res, info),
             timings=FrameTimings(
+                prep_ms=prep_ms,
                 enc_ms=enc_ms,
                 attn_ms=attn_ms,
                 dec_ms=dec_ms,
@@ -491,10 +684,10 @@ class Sam3OnnxTrackerSession:
             "memory_obj_tpos": memory_obj_tpos,
             "memory_mask_feats": memory_mask_feats,
             "memory_mask_pos": memory_mask_pos,
-            "memory_mask_tpos_idx": np.ascontiguousarray(
-                _to_numpy(memory_mask_tpos_idx).astype(np.int64, copy=False)
+            "memory_mask_tpos_idx": (
+                memory_mask_tpos_idx
                 if isinstance(memory_mask_tpos_idx, ort.OrtValue)
-                else np.asarray(memory_mask_tpos_idx, dtype=np.int64)
+                else np.ascontiguousarray(np.asarray(memory_mask_tpos_idx, dtype=np.int64))
             ),
         }
         return self._mat_runner.run(feed, output_device=output_device)
@@ -518,16 +711,112 @@ class Sam3OnnxTrackerSession:
         }
         return self._men_runner.run(feed, output_device=output_device)
 
-    def _select_memory_inputs(self, frame_idx: int) -> dict[str, np.ndarray]:
-        spatial_items = []
-        if 0 in self.cond_states and frame_idx > 0:
-            spatial_items.append((self.cond_states[0], self.num_maskmem - 1))
+    def _build_memory_input_buffers(self) -> dict[str, _InputBuffer]:
+        if self.static_num_mem_frames is None and self.static_num_obj_ptrs is None:
+            return {}
 
-        for t_pos in range(1, self.num_maskmem):
-            prev_idx = frame_idx - (self.num_maskmem - t_pos)
-            if prev_idx < 0:
-                continue
+        buffers: dict[str, _InputBuffer] = {}
+        if self.static_num_mem_frames is not None:
+            buffers["memory_mask_feats"] = self._make_input_buffer(
+                (self.static_num_mem_frames, 64, 72, 72),
+                np.float32,
+            )
+            buffers["memory_mask_pos"] = self._make_input_buffer(
+                (self.static_num_mem_frames, 64, 72, 72),
+                np.float32,
+            )
+            buffers["memory_mask_tpos_idx"] = self._make_input_buffer(
+                (self.static_num_mem_frames,),
+                np.int64,
+            )
+        if self.static_num_obj_ptrs is not None:
+            buffers["memory_obj_ptrs"] = self._make_input_buffer(
+                (self.static_num_obj_ptrs, 256),
+                np.float32,
+            )
+            buffers["memory_obj_tpos"] = self._make_input_buffer(
+                (self.static_num_obj_ptrs,),
+                np.float32,
+            )
+        return buffers
+
+    def _make_input_buffer(self, shape: tuple[int, ...], dtype) -> _InputBuffer:
+        array = np.zeros(shape, dtype=dtype)
+        ortvalue = None
+        if self.device_type != "cpu" and self.uses_iobinding:
+            ortvalue = ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, self.device_type, 0)
+            ortvalue.update_inplace(array)
+        return _InputBuffer(array=array, ortvalue=ortvalue)
+
+    def _frame_filter(self, frame_idx: int, r: int) -> list[int]:
+        if frame_idx == 0:
+            return []
+
+        max_num = max(1, self.max_obj_ptrs)
+        valid_indices: list[int] = []
+        for prev_idx in range(frame_idx - 1, 0, -r):
             state = self.non_cond_states.get(prev_idx)
+            if state is None or state.eff_iou_score is None:
+                continue
+            if state.eff_iou_score > 0.0:
+                valid_indices.insert(0, prev_idx)
+            if len(valid_indices) >= max_num - 1:
+                break
+
+        must_include = frame_idx - 1
+        if must_include >= 0 and must_include not in valid_indices:
+            valid_indices.append(must_include)
+        return valid_indices
+
+    def _pack_memory_inputs(
+        self,
+        name: str,
+        value: np.ndarray,
+        target: int | None,
+    ) -> np.ndarray | ort.OrtValue:
+        if target is None:
+            return np.ascontiguousarray(value)
+
+        buffer = self._memory_input_buffers[name]
+        buffer.array.fill(0)
+        count = min(int(value.shape[0]), int(target))
+        if count > 0:
+            buffer.array[:count] = value[:count]
+        return buffer.sync()
+
+    def _select_memory_inputs(self, frame_idx: int) -> dict[str, np.ndarray | ort.OrtValue]:
+        if frame_idx <= 0:
+            raise RuntimeError("Memory inputs are only defined for non-conditioning frames.")
+
+        cond_outputs, unselected_cond_outputs = _select_closest_cond_frames(
+            frame_idx,
+            self.cond_states,
+            self.max_cond_frames_in_attn,
+            keep_first_cond_frame=self.keep_first_cond_frame,
+        )
+
+        spatial_items: list[tuple[TrackerFrameState, int]] = [
+            (state, self.num_maskmem - 1) for _idx, state in cond_outputs.items()
+        ]
+        r = max(1, int(self.memory_temporal_stride_for_eval))
+        valid_indices = self._frame_filter(frame_idx, r) if self.use_memory_selection else []
+        for t_pos in range(1, self.num_maskmem):
+            t_rel = self.num_maskmem - t_pos
+            if self.use_memory_selection:
+                if t_rel > len(valid_indices):
+                    continue
+                prev_frame_idx = valid_indices[-t_rel]
+            else:
+                if t_rel == 1:
+                    prev_frame_idx = frame_idx - 1
+                else:
+                    prev_frame_idx = ((frame_idx - 2) // r) * r
+                    prev_frame_idx = prev_frame_idx - (t_rel - 2) * r
+            if prev_frame_idx < 0:
+                continue
+            state = self.non_cond_states.get(prev_frame_idx)
+            if state is None:
+                state = unselected_cond_outputs.get(prev_frame_idx)
             if state is None:
                 continue
             spatial_items.append((state, self.num_maskmem - t_pos - 1))
@@ -536,45 +825,70 @@ class Sam3OnnxTrackerSession:
             raise RuntimeError("No spatial memory was available for memory attention.")
 
         memory_mask_feats = np.concatenate(
-            [item[0].maskmem_features for item in spatial_items], axis=0
+            [_to_numpy(item[0].maskmem_features) for item in spatial_items],
+            axis=0,
         )
         memory_mask_pos = np.concatenate(
-            [item[0].maskmem_pos_enc for item in spatial_items], axis=0
+            [_to_numpy(item[0].maskmem_pos_enc) for item in spatial_items],
+            axis=0,
         )
-        memory_mask_tpos_idx = np.array([item[1] for item in spatial_items], dtype=np.int64)
+        memory_mask_tpos_idx = np.asarray([item[1] for item in spatial_items], dtype=np.int64)
 
-        pointer_items = []
-        if 0 in self.cond_states and frame_idx > 0:
-            pointer_items.append((self.cond_states[0], float(frame_idx)))
-        for t_diff in range(1, self.max_obj_ptrs):
-            prev_idx = frame_idx - t_diff
-            if prev_idx < 0:
+        pointer_items: list[tuple[TrackerFrameState, float]] = [
+            (state, float(frame_idx - cond_idx))
+            for cond_idx, state in cond_outputs.items()
+            if cond_idx <= frame_idx
+        ]
+        if self.use_memory_selection:
+            pointer_indices = list(reversed(valid_indices))
+        else:
+            pointer_indices = list(range(frame_idx - 1, max(-1, frame_idx - self.max_obj_ptrs), -1))
+        for t_diff, prev_frame_idx in enumerate(pointer_indices, start=1):
+            if prev_frame_idx < 0:
                 break
-            state = self.non_cond_states.get(prev_idx)
-            if state is not None:
-                pointer_items.append((state, float(t_diff)))
+            state = self.non_cond_states.get(prev_frame_idx)
+            if state is None:
+                state = unselected_cond_outputs.get(prev_frame_idx)
+            if state is None:
+                continue
+            pointer_items.append((state, float(t_diff)))
 
         if pointer_items:
-            memory_obj_ptrs = np.concatenate([item[0].obj_ptr for item in pointer_items], axis=0)
-            memory_obj_tpos = np.array([item[1] for item in pointer_items], dtype=np.float32)
+            memory_obj_ptrs = np.concatenate(
+                [_to_numpy(item[0].obj_ptr) for item in pointer_items],
+                axis=0,
+            )
+            memory_obj_tpos = np.asarray([item[1] for item in pointer_items], dtype=np.float32)
         else:
             memory_obj_ptrs = np.zeros((0, 256), np.float32)
             memory_obj_tpos = np.zeros((0,), np.float32)
 
-        if self.static_num_mem_frames is not None:
-            memory_mask_feats = self._fit_first_dim(memory_mask_feats, self.static_num_mem_frames)
-            memory_mask_pos = self._fit_first_dim(memory_mask_pos, self.static_num_mem_frames)
-            memory_mask_tpos_idx = self._fit_first_dim(memory_mask_tpos_idx, self.static_num_mem_frames)
-        if self.static_num_obj_ptrs is not None:
-            memory_obj_ptrs = self._fit_first_dim(memory_obj_ptrs, self.static_num_obj_ptrs)
-            memory_obj_tpos = self._fit_first_dim(memory_obj_tpos, self.static_num_obj_ptrs)
-
         return {
-            "memory_obj_ptrs": memory_obj_ptrs,
-            "memory_obj_tpos": memory_obj_tpos,
-            "memory_mask_feats": memory_mask_feats,
-            "memory_mask_pos": memory_mask_pos,
-            "memory_mask_tpos_idx": memory_mask_tpos_idx,
+            "memory_obj_ptrs": self._pack_memory_inputs(
+                "memory_obj_ptrs",
+                memory_obj_ptrs,
+                self.static_num_obj_ptrs,
+            ),
+            "memory_obj_tpos": self._pack_memory_inputs(
+                "memory_obj_tpos",
+                memory_obj_tpos,
+                self.static_num_obj_ptrs,
+            ),
+            "memory_mask_feats": self._pack_memory_inputs(
+                "memory_mask_feats",
+                memory_mask_feats,
+                self.static_num_mem_frames,
+            ),
+            "memory_mask_pos": self._pack_memory_inputs(
+                "memory_mask_pos",
+                memory_mask_pos,
+                self.static_num_mem_frames,
+            ),
+            "memory_mask_tpos_idx": self._pack_memory_inputs(
+                "memory_mask_tpos_idx",
+                memory_mask_tpos_idx,
+                self.static_num_mem_frames,
+            ),
         }
 
     @staticmethod
@@ -582,6 +896,30 @@ class Sam3OnnxTrackerSession:
         stem = Path(base_name).stem
         suffix = Path(base_name).suffix
         return f"{stem}_{variant}{suffix}" if variant else base_name
+
+    @classmethod
+    def _resolve_runtime_variant(
+        cls,
+        onnx_dir: Path,
+        *,
+        requested_variant: str,
+        requested_preset: str,
+        max_mem_frames: int,
+        max_obj_ptrs: int,
+    ) -> str:
+        if requested_variant:
+            return requested_variant
+        if requested_preset:
+            return requested_preset
+
+        for preset_name, caps in VARIANT_PRESET_CAPS.items():
+            if caps["max_mem_frames"] != int(max_mem_frames):
+                continue
+            if caps["max_obj_ptrs"] != int(max_obj_ptrs):
+                continue
+            if cls._resolve_model_path(onnx_dir, "memory_attention.onnx", preset_name).exists():
+                return preset_name
+        return ""
 
     @classmethod
     def _resolve_model_path(cls, onnx_dir: Path, base_name: str, variant: str) -> Path:

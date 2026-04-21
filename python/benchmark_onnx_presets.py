@@ -23,12 +23,15 @@ from sweep_onnx_mem_frames import _aggregate_summary
 PRESETS = {
     "fast": {"max_mem_frames": 2, "max_obj_ptrs": 16},
     "quality": {"max_mem_frames": 7, "max_obj_ptrs": 16},
+    "parity": {"max_mem_frames": 7, "max_obj_ptrs": 16},
 }
 
 
 def _write_csv(path: Path, rows) -> None:
     fieldnames = [
         "preset",
+        "onnx_variant",
+        "onnx_preset_requested",
         "onnx_max_mem_frames",
         "onnx_max_obj_ptrs",
         "repeat_count",
@@ -37,9 +40,13 @@ def _write_csv(path: Path, rows) -> None:
         "repeat_min_iou_median",
         "repeat_min_iou_std",
         "onnx_repeat_median_mean_total_ms",
+        "onnx_repeat_median_mean_steady_total_ms",
         "onnx_repeat_std_mean_total_ms",
         "speedup_vs_native_repeat_median_mean",
+        "speedup_vs_native_repeat_median_mean_steady",
         "native_repeat_median_mean_total_ms",
+        "native_repeat_median_mean_steady_total_ms",
+        "onnx_mean_prep_ms",
         "onnx_mean_attn_ms",
         "onnx_median_attn_ms",
         "onnx_mean_enc_ms",
@@ -89,7 +96,7 @@ def main():
     parser.add_argument(
         "--presets",
         nargs="+",
-        default=["fast", "quality"],
+        default=["fast", "quality", "parity"],
         choices=sorted(PRESETS.keys()),
         help="Named ONNX presets to benchmark.",
     )
@@ -183,6 +190,7 @@ def main():
                 onnx_max_mem_frames=preset["max_mem_frames"],
                 onnx_max_obj_ptrs=preset["max_obj_ptrs"],
                 onnx_variant=args.onnx_variant,
+                onnx_preset=preset_name,
             )
             onnx_runs.append(_load_npz(onnx_npz))
 
@@ -204,11 +212,23 @@ def main():
         print(
             f"[INFO] preset={preset_name} | "
             f"IoU={summary['repeat_mean_iou_median']:.4f} | "
-            f"repeat-median ONNX={summary['onnx_repeat_median_mean_total_ms']:.1f} ms/frame | "
-            f"repeat-median speedup={summary['speedup_vs_native_repeat_median_mean']:.2f}x"
+            f"repeat-median steady ONNX="
+            f"{summary.get('onnx_repeat_median_mean_steady_total_ms', summary['onnx_repeat_median_mean_total_ms']):.1f} ms/frame | "
+            f"steady speedup="
+            f"{summary.get('speedup_vs_native_repeat_median_mean_steady', summary['speedup_vs_native_repeat_median_mean']):.2f}x"
         )
 
-    fastest = min(rows, key=lambda item: item["onnx_repeat_median_mean_total_ms"]) if rows else None
+    fastest = (
+        min(
+            rows,
+            key=lambda item: item.get(
+                "onnx_repeat_median_mean_steady_total_ms",
+                item["onnx_repeat_median_mean_total_ms"],
+            ),
+        )
+        if rows
+        else None
+    )
     best_iou = max(rows, key=lambda item: item["repeat_mean_iou_median"]) if rows else None
 
     payload = {
@@ -231,8 +251,8 @@ def main():
     if fastest is not None:
         print(
             f"[INFO] Fastest preset: {fastest['preset']} "
-            f"at {fastest['onnx_repeat_median_mean_total_ms']:.1f} ms/frame "
-            f"({fastest['speedup_vs_native_repeat_median_mean']:.2f}x native)"
+            f"at {fastest.get('onnx_repeat_median_mean_steady_total_ms', fastest['onnx_repeat_median_mean_total_ms']):.1f} ms/frame "
+            f"({fastest.get('speedup_vs_native_repeat_median_mean_steady', fastest['speedup_vs_native_repeat_median_mean']):.2f}x native)"
         )
     if best_iou is not None:
         print(

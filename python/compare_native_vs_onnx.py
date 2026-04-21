@@ -1,6 +1,7 @@
 # sam3-onnx-cpp/python/compare_native_vs_onnx.py
 #!/usr/bin/env python3
 import argparse
+import gc
 import json
 import os
 import subprocess
@@ -25,11 +26,26 @@ DEFAULT_CKPT = Path(
 TARGET_SIZE = 1008
 ONNX_FAST_DEFAULT_MAX_MEM_FRAMES = 2
 ONNX_FAST_DEFAULT_MAX_OBJ_PTRS = 16
+ONNX_PRESETS = {
+    "fast": {"max_mem_frames": 2, "max_obj_ptrs": 16},
+    "quality": {"max_mem_frames": 7, "max_obj_ptrs": 16},
+    "parity": {"max_mem_frames": 7, "max_obj_ptrs": 16},
+}
+ONNX_PRESET_CHOICES = tuple(ONNX_PRESETS.keys())
 
 
 def _sync_cuda():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _release_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        _sync_cuda()
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
 
 
 def _measure_torch(fn):
@@ -196,6 +212,7 @@ def _preprocess_frame_native(frame_bgr: np.ndarray) -> torch.Tensor:
 class VideoFrames:
     raw_frames: list[np.ndarray]
     processed_frames: list[torch.Tensor]
+    preprocess_ms: list[float]
     fps: float
     width: int
     height: int
@@ -209,7 +226,7 @@ def _load_video_frames(video_path: str, max_frames: int) -> VideoFrames:
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    raw_frames, processed_frames = [], []
+    raw_frames, processed_frames, preprocess_ms = [], [], []
 
     while True:
         ok, frame_bgr = cap.read()
@@ -218,7 +235,9 @@ def _load_video_frames(video_path: str, max_frames: int) -> VideoFrames:
         if max_frames > 0 and len(raw_frames) >= max_frames:
             break
         raw_frames.append(frame_bgr.copy())
+        t0 = time.time()
         processed_frames.append(_preprocess_frame_native(frame_bgr))
+        preprocess_ms.append((time.time() - t0) * 1000.0)
 
     cap.release()
     if not raw_frames:
@@ -227,6 +246,7 @@ def _load_video_frames(video_path: str, max_frames: int) -> VideoFrames:
     return VideoFrames(
         raw_frames=raw_frames,
         processed_frames=processed_frames,
+        preprocess_ms=preprocess_ms,
         fps=fps if fps > 0 else 25.0,
         width=width,
         height=height,
@@ -367,112 +387,140 @@ def _run_native_tracker(
     }
 
     saved_masks = []
+    saved_prep_ms = []
     saved_enc_ms = []
     saved_attn_ms = []
     saved_dec_ms = []
     saved_mem_ms = []
     saved_total_ms = []
 
-    for frame_idx, (frame_bgr, frame_cpu) in enumerate(zip(video.raw_frames, video.processed_frames)):
-        image = frame_cpu.to(device, non_blocking=True).unsqueeze(0)
-        frame_t0 = time.time()
+    try:
+        for frame_idx, (frame_bgr, frame_cpu) in enumerate(zip(video.raw_frames, video.processed_frames)):
+            prep_ms = float(video.preprocess_ms[frame_idx])
+            frame_t0 = time.time()
+            image = frame_cpu.to(device, non_blocking=True).unsqueeze(0)
 
-        (_, current_vision_feats, current_vision_pos_embeds, feat_sizes), enc_ms = _measure_torch(
-            lambda: _compute_native_backbone_features(image_model, tracker, image)
-        )
-
-        if len(current_vision_feats) > 1:
-            high_res_features = [
-                x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
-                for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
-            ]
-        else:
-            high_res_features = None
-
-        is_init_cond_frame = frame_idx == 0
-        model_point_inputs = point_inputs if is_init_cond_frame else None
-
-        fused_embed, attn_ms = _measure_torch(
-            lambda: tracker._prepare_memory_conditioned_features(
-                frame_idx=frame_idx,
-                is_init_cond_frame=is_init_cond_frame,
-                current_vision_feats=current_vision_feats[-1:],
-                current_vision_pos_embeds=current_vision_pos_embeds[-1:],
-                feat_sizes=feat_sizes[-1:],
-                output_dict=output_dict,
-                num_frames=len(video.raw_frames),
-                track_in_reverse=False,
-                use_prev_mem_frame=True,
+            (_, current_vision_feats, current_vision_pos_embeds, feat_sizes), enc_ms = _measure_torch(
+                lambda: _compute_native_backbone_features(image_model, tracker, image)
             )
-        )
 
-        multimask_output = tracker._use_multimask(is_init_cond_frame, model_point_inputs)
-        sam_outputs, dec_ms = _measure_torch(
-            lambda: tracker._forward_sam_heads(
-                backbone_features=fused_embed,
-                point_inputs=model_point_inputs,
-                mask_inputs=None,
-                high_res_features=high_res_features,
-                multimask_output=multimask_output,
+            if len(current_vision_feats) > 1:
+                high_res_features = [
+                    x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                    for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
+                ]
+            else:
+                high_res_features = None
+
+            is_init_cond_frame = frame_idx == 0
+            model_point_inputs = point_inputs if is_init_cond_frame else None
+
+            fused_embed, attn_ms = _measure_torch(
+                lambda: tracker._prepare_memory_conditioned_features(
+                    frame_idx=frame_idx,
+                    is_init_cond_frame=is_init_cond_frame,
+                    current_vision_feats=current_vision_feats[-1:],
+                    current_vision_pos_embeds=current_vision_pos_embeds[-1:],
+                    feat_sizes=feat_sizes[-1:],
+                    output_dict=output_dict,
+                    num_frames=len(video.raw_frames),
+                    track_in_reverse=False,
+                    use_prev_mem_frame=True,
+                )
             )
-        )
-        (
-            _,
-            _high_res_multimasks,
-            _ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        ) = sam_outputs
 
-        mem_out, mem_ms = _measure_torch(
-            lambda: tracker._encode_new_memory(
-                image=image,
-                current_vision_feats=current_vision_feats,
-                feat_sizes=feat_sizes,
-                pred_masks_high_res=high_res_masks,
-                object_score_logits=object_score_logits,
-                is_mask_from_pts=is_init_cond_frame,
-                output_dict=output_dict,
-                is_init_cond_frame=is_init_cond_frame,
+            multimask_output = tracker._use_multimask(is_init_cond_frame, model_point_inputs)
+            sam_outputs, dec_ms = _measure_torch(
+                lambda: tracker._forward_sam_heads(
+                    backbone_features=fused_embed,
+                    point_inputs=model_point_inputs,
+                    mask_inputs=None,
+                    high_res_features=high_res_features,
+                    multimask_output=multimask_output,
+                )
             )
+            (
+                _,
+                _high_res_multimasks,
+                _ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            ) = sam_outputs
+
+            mem_out, mem_ms = _measure_torch(
+                lambda: tracker._encode_new_memory(
+                    image=image,
+                    current_vision_feats=current_vision_feats,
+                    feat_sizes=feat_sizes,
+                    pred_masks_high_res=high_res_masks,
+                    object_score_logits=object_score_logits,
+                    is_mask_from_pts=is_init_cond_frame,
+                    output_dict=output_dict,
+                    is_init_cond_frame=is_init_cond_frame,
+                )
+            )
+            maskmem_features, maskmem_pos_enc = mem_out
+
+            current_out = {
+                "maskmem_features": maskmem_features,
+                "maskmem_pos_enc": maskmem_pos_enc,
+                "pred_masks": low_res_masks,
+                "obj_ptr": obj_ptr,
+                "object_score_logits": object_score_logits,
+            }
+            if is_init_cond_frame:
+                output_dict["cond_frame_outputs"][frame_idx] = current_out
+            else:
+                output_dict["non_cond_frame_outputs"][frame_idx] = current_out
+
+            mask_uint8 = _mask_to_uint8(high_res_masks, video.width, video.height)
+            saved_masks.append(mask_uint8)
+            saved_prep_ms.append(prep_ms)
+            saved_enc_ms.append(enc_ms)
+            saved_attn_ms.append(0.0 if is_init_cond_frame else attn_ms)
+            saved_dec_ms.append(dec_ms)
+            saved_mem_ms.append(mem_ms)
+            saved_total_ms.append(((time.time() - frame_t0) * 1000.0) + prep_ms)
+
+            del (
+                image,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+                high_res_features,
+                model_point_inputs,
+                fused_embed,
+                sam_outputs,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                mem_out,
+                maskmem_features,
+                maskmem_pos_enc,
+                current_out,
+                mask_uint8,
+            )
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            save_path,
+            masks=np.stack(saved_masks).astype(np.uint8, copy=False),
+            prep_ms=np.asarray(saved_prep_ms, dtype=np.float32),
+            enc_ms=np.asarray(saved_enc_ms, dtype=np.float32),
+            attn_ms=np.asarray(saved_attn_ms, dtype=np.float32),
+            dec_ms=np.asarray(saved_dec_ms, dtype=np.float32),
+            mem_ms=np.asarray(saved_mem_ms, dtype=np.float32),
+            total_ms=np.asarray(saved_total_ms, dtype=np.float32),
+            prompt_json=np.array(json.dumps(prompt_spec)),
+            video_path=np.array(str(video_path)),
         )
-        maskmem_features, maskmem_pos_enc = mem_out
-
-        current_out = {
-            "maskmem_features": maskmem_features,
-            "maskmem_pos_enc": maskmem_pos_enc,
-            "pred_masks": low_res_masks,
-            "obj_ptr": obj_ptr,
-            "object_score_logits": object_score_logits,
-        }
-        if is_init_cond_frame:
-            output_dict["cond_frame_outputs"][frame_idx] = current_out
-        else:
-            output_dict["non_cond_frame_outputs"][frame_idx] = current_out
-
-        mask_uint8 = _mask_to_uint8(high_res_masks, video.width, video.height)
-        saved_masks.append(mask_uint8)
-        saved_enc_ms.append(enc_ms)
-        saved_attn_ms.append(0.0 if is_init_cond_frame else attn_ms)
-        saved_dec_ms.append(dec_ms)
-        saved_mem_ms.append(mem_ms)
-        saved_total_ms.append((time.time() - frame_t0) * 1000.0)
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        save_path,
-        masks=np.stack(saved_masks).astype(np.uint8, copy=False),
-        enc_ms=np.asarray(saved_enc_ms, dtype=np.float32),
-        attn_ms=np.asarray(saved_attn_ms, dtype=np.float32),
-        dec_ms=np.asarray(saved_dec_ms, dtype=np.float32),
-        mem_ms=np.asarray(saved_mem_ms, dtype=np.float32),
-        total_ms=np.asarray(saved_total_ms, dtype=np.float32),
-        prompt_json=np.array(json.dumps(prompt_spec)),
-        video_path=np.array(str(video_path)),
-    )
-    return save_path
+        return save_path
+    finally:
+        del output_dict, point_inputs, tracker, image_model
+        _release_cuda_memory()
 
 
 def _run_onnx_subprocess(
@@ -486,6 +534,7 @@ def _run_onnx_subprocess(
     onnx_max_mem_frames: int,
     onnx_max_obj_ptrs: int,
     onnx_variant: str,
+    onnx_preset: str = "",
 ):
     cmd = [
         str(REPO_ROOT / "sam3_env" / "Scripts" / "python.exe"),
@@ -504,6 +553,8 @@ def _run_onnx_subprocess(
     ]
     if onnx_variant:
         cmd.extend(["--onnx_variant", onnx_variant])
+    if onnx_preset:
+        cmd.extend(["--preset", onnx_preset])
     if safe:
         cmd.append("--safe")
     if onnx_max_mem_frames > 0:
@@ -541,14 +592,50 @@ def _load_npz(path: Path):
         return {key: data[key] for key in data.files}
 
 
+def _decode_json_scalar(data: dict, key: str):
+    if key not in data:
+        return None
+    value = data[key]
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not value:
+        return None
+    return json.loads(value)
+
+
+def _resolve_onnx_runtime_caps(
+    onnx_preset: str,
+    onnx_max_mem_frames: int | None,
+    onnx_max_obj_ptrs: int | None,
+) -> tuple[str, int, int]:
+    preset = onnx_preset.strip().lower()
+    defaults = ONNX_PRESETS.get(preset, ONNX_PRESETS["fast"])
+    max_mem_frames = defaults["max_mem_frames"] if onnx_max_mem_frames is None else onnx_max_mem_frames
+    max_obj_ptrs = defaults["max_obj_ptrs"] if onnx_max_obj_ptrs is None else onnx_max_obj_ptrs
+    return preset, int(max_mem_frames), int(max_obj_ptrs)
+
+
 def _summarize_timings(prefix: str, data):
     summary = {}
-    for key in ("enc_ms", "attn_ms", "dec_ms", "mem_ms", "total_ms"):
+    for key in ("prep_ms", "enc_ms", "attn_ms", "dec_ms", "mem_ms", "total_ms"):
+        if key not in data:
+            continue
         values = np.asarray(data[key], dtype=np.float32)
         summary[f"{prefix}_mean_{key}"] = float(values.mean())
         summary[f"{prefix}_median_{key}"] = float(np.median(values))
     mean_total = summary[f"{prefix}_mean_total_ms"]
     summary[f"{prefix}_fps"] = float(1000.0 / mean_total) if mean_total > 0 else 0.0
+    totals = np.asarray(data["total_ms"], dtype=np.float32)
+    if totals.size > 0:
+        summary[f"{prefix}_frame0_total_ms"] = float(totals[0])
+    steady = totals[1:] if totals.size > 1 else totals
+    if steady.size > 0:
+        summary[f"{prefix}_steady_mean_total_ms"] = float(steady.mean())
+        summary[f"{prefix}_steady_median_total_ms"] = float(np.median(steady))
+        steady_mean = summary[f"{prefix}_steady_mean_total_ms"]
+        summary[f"{prefix}_steady_fps"] = float(1000.0 / steady_mean) if steady_mean > 0 else 0.0
     return summary
 
 
@@ -566,6 +653,7 @@ def run_compare(
     onnx_max_mem_frames: int,
     onnx_max_obj_ptrs: int,
     onnx_variant: str = "",
+    onnx_preset: str = "",
     prompt_json_path: Path | None = None,
 ):
     outdir = Path(outdir).resolve()
@@ -603,10 +691,12 @@ def run_compare(
         onnx_max_mem_frames=onnx_max_mem_frames,
         onnx_max_obj_ptrs=onnx_max_obj_ptrs,
         onnx_variant=onnx_variant,
+        onnx_preset=onnx_preset,
     )
 
     native = _load_npz(native_npz)
     onnx = _load_npz(onnx_npz)
+    onnx_runtime = _decode_json_scalar(onnx, "runtime_json")
     native_frame_count = len(native["masks"])
     onnx_frame_count = len(onnx["masks"])
     frame_count = min(native_frame_count, onnx_frame_count)
@@ -633,7 +723,11 @@ def run_compare(
         "native_frame_count": native_frame_count,
         "onnx_frame_count": onnx_frame_count,
         "prompt": prompt_spec,
-        "onnx_variant": onnx_variant,
+        "onnx_variant_requested": onnx_variant,
+        "onnx_preset_requested": onnx_preset,
+        "onnx_variant": (
+            onnx_runtime.get("resolved_variant", onnx_variant) if isinstance(onnx_runtime, dict) else onnx_variant
+        ),
         "onnx_max_mem_frames": int(onnx_max_mem_frames),
         "onnx_max_obj_ptrs": int(onnx_max_obj_ptrs),
         "mean_iou": mean_iou,
@@ -643,6 +737,8 @@ def run_compare(
         "worst_frame": worst_frame,
         "frame_metrics": frame_summaries,
     }
+    if onnx_runtime is not None:
+        summary["onnx_runtime"] = onnx_runtime
     summary.update(_summarize_timings("native", native))
     summary.update(_summarize_timings("onnx", onnx))
 
@@ -695,6 +791,12 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
+        "--onnx_preset",
+        default=os.getenv("SAM3_ONNX_PRESET", "").strip().lower(),
+        choices=["", *ONNX_PRESET_CHOICES],
+        help="Optional named ONNX runtime preset. When set, it fills in missing caps and prefers the matching exported variant.",
+    )
+    parser.add_argument(
         "--onnx_variant",
         default=os.getenv("SAM3_ONNX_VARIANT", "").strip(),
         help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
@@ -702,14 +804,14 @@ def main():
     parser.add_argument(
         "--onnx_max_mem_frames",
         type=int,
-        default=ONNX_FAST_DEFAULT_MAX_MEM_FRAMES,
-        help="Cap on ONNX spatial memory frames. Defaults to the fast preset (2).",
+        default=None,
+        help="Cap on ONNX spatial memory frames. Defaults to the selected preset, or the fast preset when omitted.",
     )
     parser.add_argument(
         "--onnx_max_obj_ptrs",
         type=int,
-        default=ONNX_FAST_DEFAULT_MAX_OBJ_PTRS,
-        help="Cap on ONNX object pointers. Defaults to the fast preset (16).",
+        default=None,
+        help="Cap on ONNX object pointers. Defaults to the selected preset, or the fast preset when omitted.",
     )
     parser.add_argument(
         "--outdir",
@@ -730,6 +832,11 @@ def main():
 
     video = _load_video_frames(args.video, args.max_frames)
     prompt_spec = _resolve_prompt(args, video.raw_frames[0])
+    onnx_preset, onnx_max_mem_frames, onnx_max_obj_ptrs = _resolve_onnx_runtime_caps(
+        args.onnx_preset,
+        args.onnx_max_mem_frames,
+        args.onnx_max_obj_ptrs,
+    )
     run = run_compare(
         video_path=args.video,
         onnx_dir=Path(args.onnx_dir).resolve(),
@@ -740,9 +847,10 @@ def main():
         max_frames=len(video.raw_frames),
         safe=args.safe,
         onnx_accel=args.onnx_accel,
-        onnx_max_mem_frames=args.onnx_max_mem_frames,
-        onnx_max_obj_ptrs=args.onnx_max_obj_ptrs,
+        onnx_max_mem_frames=onnx_max_mem_frames,
+        onnx_max_obj_ptrs=onnx_max_obj_ptrs,
         onnx_variant=args.onnx_variant,
+        onnx_preset=onnx_preset,
         prompt_json_path=Path(args.save_prompt_json).resolve() if args.save_prompt_json else None,
     )
     summary = run["summary"]
@@ -758,21 +866,30 @@ def main():
     print(f"[INFO] Min IoU       : {min_iou:.4f}")
     print(f"[INFO] Mean Dice     : {mean_dice:.4f}")
     print(f"[INFO] Mean PixelAcc : {mean_pixel_acc:.4f}")
+    runtime = summary.get("onnx_runtime", {})
+    if isinstance(runtime, dict):
+        print(
+            f"[INFO] ONNX runtime  : preset={runtime.get('requested_preset') or 'auto'} "
+            f"variant={runtime.get('resolved_variant') or 'default'} "
+            f"iobinding={'on' if runtime.get('uses_iobinding') else 'off'}"
+        )
     print(
         f"[INFO] Native total  : {summary['native_mean_total_ms']:.1f} ms/frame "
-        f"({summary['native_fps']:.2f} fps)"
+        f"({summary['native_fps']:.2f} fps) | steady={summary.get('native_steady_mean_total_ms', summary['native_mean_total_ms']):.1f} ms"
     )
     print(
-        f"[INFO] Native stage  : enc={summary['native_mean_enc_ms']:.1f} "
+        f"[INFO] Native stage  : prep={summary.get('native_mean_prep_ms', 0.0):.1f} "
+        f"enc={summary['native_mean_enc_ms']:.1f} "
         f"attn={summary['native_mean_attn_ms']:.1f} dec={summary['native_mean_dec_ms']:.1f} "
         f"mem={summary['native_mean_mem_ms']:.1f}"
     )
     print(
         f"[INFO] ONNX total    : {summary['onnx_mean_total_ms']:.1f} ms/frame "
-        f"({summary['onnx_fps']:.2f} fps)"
+        f"({summary['onnx_fps']:.2f} fps) | steady={summary.get('onnx_steady_mean_total_ms', summary['onnx_mean_total_ms']):.1f} ms"
     )
     print(
-        f"[INFO] ONNX stage    : enc={summary['onnx_mean_enc_ms']:.1f} "
+        f"[INFO] ONNX stage    : prep={summary.get('onnx_mean_prep_ms', 0.0):.1f} "
+        f"enc={summary['onnx_mean_enc_ms']:.1f} "
         f"attn={summary['onnx_mean_attn_ms']:.1f} dec={summary['onnx_mean_dec_ms']:.1f} "
         f"mem={summary['onnx_mean_mem_ms']:.1f}"
     )
