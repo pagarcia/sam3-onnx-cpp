@@ -17,21 +17,13 @@ from compare_native_vs_onnx import (
     _run_onnx_subprocess,
     _save_prompt_spec,
 )
+from onnx_runtime_policy import resolve_runtime_caps
 from sweep_onnx_mem_frames import _aggregate_summary
 
 
-PRESETS = {
-    "fast": {"max_mem_frames": 2, "max_obj_ptrs": 16},
-    "quality": {"max_mem_frames": 7, "max_obj_ptrs": 16},
-    "parity": {"max_mem_frames": 7, "max_obj_ptrs": 16},
-}
-
-
-def _write_csv(path: Path, rows) -> None:
+def _write_csv(path: Path, row: dict) -> None:
     fieldnames = [
-        "preset",
-        "onnx_variant",
-        "onnx_preset_requested",
+        "onnx_mode",
         "onnx_max_mem_frames",
         "onnx_max_obj_ptrs",
         "repeat_count",
@@ -48,24 +40,19 @@ def _write_csv(path: Path, rows) -> None:
         "native_repeat_median_mean_steady_total_ms",
         "onnx_mean_prep_ms",
         "onnx_mean_attn_ms",
-        "onnx_median_attn_ms",
         "onnx_mean_enc_ms",
-        "onnx_median_enc_ms",
         "onnx_mean_dec_ms",
-        "onnx_median_dec_ms",
         "onnx_mean_mem_ms",
-        "onnx_median_mem_ms",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key) for key in fieldnames})
+        writer.writerow({key: row.get(key) for key in fieldnames})
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark the recommended ONNX presets against the same native SAM3 baseline."
+        description="Benchmark the default ONNX SAM3 path against the same native SAM3 baseline."
     )
     parser.add_argument("--video", required=True, help="Input video path.")
     parser.add_argument(
@@ -98,17 +85,10 @@ def main():
     parser.add_argument("--save_prompt_json", default="", help="Optional output path for the prompt JSON.")
     parser.add_argument("--max_frames", type=int, default=20, help="Number of frames to compare.")
     parser.add_argument(
-        "--presets",
-        nargs="+",
-        default=["fast", "quality", "parity"],
-        choices=sorted(PRESETS.keys()),
-        help="Named ONNX presets to benchmark.",
-    )
-    parser.add_argument(
         "--repeats",
         type=int,
         default=3,
-        help="Number of repeated native and ONNX runs per preset.",
+        help="Number of repeated native and ONNX runs.",
     )
     parser.add_argument(
         "--onnx_accel",
@@ -117,14 +97,21 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
-        "--onnx_variant",
-        default="",
-        help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
+        "--onnx_max_mem_frames",
+        type=int,
+        default=None,
+        help="Optional ONNX spatial-memory cap. When omitted, the runtime auto-selects 2 for single-annotation and 4 for multi-annotation.",
+    )
+    parser.add_argument(
+        "--onnx_max_obj_ptrs",
+        type=int,
+        default=None,
+        help="Optional ONNX object-pointer cap. Defaults to 16 when omitted.",
     )
     parser.add_argument(
         "--outdir",
         default="",
-        help="Optional output directory for the preset benchmark outputs.",
+        help="Optional output directory for the benchmark outputs.",
     )
     parser.add_argument(
         "--safe",
@@ -137,7 +124,7 @@ def main():
         raise SystemExit("--repeats must be positive")
 
     outdir = Path(args.outdir).resolve() if args.outdir else Path(
-        tempfile.mkdtemp(prefix="sam3_preset_bench_", dir=str(REPO_ROOT / "checkpoints" / "sam3"))
+        tempfile.mkdtemp(prefix="sam3_default_bench_", dir=str(REPO_ROOT / "checkpoints" / "sam3"))
     )
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -145,19 +132,32 @@ def main():
     prompt_spec = _resolve_prompt(args, video.raw_frames[0])
     prompt_json_path = Path(args.save_prompt_json).resolve() if args.save_prompt_json else outdir / "prompt.json"
     _save_prompt_spec(prompt_json_path, prompt_spec)
+    onnx_max_mem_frames, onnx_max_obj_ptrs = resolve_runtime_caps(
+        prompt_spec=prompt_spec,
+        max_mem_frames=args.onnx_max_mem_frames,
+        max_obj_ptrs=args.onnx_max_obj_ptrs,
+    )
 
-    summary_json = outdir / "preset_summary.json"
-    summary_csv = outdir / "preset_summary.csv"
+    summary_json = outdir / "benchmark_summary.json"
+    summary_csv = outdir / "benchmark_summary.csv"
     native_dir = outdir / "native"
+    onnx_dir = outdir / "onnx"
     native_dir.mkdir(parents=True, exist_ok=True)
+    onnx_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Output dir: {outdir}")
-    print(f"[INFO] Presets: {args.presets}")
     print(f"[INFO] Repeats: {args.repeats}")
+    print(
+        f"[INFO] Default ONNX runtime caps: max_mem_frames={onnx_max_mem_frames}, "
+        f"max_obj_ptrs={onnx_max_obj_ptrs}"
+    )
 
     native_runs = []
+    onnx_runs = []
     for repeat_idx in range(1, args.repeats + 1):
         native_npz = native_dir / f"repeat_{repeat_idx:02d}.npz"
+        onnx_npz = onnx_dir / f"repeat_{repeat_idx:02d}.npz"
+
         print(f"[INFO] Running native PyTorch tracker repeat {repeat_idx}/{args.repeats}...")
         _run_native_tracker(
             video=video,
@@ -169,103 +169,46 @@ def main():
         )
         native_runs.append(_load_npz(native_npz))
 
-    rows = []
-    for preset_name in args.presets:
-        preset = PRESETS[preset_name]
-        run_dir = outdir / preset_name
-        run_dir.mkdir(parents=True, exist_ok=True)
-        onnx_runs = []
-
-        for repeat_idx in range(1, args.repeats + 1):
-            onnx_npz = run_dir / f"repeat_{repeat_idx:02d}.npz"
-            print(
-                f"[INFO] Running preset={preset_name} "
-                f"(mem={preset['max_mem_frames']}, obj_ptrs={preset['max_obj_ptrs']}) "
-                f"repeat {repeat_idx}/{args.repeats}..."
-            )
-            _run_onnx_subprocess(
-                video_path=args.video,
-                onnx_dir=Path(args.onnx_dir).resolve(),
-                prompt_json=prompt_json_path,
-                save_path=onnx_npz,
-                max_frames=len(video.raw_frames),
-                safe=args.safe,
-                onnx_accel=args.onnx_accel,
-                onnx_max_mem_frames=preset["max_mem_frames"],
-                onnx_max_obj_ptrs=preset["max_obj_ptrs"],
-                onnx_variant=args.onnx_variant,
-                onnx_preset=preset_name,
-            )
-            onnx_runs.append(_load_npz(onnx_npz))
-
-        summary = _aggregate_summary(
-            native_runs=native_runs,
-            onnx_runs=onnx_runs,
-            mem_frames=preset["max_mem_frames"],
-            onnx_max_obj_ptrs=preset["max_obj_ptrs"],
+        print(f"[INFO] Running default ONNX tracker repeat {repeat_idx}/{args.repeats}...")
+        _run_onnx_subprocess(
+            video_path=args.video,
+            onnx_dir=Path(args.onnx_dir).resolve(),
+            prompt_json=prompt_json_path,
+            save_path=onnx_npz,
+            max_frames=len(video.raw_frames),
+            safe=args.safe,
+            onnx_accel=args.onnx_accel,
+            onnx_max_mem_frames=onnx_max_mem_frames,
+            onnx_max_obj_ptrs=onnx_max_obj_ptrs,
         )
-        summary["preset"] = preset_name
-        summary["video"] = str(args.video)
-        summary["prompt"] = prompt_spec
+        onnx_runs.append(_load_npz(onnx_npz))
 
-        preset_summary_json = run_dir / "summary.json"
-        with preset_summary_json.open("w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
-        rows.append(summary)
-
-        print(
-            f"[INFO] preset={preset_name} | "
-            f"IoU={summary['repeat_mean_iou_median']:.4f} | "
-            f"repeat-median steady ONNX="
-            f"{summary.get('onnx_repeat_median_mean_steady_total_ms', summary['onnx_repeat_median_mean_total_ms']):.1f} ms/frame | "
-            f"steady speedup="
-            f"{summary.get('speedup_vs_native_repeat_median_mean_steady', summary['speedup_vs_native_repeat_median_mean']):.2f}x"
-        )
-
-    fastest = (
-        min(
-            rows,
-            key=lambda item: item.get(
-                "onnx_repeat_median_mean_steady_total_ms",
-                item["onnx_repeat_median_mean_total_ms"],
-            ),
-        )
-        if rows
-        else None
-    )
-    best_iou = max(rows, key=lambda item: item["repeat_mean_iou_median"]) if rows else None
+    summary = _aggregate_summary(native_runs, onnx_runs, onnx_max_mem_frames, onnx_max_obj_ptrs)
+    summary["video"] = str(args.video)
+    summary["prompt"] = prompt_spec
 
     payload = {
         "video": str(args.video),
         "frame_count": len(video.raw_frames),
         "prompt": prompt_spec,
-        "presets": {name: PRESETS[name] for name in args.presets},
-        "onnx_accel": args.onnx_accel,
-        "onnx_variant": args.onnx_variant,
         "repeats": int(args.repeats),
-        "fastest": fastest,
-        "best_iou": best_iou,
-        "results": rows,
+        "onnx_accel": args.onnx_accel,
+        "summary": summary,
     }
 
     with summary_json.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-    _write_csv(summary_csv, rows)
+    _write_csv(summary_csv, summary)
 
-    if fastest is not None:
-        print(
-            f"[INFO] Fastest preset: {fastest['preset']} "
-            f"at {fastest.get('onnx_repeat_median_mean_steady_total_ms', fastest['onnx_repeat_median_mean_total_ms']):.1f} ms/frame "
-            f"({fastest.get('speedup_vs_native_repeat_median_mean_steady', fastest['speedup_vs_native_repeat_median_mean']):.2f}x native)"
-        )
-    if best_iou is not None:
-        print(
-            f"[INFO] Best IoU preset: {best_iou['preset']} "
-            f"with repeat-median mean IoU {best_iou['repeat_mean_iou_median']:.4f}"
-        )
+    print(
+        f"[INFO] Mean IoU: {summary['repeat_mean_iou_median']:.4f} | "
+        f"steady ONNX={summary.get('onnx_repeat_median_mean_steady_total_ms', summary['onnx_repeat_median_mean_total_ms']):.1f} ms/frame | "
+        f"steady speedup={summary.get('speedup_vs_native_repeat_median_mean_steady', summary['speedup_vs_native_repeat_median_mean']):.2f}x"
+    )
     print(f"[INFO] Summary JSON : {summary_json}")
     print(f"[INFO] Summary CSV  : {summary_csv}")
     print(f"[INFO] Native dir   : {native_dir}")
+    print(f"[INFO] ONNX dir     : {onnx_dir}")
 
 
 if __name__ == "__main__":

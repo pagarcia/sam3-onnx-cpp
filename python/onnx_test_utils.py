@@ -46,8 +46,7 @@ def print_system_info() -> None:
     print("[INFO] onnxruntime:", ort.__version__)
     print("[INFO] ORT providers (available):", ort.get_available_providers())
     print("[INFO] SAM3_ORT_ACCEL:", ACCEL)
-    print("[INFO] SAM3_ONNX_VARIANT:", os.getenv("SAM3_ONNX_VARIANT", ""))
-    print("[INFO] SAM3_ORT_GRAPH_OPT:", os.getenv("SAM3_ORT_GRAPH_OPT", "extended"))
+    print("[INFO] SAM3_ORT_GRAPH_OPT:", os.getenv("SAM3_ORT_GRAPH_OPT", "all"))
     print("[INFO] SAM3_ORT_IO_BINDING:", os.getenv("SAM3_ORT_IO_BINDING", "auto"))
 
 
@@ -100,7 +99,7 @@ def _resolve_graph_optimization_level(safe: bool):
     if safe:
         return ort.GraphOptimizationLevel.ORT_DISABLE_ALL
 
-    value = os.getenv("SAM3_ORT_GRAPH_OPT", "extended").strip().lower()
+    value = os.getenv("SAM3_ORT_GRAPH_OPT", "all").strip().lower()
     if value in ("disable", "disabled", "none", "off"):
         return ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     if value in ("basic",):

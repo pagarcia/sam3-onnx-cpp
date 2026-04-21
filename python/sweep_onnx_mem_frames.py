@@ -207,8 +207,7 @@ def _aggregate_summary(native_runs: list[dict], onnx_runs: list[dict], mem_frame
     summary.update(_aggregate_timing_arrays("onnx", onnx_runs))
     onnx_runtime = _decode_json_scalar(onnx_runs[0], "runtime_json") if onnx_runs else None
     if isinstance(onnx_runtime, dict):
-        summary["onnx_variant"] = onnx_runtime.get("resolved_variant", "")
-        summary["onnx_preset_requested"] = onnx_runtime.get("requested_preset", "")
+        summary["onnx_mode"] = onnx_runtime.get("mode", "default")
         summary["onnx_runtime"] = onnx_runtime
 
     native_mean_total = summary["native_mean_total_ms"]
@@ -254,8 +253,7 @@ def _aggregate_summary(native_runs: list[dict], onnx_runs: list[dict], mem_frame
 def _write_csv(path: Path, rows) -> None:
     fieldnames = [
         "onnx_max_mem_frames",
-        "onnx_variant",
-        "onnx_preset_requested",
+        "onnx_mode",
         "repeat_count",
         "mean_iou",
         "repeat_mean_iou_median",
@@ -359,11 +357,6 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
-        "--onnx_variant",
-        default="",
-        help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
-    )
-    parser.add_argument(
         "--onnx_max_obj_ptrs",
         type=int,
         default=0,
@@ -440,7 +433,6 @@ def main():
                 onnx_accel=args.onnx_accel,
                 onnx_max_mem_frames=mem_frames,
                 onnx_max_obj_ptrs=args.onnx_max_obj_ptrs,
-                onnx_variant=args.onnx_variant,
             )
             onnx_runs.append(_load_npz(onnx_npz))
 
@@ -476,7 +468,6 @@ def main():
         "prompt": prompt_spec,
         "mem_frames_values": mem_frames_values,
         "onnx_accel": args.onnx_accel,
-        "onnx_variant": args.onnx_variant,
         "repeats": int(args.repeats),
         "onnx_max_obj_ptrs": int(args.onnx_max_obj_ptrs),
         "native_defaults": {

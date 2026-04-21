@@ -15,6 +15,11 @@ import cv2
 import numpy as np
 from PyQt5 import QtWidgets
 
+from onnx_runtime_policy import (
+    DEFAULT_MAX_OBJ_PTRS,
+    prompt_annotation_count,
+    resolve_runtime_caps,
+)
 from onnx_test_utils import compute_display_base, green_overlay, print_system_info, set_cv2_threads
 from prompt_spec_utils import (
     load_prompt_spec,
@@ -24,31 +29,11 @@ from prompt_spec_utils import (
     save_prompt_spec,
 )
 from sam3_onnx_session import (
-    FAST_DEFAULT_MAX_MEM_FRAMES,
-    FAST_DEFAULT_MAX_OBJ_PTRS,
     Sam3OnnxTrackerSession,
-    VARIANT_PRESET_CAPS,
     mask_to_overlay,
     prepare_prompt_box,
     prepare_prompt_points,
 )
-
-
-def _resolve_runtime_caps(args) -> tuple[str, int, int]:
-    preset = args.preset.strip().lower()
-    max_mem_frames = args.max_mem_frames
-    max_obj_ptrs = args.max_obj_ptrs
-    if preset:
-        caps = VARIANT_PRESET_CAPS[preset]
-        if max_mem_frames is None:
-            max_mem_frames = caps["max_mem_frames"]
-        if max_obj_ptrs is None:
-            max_obj_ptrs = caps["max_obj_ptrs"]
-    if max_mem_frames is None:
-        max_mem_frames = FAST_DEFAULT_MAX_MEM_FRAMES
-    if max_obj_ptrs is None:
-        max_obj_ptrs = FAST_DEFAULT_MAX_OBJ_PTRS
-    return preset, int(max_mem_frames), int(max_obj_ptrs)
 
 
 def _parse_frame_indices_text(text: str, *, one_based: bool = False) -> list[int]:
@@ -361,18 +346,7 @@ def main():
     parser.add_argument(
         "--onnx_dir",
         default=str(Path(__file__).resolve().parent.parent / "checkpoints" / "sam3" / "video_onnx"),
-        help="Directory containing image_encoder.onnx, image_decoder.onnx, memory_attention.onnx, memory_encoder.onnx.",
-    )
-    parser.add_argument(
-        "--onnx_variant",
-        default=os.getenv("SAM3_ONNX_VARIANT", "").strip(),
-        help="Optional tracker ONNX variant suffix such as fp16, fast, quality, or quality_fp16.",
-    )
-    parser.add_argument(
-        "--preset",
-        default="",
-        choices=["", *sorted(VARIANT_PRESET_CAPS.keys())],
-        help="Optional named runtime preset. When set, it fills in missing caps and prefers the matching exported variant.",
+        help="Directory containing the default ONNX tracker files for video inference.",
     )
     parser.add_argument(
         "--prompt",
@@ -389,13 +363,13 @@ def main():
         "--max_mem_frames",
         type=int,
         default=None,
-        help="Cap on spatial memory frames used by ONNX attention. Defaults to the selected preset, or the fast preset when omitted.",
+        help="Optional spatial-memory cap. When omitted, single-annotation runs use 2 and multi-annotation runs use 4.",
     )
     parser.add_argument(
         "--max_obj_ptrs",
         type=int,
         default=None,
-        help="Cap on object pointers used by ONNX attention. Defaults to the selected preset, or the fast preset when omitted.",
+        help="Optional object-pointer cap. Defaults to 16 when omitted.",
     )
     parser.add_argument(
         "--points",
@@ -449,34 +423,6 @@ def main():
 
     video_path = _resolve_video(args)
     print(f"[INFO] Video: {video_path}")
-    preset, max_mem_frames, max_obj_ptrs = _resolve_runtime_caps(args)
-
-    tracker = Sam3OnnxTrackerSession(
-        Path(args.onnx_dir),
-        safe=args.safe,
-        max_mem_frames=max_mem_frames,
-        max_obj_ptrs=max_obj_ptrs,
-        variant=args.onnx_variant,
-        preset=preset,
-    )
-    runtime = tracker.runtime_metadata
-    print(
-        f"[INFO] ONNX runtime: preset={runtime['requested_preset'] or 'auto'} "
-        f"variant={runtime['resolved_variant'] or 'default'} "
-        f"device={runtime['device_type']}"
-    )
-    print(
-        f"[INFO] Models: enc={runtime['model_names']['encoder']} "
-        f"dec={runtime['model_names']['decoder']} "
-        f"attn={runtime['model_names']['memory_attention']} "
-        f"mem={runtime['model_names']['memory_encoder']}"
-    )
-    print(
-        f"[INFO] ONNX runtime caps: max_mem_frames={tracker.num_maskmem}, "
-        f"max_obj_ptrs={tracker.max_obj_ptrs}, "
-        f"static_mem={tracker.static_num_mem_frames}, static_obj_ptrs={tracker.static_num_obj_ptrs}, "
-        f"iobinding={'on' if tracker.uses_iobinding else 'off'}"
-    )
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -491,28 +437,68 @@ def main():
         raise SystemExit("The selected video is empty.")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
+    prompt_frame_indices = _parse_frame_indices_text(
+        args.prompt_frames_1based or args.prompt_frames,
+        one_based=bool(args.prompt_frames_1based),
+    )
+
+    if args.prompt_json:
+        prompt_spec = load_prompt_spec(Path(args.prompt_json).resolve())
+    elif args.box:
+        prompt_spec = {"prompt": "bounding_box", "box": list(parse_box_text(args.box))}
+    elif args.points:
+        points, labels = parse_points_text(args.points)
+        prompt_spec = {
+            "prompt": "seed_points",
+            "points": [[int(px), int(py), int(label)] for (px, py), label in zip(points, labels)],
+        }
+    else:
+        prompt_spec = None
+
+    annotation_count = (
+        prompt_annotation_count(prompt_spec)
+        if prompt_spec is not None
+        else max(1, len(prompt_frame_indices))
+    )
+    max_mem_frames, max_obj_ptrs = resolve_runtime_caps(
+        annotation_count=annotation_count,
+        max_mem_frames=args.max_mem_frames,
+        max_obj_ptrs=args.max_obj_ptrs,
+    )
+    tracker = Sam3OnnxTrackerSession(
+        Path(args.onnx_dir),
+        safe=args.safe,
+        max_mem_frames=max_mem_frames,
+        max_obj_ptrs=max_obj_ptrs,
+    )
+    runtime = tracker.runtime_metadata
+    print(
+        f"[INFO] ONNX runtime: mode={runtime['mode']} graph={runtime.get('graph_profile', 'default')} "
+        f"device={runtime['device_type']}"
+    )
+    print(
+        f"[INFO] Models: enc={runtime['model_names']['encoder']} "
+        f"dec={runtime['model_names']['decoder']} "
+        f"attn={runtime['model_names']['memory_attention']} "
+        f"mem={runtime['model_names']['memory_encoder']}"
+    )
+    print(
+        f"[INFO] Prompt annotations: {annotation_count} | "
+        f"ONNX runtime caps: max_mem_frames={tracker.num_maskmem}, "
+        f"max_obj_ptrs={tracker.max_obj_ptrs}, "
+        f"static_mem={tracker.static_num_mem_frames}, static_obj_ptrs={tracker.static_num_obj_ptrs}, "
+        f"iobinding={'on' if tracker.uses_iobinding else 'off'}"
+    )
+
     if args.prompt_json:
         prompt_schedule, prompt_spec = _build_prompt_schedule_from_spec(
             cap,
             first_frame,
             tracker,
-            load_prompt_spec(Path(args.prompt_json).resolve()),
-            max_frames=args.max_frames,
-        )
-    elif args.prompt_frames or args.prompt_frames_1based:
-        prompt_schedule, prompt_spec = _interactive_collect_prompt_schedule(
-            cap,
-            first_frame,
-            tracker,
-            prompt_kind=args.prompt,
-            frame_indices=_parse_frame_indices_text(
-                args.prompt_frames_1based or args.prompt_frames,
-                one_based=bool(args.prompt_frames_1based),
-            ),
+            prompt_spec,
             max_frames=args.max_frames,
         )
     elif args.box:
-        prompt_spec = {"prompt": "bounding_box", "box": list(parse_box_text(args.box))}
         prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
         prompt_schedule = {
             0: {
@@ -523,11 +509,6 @@ def main():
             }
         }
     elif args.points:
-        points, labels = parse_points_text(args.points)
-        prompt_spec = {
-            "prompt": "seed_points",
-            "points": [[int(px), int(py), int(label)] for (px, py), label in zip(points, labels)],
-        }
         prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
         prompt_schedule = {
             0: {
@@ -537,6 +518,15 @@ def main():
                 "annotation": {"frame_idx": 0, **prompt_spec},
             }
         }
+    elif prompt_frame_indices:
+        prompt_schedule, prompt_spec = _interactive_collect_prompt_schedule(
+            cap,
+            first_frame,
+            tracker,
+            prompt_kind=args.prompt,
+            frame_indices=prompt_frame_indices,
+            max_frames=args.max_frames,
+        )
     elif args.prompt == "bounding_box":
         prepared0, init_points, init_labels, prompt_spec = _interactive_select_box(
             first_frame,

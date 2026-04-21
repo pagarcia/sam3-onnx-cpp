@@ -1,7 +1,7 @@
 {
   "cases": [
     {
-      "name": "sample_points_fast",
+      "name": "sample_points_default",
       "video": "C:\\path\\to\\clip.mp4",
       "points": "320,240,1;420,300,0",
       "max_frames": 20,
@@ -18,11 +18,11 @@
       }
     },
     {
-      "name": "sample_box_quality",
+      "name": "sample_box_multi_annotation",
       "video": "C:\\path\\to\\clip.mp4",
       "box": "120,80,520,430",
       "max_frames": 20,
-      "onnx_max_mem_frames": 7,
+      "onnx_max_mem_frames": 4,
       "onnx_max_obj_ptrs": 16,
       "thresholds": {
         "min": {

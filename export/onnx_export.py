@@ -9,34 +9,6 @@ import numpy as np
 import torch
 
 
-VARIANT_PRESETS = {
-    "default": {
-        "name": "",
-        "max_mem_frames": None,
-        "max_obj_ptrs": None,
-        "static_memory_shapes": False,
-    },
-    "fast": {
-        "name": "fast",
-        "max_mem_frames": 2,
-        "max_obj_ptrs": 16,
-        "static_memory_shapes": True,
-    },
-    "quality": {
-        "name": "quality",
-        "max_mem_frames": 7,
-        "max_obj_ptrs": 16,
-        "static_memory_shapes": True,
-    },
-    "parity": {
-        "name": "parity",
-        "max_mem_frames": None,
-        "max_obj_ptrs": None,
-        "static_memory_shapes": True,
-    },
-}
-
-
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -158,7 +130,7 @@ def _parse_csv(text: str) -> list[str]:
     return values
 
 
-def _build_export_variants(model, variant_names: list[str], precisions: list[str]):
+def _build_export_variants(model, precisions: list[str]):
     from src.utils import ExportVariant
 
     tracker = model.inst_interactive_predictor.model
@@ -166,24 +138,18 @@ def _build_export_variants(model, variant_names: list[str], precisions: list[str
     native_obj_ptrs = int(tracker.max_obj_ptrs_in_encoder)
     variants = []
 
-    for variant_name in variant_names:
-        if variant_name not in VARIANT_PRESETS:
-            raise SystemExit(
-                f"Unsupported variant {variant_name!r}. Expected one of: {', '.join(sorted(VARIANT_PRESETS))}."
+    for precision in precisions:
+        if precision not in ("fp32", "fp16"):
+            raise SystemExit("--precisions must contain only fp32 and/or fp16.")
+        variants.append(
+            ExportVariant(
+                name="",
+                precision=precision,
+                max_mem_frames=native_mem,
+                max_obj_ptrs=native_obj_ptrs,
+                static_memory_shapes=False,
             )
-        preset = VARIANT_PRESETS[variant_name]
-        for precision in precisions:
-            if precision not in ("fp32", "fp16"):
-                raise SystemExit("--precisions must contain only fp32 and/or fp16.")
-            variants.append(
-                ExportVariant(
-                    name=preset["name"],
-                    precision=precision,
-                    max_mem_frames=preset["max_mem_frames"] or native_mem,
-                    max_obj_ptrs=preset["max_obj_ptrs"] or native_obj_ptrs,
-                    static_memory_shapes=bool(preset["static_memory_shapes"]),
-                )
-            )
+        )
     return variants
 
 
@@ -256,14 +222,13 @@ def main(args) -> None:
     mem_attn = MemAttention(model).eval().cpu()
     mem_enc = MemEncoder(model).eval().cpu()
 
-    variant_names = _parse_csv(args.variants)
     precisions = _parse_csv(args.precisions)
-    export_variants = _build_export_variants(model, variant_names, precisions)
+    export_variants = _build_export_variants(model, precisions)
     if not export_variants:
-        raise SystemExit("No export variants were selected.")
+        raise SystemExit("No export precisions were selected.")
 
     print(
-        "[INFO] Variants    : "
+        "[INFO] Exports     : "
         + ", ".join(variant.token or "default" for variant in export_variants)
     )
 
@@ -301,13 +266,8 @@ if __name__ == "__main__":
         help="Directory where the exported ONNX files will be written.",
     )
     parser.add_argument(
-        "--variants",
-        default="default",
-        help="Comma-separated export presets: default, fast, quality, parity.",
-    )
-    parser.add_argument(
         "--precisions",
         default="fp32",
-        help="Comma-separated precisions to emit for each selected variant: fp32 and/or fp16.",
+        help="Comma-separated precisions to emit for the default dynamic tracker export: fp32 and/or fp16.",
     )
     main(parser.parse_args())

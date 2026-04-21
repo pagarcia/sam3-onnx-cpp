@@ -12,21 +12,13 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+from onnx_runtime_policy import DEFAULT_MAX_MEM_FRAMES, DEFAULT_MAX_OBJ_PTRS
 from onnx_test_utils import PrepInfo, green_overlay, make_session, preprocess_image_bgr
 
 
 DEFAULT_NUM_MASKMEM = 7
-DEFAULT_MAX_OBJ_PTRS = 16
-FAST_DEFAULT_MAX_MEM_FRAMES = 2
-FAST_DEFAULT_MAX_OBJ_PTRS = 16
 DEFAULT_MAX_COND_FRAMES_IN_ATTN = 4
 DEFAULT_MEMORY_TEMPORAL_STRIDE_FOR_EVAL = 1
-
-VARIANT_PRESET_CAPS = {
-    "fast": {"max_mem_frames": 2, "max_obj_ptrs": 16},
-    "quality": {"max_mem_frames": 7, "max_obj_ptrs": 16},
-    "parity": {"max_mem_frames": 7, "max_obj_ptrs": 16},
-}
 
 ORT_TENSOR_TYPE_TO_NUMPY = {
     "tensor(float)": np.float32,
@@ -352,22 +344,13 @@ class Sam3OnnxTrackerSession:
         onnx_dir: Path,
         *,
         safe: bool = False,
-        max_mem_frames: int = FAST_DEFAULT_MAX_MEM_FRAMES,
-        max_obj_ptrs: int = FAST_DEFAULT_MAX_OBJ_PTRS,
-        variant: str = "",
-        preset: str = "",
+        max_mem_frames: int = DEFAULT_MAX_MEM_FRAMES,
+        max_obj_ptrs: int = DEFAULT_MAX_OBJ_PTRS,
     ) -> None:
         self.onnx_dir = Path(onnx_dir).resolve()
-        self.requested_variant = variant.strip()
-        self.requested_preset = preset.strip().lower()
-        self.variant = self._resolve_runtime_variant(
-            self.onnx_dir,
-            requested_variant=self.requested_variant,
-            requested_preset=self.requested_preset,
-            max_mem_frames=max_mem_frames,
-            max_obj_ptrs=max_obj_ptrs,
-        )
-        self.constants = self._load_video_constants(self.onnx_dir, self.variant)
+        self.mode = "default"
+        self.graph_profile = self._resolve_graph_profile(self.onnx_dir, int(max_mem_frames))
+        self.constants = self._load_video_constants(self.onnx_dir, self.graph_profile)
 
         native_num_maskmem = int(
             self.constants.get("num_maskmem", np.array([DEFAULT_NUM_MASKMEM], dtype=np.int64))[0]
@@ -386,10 +369,10 @@ class Sam3OnnxTrackerSession:
             else native_max_obj_ptrs
         )
 
-        enc_path = self._resolve_encoder_path(self.onnx_dir, self.variant)
-        dec_path = self._resolve_model_path(self.onnx_dir, "image_decoder.onnx", self.variant)
-        mat_path = self._resolve_model_path(self.onnx_dir, "memory_attention.onnx", self.variant)
-        men_path = self._resolve_model_path(self.onnx_dir, "memory_encoder.onnx", self.variant)
+        enc_path = self._resolve_encoder_path(self.onnx_dir)
+        dec_path = self._resolve_model_path(self.onnx_dir, "image_decoder.onnx", self.graph_profile)
+        mat_path = self._resolve_model_path(self.onnx_dir, "memory_attention.onnx", self.graph_profile)
+        men_path = self._resolve_model_path(self.onnx_dir, "memory_encoder.onnx", self.graph_profile)
 
         for path in (enc_path, dec_path, mat_path, men_path):
             if not path.exists():
@@ -417,12 +400,12 @@ class Sam3OnnxTrackerSession:
         self.static_num_mem_frames = self._fixed_input_dim(self.sess_mat, "memory_mask_feats", 0)
         self.static_num_obj_ptrs = self._fixed_input_dim(self.sess_mat, "memory_obj_ptrs", 0)
         self.num_maskmem = (
-            int(self.static_num_mem_frames)
+            min(int(self.static_num_mem_frames), requested_num_maskmem)
             if self.static_num_mem_frames is not None
             else requested_num_maskmem
         )
         self.max_obj_ptrs = (
-            int(self.static_num_obj_ptrs)
+            min(int(self.static_num_obj_ptrs), requested_max_obj_ptrs)
             if self.static_num_obj_ptrs is not None
             else requested_max_obj_ptrs
         )
@@ -470,9 +453,8 @@ class Sam3OnnxTrackerSession:
     @property
     def runtime_metadata(self) -> dict[str, Any]:
         return {
-            "requested_variant": self.requested_variant,
-            "requested_preset": self.requested_preset,
-            "resolved_variant": self.variant,
+            "mode": self.mode,
+            "graph_profile": self.graph_profile,
             "model_names": {name: path.name for name, path in self.model_paths.items()},
             "model_paths": {name: str(path) for name, path in self.model_paths.items()},
             "providers": {
@@ -1036,38 +1018,43 @@ class Sam3OnnxTrackerSession:
         }
 
     @staticmethod
-    def _variant_name(base_name: str, variant: str) -> str:
+    def _profiled_name(base_name: str, graph_profile: str) -> str:
+        if not graph_profile or graph_profile == "default":
+            return base_name
         stem = Path(base_name).stem
         suffix = Path(base_name).suffix
-        return f"{stem}_{variant}{suffix}" if variant else base_name
+        return f"{stem}_{graph_profile}{suffix}"
 
     @classmethod
-    def _resolve_runtime_variant(
-        cls,
-        onnx_dir: Path,
-        *,
-        requested_variant: str,
-        requested_preset: str,
-        max_mem_frames: int,
-        max_obj_ptrs: int,
-    ) -> str:
-        if requested_variant:
-            return requested_variant
-        if requested_preset:
-            return requested_preset
-
-        for preset_name, caps in VARIANT_PRESET_CAPS.items():
-            if caps["max_mem_frames"] != int(max_mem_frames):
-                continue
-            if caps["max_obj_ptrs"] != int(max_obj_ptrs):
-                continue
-            if cls._resolve_model_path(onnx_dir, "memory_attention.onnx", preset_name).exists():
-                return preset_name
-        return ""
+    def _bundle_exists(cls, onnx_dir: Path, graph_profile: str) -> bool:
+        required = (
+            "image_decoder.onnx",
+            "memory_attention.onnx",
+            "memory_encoder.onnx",
+            "video_constants.npz",
+        )
+        return all(
+            (onnx_dir / cls._profiled_name(base_name, graph_profile)).exists()
+            for base_name in required
+        )
 
     @classmethod
-    def _resolve_model_path(cls, onnx_dir: Path, base_name: str, variant: str) -> Path:
-        candidate = onnx_dir / cls._variant_name(base_name, variant)
+    def _resolve_graph_profile(cls, onnx_dir: Path, requested_max_mem_frames: int) -> str:
+        candidates = (
+            ["quality", "parity", "fast", "default"]
+            if int(requested_max_mem_frames) > DEFAULT_MAX_MEM_FRAMES
+            else ["fast", "quality", "parity", "default"]
+        )
+        for graph_profile in candidates:
+            if graph_profile == "default":
+                return "default"
+            if cls._bundle_exists(onnx_dir, graph_profile):
+                return graph_profile
+        return "default"
+
+    @classmethod
+    def _resolve_model_path(cls, onnx_dir: Path, base_name: str, graph_profile: str) -> Path:
+        candidate = onnx_dir / cls._profiled_name(base_name, graph_profile)
         if candidate.exists():
             return candidate
         fallback = onnx_dir / base_name
@@ -1076,43 +1063,28 @@ class Sam3OnnxTrackerSession:
         return candidate
 
     @classmethod
-    def _resolve_encoder_path(cls, onnx_dir: Path, variant: str) -> Path:
-        custom_encoder = cls._resolve_model_path(onnx_dir, "image_encoder.onnx", variant)
-        if custom_encoder.exists():
-            return custom_encoder
+    def _resolve_encoder_path(cls, onnx_dir: Path) -> Path:
+        custom_candidates = [
+            onnx_dir / "image_encoder.onnx",
+            onnx_dir / "image_encoder_fp16.onnx",
+        ]
+        for custom_encoder in custom_candidates:
+            if custom_encoder.exists():
+                return custom_encoder
 
         repo_root = Path(__file__).resolve().parent.parent
         shared_dir = repo_root / "checkpoints" / "sam3" / "onnx"
 
-        encoder_candidates = []
-        wants_fp16 = "fp16" in variant.lower()
-        wants_fp32 = "fp32" in variant.lower()
-        if variant:
-            encoder_candidates.extend(
-                [
-                    shared_dir / cls._variant_name("vision_encoder.onnx", variant),
-                    shared_dir / cls._variant_name("vision_encoder_fp16.onnx", variant),
-                ]
-            )
-            if wants_fp32:
-                encoder_candidates.append(shared_dir / "vision_encoder.onnx")
-            if wants_fp16:
-                encoder_candidates.append(shared_dir / "vision_encoder_fp16.onnx")
-
-        if wants_fp16:
-            encoder_candidates.extend(
-                [
-                    shared_dir / "vision_encoder_fp16.onnx",
-                    shared_dir / "vision_encoder.onnx",
-                ]
-            )
-        else:
-            encoder_candidates.extend(
-                [
-                    shared_dir / "vision_encoder.onnx",
-                    shared_dir / "vision_encoder_fp16.onnx",
-                ]
-            )
+        accel = os.getenv("SAM3_ORT_ACCEL", "auto").strip().lower()
+        prefers_fp16 = accel != "cpu" and any(
+            provider in ("CUDAExecutionProvider", "TensorrtExecutionProvider")
+            for provider in ort.get_available_providers()
+        )
+        encoder_candidates = (
+            [shared_dir / "vision_encoder_fp16.onnx", shared_dir / "vision_encoder.onnx"]
+            if prefers_fp16
+            else [shared_dir / "vision_encoder.onnx", shared_dir / "vision_encoder_fp16.onnx"]
+        )
 
         seen = set()
         for candidate in encoder_candidates:
@@ -1129,8 +1101,8 @@ class Sam3OnnxTrackerSession:
         )
 
     @classmethod
-    def _load_video_constants(cls, onnx_dir: Path, variant: str) -> dict[str, np.ndarray]:
-        constants_path = cls._resolve_model_path(onnx_dir, "video_constants.npz", variant)
+    def _load_video_constants(cls, onnx_dir: Path, graph_profile: str) -> dict[str, np.ndarray]:
+        constants_path = cls._resolve_model_path(onnx_dir, "video_constants.npz", graph_profile)
         if not constants_path.exists():
             raise SystemExit(
                 f"Missing {constants_path}. Run export\\onnx_export.py first to generate the video constants bundle."

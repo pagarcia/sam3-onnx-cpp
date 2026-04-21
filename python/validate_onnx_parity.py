@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
+from onnx_runtime_policy import resolve_runtime_caps
 from compare_native_vs_onnx import (
     DEFAULT_CKPT,
     DEFAULT_ONNX_DIR,
@@ -108,11 +109,6 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
-        "--onnx_variant",
-        default="",
-        help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
-    )
-    parser.add_argument(
         "--max_frames",
         type=int,
         default=20,
@@ -121,14 +117,14 @@ def main():
     parser.add_argument(
         "--onnx_max_mem_frames",
         type=int,
-        default=2,
-        help="Default ONNX spatial-memory cap for cases that do not override it.",
+        default=None,
+        help="Optional default ONNX spatial-memory cap. When omitted, the runtime auto-selects 2 for single-annotation and 4 for multi-annotation.",
     )
     parser.add_argument(
         "--onnx_max_obj_ptrs",
         type=int,
-        default=16,
-        help="Default ONNX object-pointer cap for cases that do not override it.",
+        default=None,
+        help="Optional default ONNX object-pointer cap. Defaults to 16 when omitted.",
     )
     parser.add_argument(
         "--outdir",
@@ -159,6 +155,11 @@ def main():
         case_name = case.get("name", f"case_{idx:02d}")
         case_dir = outdir / case_name
         prompt_spec = _resolve_prompt_spec(case)
+        onnx_max_mem_frames, onnx_max_obj_ptrs = resolve_runtime_caps(
+            prompt_spec=prompt_spec,
+            max_mem_frames=case.get("onnx_max_mem_frames", args.onnx_max_mem_frames),
+            max_obj_ptrs=case.get("onnx_max_obj_ptrs", args.onnx_max_obj_ptrs),
+        )
         print(f"[INFO] Case {idx}/{len(cases)}: {case_name}")
 
         run = run_compare(
@@ -171,9 +172,8 @@ def main():
             max_frames=int(case.get("max_frames", args.max_frames)),
             safe=bool(case.get("safe", args.safe)),
             onnx_accel=case.get("onnx_accel", args.onnx_accel),
-            onnx_max_mem_frames=int(case.get("onnx_max_mem_frames", args.onnx_max_mem_frames)),
-            onnx_max_obj_ptrs=int(case.get("onnx_max_obj_ptrs", args.onnx_max_obj_ptrs)),
-            onnx_variant=case.get("onnx_variant", args.onnx_variant),
+            onnx_max_mem_frames=onnx_max_mem_frames,
+            onnx_max_obj_ptrs=onnx_max_obj_ptrs,
         )
         summary = run["summary"]
         passed, failures = _check_thresholds(summary, case.get("thresholds", {}))

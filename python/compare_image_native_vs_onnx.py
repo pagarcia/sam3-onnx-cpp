@@ -33,9 +33,7 @@ from compare_native_vs_onnx import (
 
 RESULT_LAYOUT = (
     ("Native", "native"),
-    ("ONNX Fast", "fast"),
-    ("ONNX Quality", "quality"),
-    ("ONNX Parity", "parity"),
+    ("ONNX", "onnx"),
 )
 
 
@@ -114,7 +112,7 @@ def _annotate_tile(vis_bgr: np.ndarray, title: str, meta: dict) -> np.ndarray:
     if meta.get("variant"):
         cv2.putText(
             tile,
-            f"Variant: {meta['variant']}",
+            f"Mode: {meta['variant']}",
             (tile.shape[1] - 260, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -140,9 +138,7 @@ def _compose_grid(image_bgr: np.ndarray, prompt_spec: dict, results: dict[str, d
         _draw_prompt(vis, prompt_spec, scale)
         tiles.append(_annotate_tile(vis, title, meta))
 
-    top = np.hstack(tiles[:2])
-    bottom = np.hstack(tiles[2:])
-    return np.vstack([top, bottom])
+    return np.hstack(tiles)
 
 
 def _run_native_image_compare(
@@ -257,16 +253,14 @@ def _run_native_image_compare(
 
 def _run_onnx_worker(
     *,
-    preset: str,
     image_path: str,
     prompt_json_path: Path,
     onnx_dir: Path,
     outdir: Path,
     safe: bool,
-    onnx_variant: str,
 ) -> tuple[np.ndarray, dict]:
-    mask_path = outdir / f"{preset}_mask.png"
-    json_path = outdir / f"{preset}_summary.json"
+    mask_path = outdir / "onnx_mask.png"
+    json_path = outdir / "onnx_summary.json"
     cmd = [
         str(REPO_ROOT / "sam3_env" / "Scripts" / "python.exe"),
         str(REPO_ROOT / "python" / "onnx_compare_image_worker.py"),
@@ -274,8 +268,6 @@ def _run_onnx_worker(
         str(Path(image_path).resolve()),
         "--prompt_json",
         str(prompt_json_path.resolve()),
-        "--preset",
-        preset,
         "--onnx_dir",
         str(onnx_dir.resolve()),
         "--save_mask",
@@ -285,8 +277,6 @@ def _run_onnx_worker(
     ]
     if safe:
         cmd.append("--safe")
-    if onnx_variant:
-        cmd.extend(["--onnx_variant", onnx_variant])
 
     subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
     mask_uint8 = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -300,14 +290,14 @@ def _run_onnx_worker(
         "dec_ms": float(payload["dec_ms"]),
         "mem_ms": float(payload["mem_ms"]),
         "full_total_ms": float(payload["full_total_ms"]),
-        "variant": payload["runtime"].get("resolved_variant", preset),
+        "variant": payload["runtime"].get("mode", "default"),
     }
     return mask_uint8, meta
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare one native SAM3 image prompt against ONNX fast/quality/parity in a 2x2 grid."
+        description="Compare one native SAM3 image prompt against the default ONNX path."
     )
     parser.add_argument("--image", default="", help="Optional image path. If omitted, a file picker is shown.")
     parser.add_argument(
@@ -336,11 +326,6 @@ def main() -> None:
         help="Directory containing the exported ONNX tracker files.",
     )
     parser.add_argument(
-        "--onnx_variant",
-        default="",
-        help="Optional explicit ONNX variant override for all presets.",
-    )
-    parser.add_argument(
         "--outdir",
         default="",
         help="Optional output directory for prompt/masks/summary/composite.",
@@ -348,7 +333,7 @@ def main() -> None:
     parser.add_argument(
         "--save_compare_png",
         default="",
-        help="Optional explicit PNG path for the final 2x2 comparison image.",
+        help="Optional explicit PNG path for the final side-by-side comparison image.",
     )
     parser.add_argument(
         "--safe",
@@ -383,21 +368,18 @@ def main() -> None:
     print(f"[INFO] Prompt    : {prompt_json_path}")
 
     results: dict[str, dict] = {}
-    for preset in ("fast", "quality", "parity"):
-        print(f"[INFO] Running ONNX preset: {preset}")
-        mask_uint8, meta = _run_onnx_worker(
-            preset=preset,
-            image_path=image_path,
-            prompt_json_path=prompt_json_path,
-            onnx_dir=Path(args.onnx_dir),
-            outdir=outdir,
-            safe=args.safe,
-            onnx_variant=args.onnx_variant,
-        )
-        results[preset] = {
-            "mask_uint8": mask_uint8,
-            **meta,
-        }
+    print("[INFO] Running default ONNX image path...")
+    mask_uint8, meta = _run_onnx_worker(
+        image_path=image_path,
+        prompt_json_path=prompt_json_path,
+        onnx_dir=Path(args.onnx_dir),
+        outdir=outdir,
+        safe=args.safe,
+    )
+    results["onnx"] = {
+        "mask_uint8": mask_uint8,
+        **meta,
+    }
 
     print("[INFO] Running native image path...")
     native_mask, native_meta = _run_native_image_compare(
@@ -415,7 +397,7 @@ def main() -> None:
     compare_png = (
         Path(args.save_compare_png).resolve()
         if args.save_compare_png
-        else outdir / "compare_2x2.png"
+        else outdir / "compare_native_vs_onnx.png"
     )
     compare_png.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(compare_png), grid):
@@ -425,9 +407,7 @@ def main() -> None:
         "image": str(Path(image_path).resolve()),
         "prompt_json": str(prompt_json_path),
         "native": {key: value for key, value in results["native"].items() if key != "mask_uint8"},
-        "fast": {key: value for key, value in results["fast"].items() if key != "mask_uint8"},
-        "quality": {key: value for key, value in results["quality"].items() if key != "mask_uint8"},
-        "parity": {key: value for key, value in results["parity"].items() if key != "mask_uint8"},
+        "onnx": {key: value for key, value in results["onnx"].items() if key != "mask_uint8"},
         "compare_png": str(compare_png),
     }
     summary_path = outdir / "summary.json"
@@ -437,7 +417,7 @@ def main() -> None:
     print(f"[INFO] Saved summary JSON    : {summary_path}")
     cv2.namedWindow("SAM3 2D Compare", cv2.WINDOW_AUTOSIZE)
     cv2.imshow("SAM3 2D Compare", grid)
-    print("[INFO] Showing 2x2 comparison. Press ESC to close.")
+    print("[INFO] Showing side-by-side comparison. Press ESC to close.")
     while True:
         if cv2.waitKey(20) & 0xFF == 27:
             break

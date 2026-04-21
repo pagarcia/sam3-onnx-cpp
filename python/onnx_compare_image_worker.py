@@ -12,25 +12,14 @@ from sam3_onnx_session import Sam3OnnxTrackerSession, load_prompt_spec
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a single ONNX image prompt for one preset and save the mask/timings."
+        description="Run the default ONNX image prompt path and save the mask/timings."
     )
     parser.add_argument("--image", required=True, help="Input image path.")
     parser.add_argument("--prompt_json", required=True, help="Prompt JSON path.")
     parser.add_argument(
-        "--preset",
-        required=True,
-        choices=["fast", "quality", "parity"],
-        help="Named ONNX runtime preset.",
-    )
-    parser.add_argument(
         "--onnx_dir",
         default=str(Path(__file__).resolve().parent.parent / "checkpoints" / "sam3" / "video_onnx"),
         help="Directory containing the exported ONNX tracker files.",
-    )
-    parser.add_argument(
-        "--onnx_variant",
-        default="",
-        help="Optional explicit ONNX variant override.",
     )
     parser.add_argument("--save_mask", required=True, help="Output mask PNG path.")
     parser.add_argument("--save_json", required=True, help="Output JSON summary path.")
@@ -50,8 +39,6 @@ def main() -> None:
     tracker = Sam3OnnxTrackerSession(
         Path(args.onnx_dir),
         safe=args.safe,
-        variant=args.onnx_variant,
-        preset=args.preset,
     )
     prepared, prompt_points, prompt_labels = tracker.prepare_prompt_from_spec(
         image_bgr,
@@ -79,8 +66,7 @@ def main() -> None:
     )
     payload = {
         "image": str(image_path),
-        "preset": args.preset,
-        "requested_variant": args.onnx_variant,
+        "mode": "default",
         "mask_path": str(save_mask),
         "prep_ms": float(result.timings.prep_ms),
         "enc_ms": float(result.timings.enc_ms),
@@ -92,10 +78,7 @@ def main() -> None:
         "runtime": tracker.runtime_metadata,
     }
     save_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(
-        f"[INFO] preset={args.preset} variant={payload['runtime']['resolved_variant'] or 'default'} "
-        f"full_total_ms={full_total_ms:.1f}"
-    )
+    print(f"[INFO] mode=default full_total_ms={full_total_ms:.1f}")
     print(f"[INFO] Saved mask: {save_mask}")
     print(f"[INFO] Saved JSON: {save_json}")
 

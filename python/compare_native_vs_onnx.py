@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import torch
 
+from onnx_runtime_policy import resolve_runtime_caps as resolve_onnx_runtime_caps
 from prompt_spec_utils import (
     load_prompt_spec as _shared_load_prompt_spec,
     parse_box_text as _shared_parse_box_text,
@@ -32,14 +33,6 @@ DEFAULT_CKPT = Path(
     r"C:\Users\Pablo\.cache\huggingface\hub\models--facebook--sam3\snapshots\3c879f39826c281e95690f02c7821c4de09afae7\sam3.pt"
 )
 TARGET_SIZE = 1008
-ONNX_FAST_DEFAULT_MAX_MEM_FRAMES = 2
-ONNX_FAST_DEFAULT_MAX_OBJ_PTRS = 16
-ONNX_PRESETS = {
-    "fast": {"max_mem_frames": 2, "max_obj_ptrs": 16},
-    "quality": {"max_mem_frames": 7, "max_obj_ptrs": 16},
-    "parity": {"max_mem_frames": 7, "max_obj_ptrs": 16},
-}
-ONNX_PRESET_CHOICES = tuple(ONNX_PRESETS.keys())
 
 
 def _sync_cuda():
@@ -604,8 +597,6 @@ def _run_onnx_subprocess(
     onnx_accel: str,
     onnx_max_mem_frames: int,
     onnx_max_obj_ptrs: int,
-    onnx_variant: str,
-    onnx_preset: str = "",
 ):
     cmd = [
         str(REPO_ROOT / "sam3_env" / "Scripts" / "python.exe"),
@@ -622,10 +613,6 @@ def _run_onnx_subprocess(
         str(max_frames),
         "--no_output_video",
     ]
-    if onnx_variant:
-        cmd.extend(["--onnx_variant", onnx_variant])
-    if onnx_preset:
-        cmd.extend(["--preset", onnx_preset])
     if safe:
         cmd.append("--safe")
     if onnx_max_mem_frames > 0:
@@ -676,18 +663,6 @@ def _decode_json_scalar(data: dict, key: str):
     return json.loads(value)
 
 
-def _resolve_onnx_runtime_caps(
-    onnx_preset: str,
-    onnx_max_mem_frames: int | None,
-    onnx_max_obj_ptrs: int | None,
-) -> tuple[str, int, int]:
-    preset = onnx_preset.strip().lower()
-    defaults = ONNX_PRESETS.get(preset, ONNX_PRESETS["fast"])
-    max_mem_frames = defaults["max_mem_frames"] if onnx_max_mem_frames is None else onnx_max_mem_frames
-    max_obj_ptrs = defaults["max_obj_ptrs"] if onnx_max_obj_ptrs is None else onnx_max_obj_ptrs
-    return preset, int(max_mem_frames), int(max_obj_ptrs)
-
-
 def _summarize_timings(prefix: str, data):
     summary = {}
     for key in ("prep_ms", "enc_ms", "attn_ms", "dec_ms", "mem_ms", "total_ms"):
@@ -723,8 +698,6 @@ def run_compare(
     onnx_accel: str,
     onnx_max_mem_frames: int,
     onnx_max_obj_ptrs: int,
-    onnx_variant: str = "",
-    onnx_preset: str = "",
     prompt_json_path: Path | None = None,
 ):
     outdir = Path(outdir).resolve()
@@ -761,8 +734,6 @@ def run_compare(
         onnx_accel=onnx_accel,
         onnx_max_mem_frames=onnx_max_mem_frames,
         onnx_max_obj_ptrs=onnx_max_obj_ptrs,
-        onnx_variant=onnx_variant,
-        onnx_preset=onnx_preset,
     )
 
     native = _load_npz(native_npz)
@@ -794,11 +765,7 @@ def run_compare(
         "native_frame_count": native_frame_count,
         "onnx_frame_count": onnx_frame_count,
         "prompt": prompt_spec,
-        "onnx_variant_requested": onnx_variant,
-        "onnx_preset_requested": onnx_preset,
-        "onnx_variant": (
-            onnx_runtime.get("resolved_variant", onnx_variant) if isinstance(onnx_runtime, dict) else onnx_variant
-        ),
+        "onnx_mode": onnx_runtime.get("mode", "default") if isinstance(onnx_runtime, dict) else "default",
         "onnx_max_mem_frames": int(onnx_max_mem_frames),
         "onnx_max_obj_ptrs": int(onnx_max_obj_ptrs),
         "mean_iou": mean_iou,
@@ -866,27 +833,16 @@ def main():
         help="Execution provider choice for the ONNX subprocess.",
     )
     parser.add_argument(
-        "--onnx_preset",
-        default=os.getenv("SAM3_ONNX_PRESET", "").strip().lower(),
-        choices=["", *ONNX_PRESET_CHOICES],
-        help="Optional named ONNX runtime preset. When set, it fills in missing caps and prefers the matching exported variant.",
-    )
-    parser.add_argument(
-        "--onnx_variant",
-        default=os.getenv("SAM3_ONNX_VARIANT", "").strip(),
-        help="Optional ONNX tracker variant suffix such as fp16, fast, quality, or quality_fp16.",
-    )
-    parser.add_argument(
         "--onnx_max_mem_frames",
         type=int,
         default=None,
-        help="Cap on ONNX spatial memory frames. Defaults to the selected preset, or the fast preset when omitted.",
+        help="Optional ONNX spatial-memory cap. When omitted, the runtime auto-selects 2 for single-annotation and 4 for multi-annotation.",
     )
     parser.add_argument(
         "--onnx_max_obj_ptrs",
         type=int,
         default=None,
-        help="Cap on ONNX object pointers. Defaults to the selected preset, or the fast preset when omitted.",
+        help="Optional ONNX object-pointer cap. Defaults to 16 when omitted.",
     )
     parser.add_argument(
         "--outdir",
@@ -907,10 +863,10 @@ def main():
 
     video = _load_video_frames(args.video, args.max_frames)
     prompt_spec = _resolve_prompt(args, video.raw_frames[0])
-    onnx_preset, onnx_max_mem_frames, onnx_max_obj_ptrs = _resolve_onnx_runtime_caps(
-        args.onnx_preset,
-        args.onnx_max_mem_frames,
-        args.onnx_max_obj_ptrs,
+    onnx_max_mem_frames, onnx_max_obj_ptrs = resolve_onnx_runtime_caps(
+        prompt_spec=prompt_spec,
+        max_mem_frames=args.onnx_max_mem_frames,
+        max_obj_ptrs=args.onnx_max_obj_ptrs,
     )
     run = run_compare(
         video_path=args.video,
@@ -924,8 +880,6 @@ def main():
         onnx_accel=args.onnx_accel,
         onnx_max_mem_frames=onnx_max_mem_frames,
         onnx_max_obj_ptrs=onnx_max_obj_ptrs,
-        onnx_variant=args.onnx_variant,
-        onnx_preset=onnx_preset,
         prompt_json_path=Path(args.save_prompt_json).resolve() if args.save_prompt_json else None,
     )
     summary = run["summary"]
@@ -944,8 +898,8 @@ def main():
     runtime = summary.get("onnx_runtime", {})
     if isinstance(runtime, dict):
         print(
-            f"[INFO] ONNX runtime  : preset={runtime.get('requested_preset') or 'auto'} "
-            f"variant={runtime.get('resolved_variant') or 'default'} "
+            f"[INFO] ONNX runtime  : mode={runtime.get('mode', 'default')} "
+            f"graph={runtime.get('graph_profile', 'default')} "
             f"iobinding={'on' if runtime.get('uses_iobinding') else 'off'}"
         )
     print(
