@@ -16,6 +16,14 @@ import cv2
 import numpy as np
 import torch
 
+from prompt_spec_utils import (
+    load_prompt_spec as _shared_load_prompt_spec,
+    parse_box_text as _shared_parse_box_text,
+    parse_points_text as _shared_parse_points_text,
+    prompt_annotations_from_spec,
+    save_prompt_spec as _shared_save_prompt_spec,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SAM3_REPO = REPO_ROOT.parent / "sam3"
@@ -57,32 +65,19 @@ def _measure_torch(fn):
 
 
 def _parse_points_text(text: str):
-    points, labels = [], []
-    if not text.strip():
-        return points, labels
-    for item in text.split(";"):
-        x_str, y_str, label_str = [part.strip() for part in item.split(",")]
-        points.append((int(float(x_str)), int(float(y_str))))
-        labels.append(int(label_str))
-    return points, labels
+    return _shared_parse_points_text(text)
 
 
 def _parse_box_text(text: str):
-    parts = [int(float(part.strip())) for part in text.split(",")]
-    if len(parts) != 4:
-        raise ValueError("--box expects x1,y1,x2,y2")
-    return tuple(parts)
+    return _shared_parse_box_text(text)
 
 
 def _load_prompt_spec(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    return _shared_load_prompt_spec(path)
 
 
 def _save_prompt_spec(path: Path, spec) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(spec, f, indent=2)
+    _shared_save_prompt_spec(path, spec)
 
 
 def _compute_display_base(frame_bgr: np.ndarray, max_side: int = 1200):
@@ -198,6 +193,25 @@ def _resolve_prompt(args, first_bgr):
     if args.prompt == "bounding_box":
         return _interactive_select_box(first_bgr)
     return _interactive_select_points(first_bgr)
+
+
+def _validate_prompt_annotations(
+    annotations: list[dict],
+    *,
+    frame_count: int,
+) -> None:
+    if not annotations:
+        raise SystemExit("At least one prompt annotation is required.")
+    if int(annotations[0]["frame_idx"]) != 0:
+        raise SystemExit(
+            "Multi-annotation video prompts currently require the first annotation to be on frame 0."
+        )
+    for annotation in annotations:
+        frame_idx = int(annotation["frame_idx"])
+        if frame_idx >= frame_count:
+            raise SystemExit(
+                f"Prompt annotation frame {frame_idx} is outside the loaded video length ({frame_count} frames)."
+            )
 
 
 def _preprocess_frame_native(frame_bgr: np.ndarray) -> torch.Tensor:
@@ -377,10 +391,29 @@ def _run_native_tracker(
     save_path: Path,
     video_path: str,
 ):
+    print(
+        f"[INFO] Building native SAM3 model from checkpoint: {Path(checkpoint).resolve()}",
+        flush=True,
+    )
     image_model = _build_native_model(sam3_repo, checkpoint)
     tracker = image_model.inst_interactive_predictor.model
     device = next(image_model.parameters()).device
-    point_inputs = _prepare_native_point_inputs(prompt_spec, video.width, video.height, device)
+    print(f"[INFO] Native model ready on device: {device}", flush=True)
+    annotations = prompt_annotations_from_spec(prompt_spec)
+    _validate_prompt_annotations(annotations, frame_count=len(video.raw_frames))
+    print(
+        f"[INFO] Native prompt frames: {[int(annotation['frame_idx']) for annotation in annotations]}",
+        flush=True,
+    )
+    point_inputs_by_frame = {
+        int(annotation["frame_idx"]): _prepare_native_point_inputs(
+            annotation,
+            video.width,
+            video.height,
+            device,
+        )
+        for annotation in annotations
+    }
     output_dict = {
         "cond_frame_outputs": {},
         "non_cond_frame_outputs": {},
@@ -393,6 +426,8 @@ def _run_native_tracker(
     saved_dec_ms = []
     saved_mem_ms = []
     saved_total_ms = []
+    total_frames = len(video.raw_frames)
+    run_t0 = time.time()
 
     try:
         for frame_idx, (frame_bgr, frame_cpu) in enumerate(zip(video.raw_frames, video.processed_frames)):
@@ -412,8 +447,8 @@ def _run_native_tracker(
             else:
                 high_res_features = None
 
-            is_init_cond_frame = frame_idx == 0
-            model_point_inputs = point_inputs if is_init_cond_frame else None
+            is_init_cond_frame = frame_idx in point_inputs_by_frame
+            model_point_inputs = point_inputs_by_frame.get(frame_idx)
 
             fused_embed, attn_ms = _measure_torch(
                 lambda: tracker._prepare_memory_conditioned_features(
@@ -442,7 +477,7 @@ def _run_native_tracker(
             (
                 _,
                 _high_res_multimasks,
-                _ious,
+                ious,
                 low_res_masks,
                 high_res_masks,
                 obj_ptr,
@@ -470,6 +505,10 @@ def _run_native_tracker(
                 "obj_ptr": obj_ptr,
                 "object_score_logits": object_score_logits,
             }
+            if tracker.use_memory_selection:
+                iou_score = ious.max(-1)[0]
+                current_out["iou_score"] = iou_score
+                current_out["eff_iou_score"] = tracker.cal_mem_score(object_score_logits, iou_score)
             if is_init_cond_frame:
                 output_dict["cond_frame_outputs"][frame_idx] = current_out
             else:
@@ -482,7 +521,38 @@ def _run_native_tracker(
             saved_attn_ms.append(0.0 if is_init_cond_frame else attn_ms)
             saved_dec_ms.append(dec_ms)
             saved_mem_ms.append(mem_ms)
-            saved_total_ms.append(((time.time() - frame_t0) * 1000.0) + prep_ms)
+            total_ms = ((time.time() - frame_t0) * 1000.0) + prep_ms
+            saved_total_ms.append(total_ms)
+
+            should_log = (
+                frame_idx < 3
+                or is_init_cond_frame
+                or (frame_idx + 1) == total_frames
+                or ((frame_idx + 1) % 10 == 0)
+            )
+            if should_log:
+                elapsed_s = max(0.0, time.time() - run_t0)
+                processed = frame_idx + 1
+                avg_ms = float(np.mean(saved_total_ms)) if saved_total_ms else 0.0
+                remaining = max(0, total_frames - processed)
+                eta_s = (avg_ms * remaining) / 1000.0 if avg_ms > 0 else 0.0
+                phase = "Cond" if is_init_cond_frame else "Track"
+                if is_init_cond_frame:
+                    print(
+                        f"[INFO] Native Frame {frame_idx:03d} | {phase} | "
+                        f"Prep:{prep_ms:.1f} Enc:{enc_ms:.1f} Dec:{dec_ms:.1f} Mem:{mem_ms:.1f} "
+                        f"Total:{total_ms:.1f} ms | "
+                        f"Elapsed:{elapsed_s:.1f}s ETA:{eta_s:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[INFO] Native Frame {frame_idx:03d} | {phase} | "
+                        f"Prep:{prep_ms:.1f} Enc:{enc_ms:.1f} Attn:{attn_ms:.1f} "
+                        f"Dec:{dec_ms:.1f} Mem:{mem_ms:.1f} Total:{total_ms:.1f} ms | "
+                        f"Elapsed:{elapsed_s:.1f}s ETA:{eta_s:.1f}s",
+                        flush=True,
+                    )
 
             del (
                 image,
@@ -517,9 +587,10 @@ def _run_native_tracker(
             prompt_json=np.array(json.dumps(prompt_spec)),
             video_path=np.array(str(video_path)),
         )
+        print(f"[INFO] Native benchmark dump saved: {save_path}", flush=True)
         return save_path
     finally:
-        del output_dict, point_inputs, tracker, image_model
+        del output_dict, point_inputs_by_frame, tracker, image_model
         _release_cuda_memory()
 
 
@@ -781,7 +852,11 @@ def main():
     )
     parser.add_argument("--points", default="", help="Prompt points as x,y,label;x,y,label")
     parser.add_argument("--box", default="", help="Prompt box as x1,y1,x2,y2")
-    parser.add_argument("--prompt_json", default="", help="Optional prompt JSON to replay.")
+    parser.add_argument(
+        "--prompt_json",
+        default="",
+        help="Optional prompt JSON to replay. Supports the legacy single-frame format or a multi-frame 'annotations' list.",
+    )
     parser.add_argument("--save_prompt_json", default="", help="Optional output path for the prompt JSON.")
     parser.add_argument("--max_frames", type=int, default=20, help="Number of frames to compare.")
     parser.add_argument(

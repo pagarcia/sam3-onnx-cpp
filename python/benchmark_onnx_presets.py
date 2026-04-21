@@ -90,7 +90,11 @@ def main():
     )
     parser.add_argument("--points", default="", help="Prompt points as x,y,label;x,y,label")
     parser.add_argument("--box", default="", help="Prompt box as x1,y1,x2,y2")
-    parser.add_argument("--prompt_json", default="", help="Optional prompt JSON to replay.")
+    parser.add_argument(
+        "--prompt_json",
+        default="",
+        help="Optional prompt JSON to replay. Supports the legacy single-frame format or a multi-frame 'annotations' list.",
+    )
     parser.add_argument("--save_prompt_json", default="", help="Optional output path for the prompt JSON.")
     parser.add_argument("--max_frames", type=int, default=20, help="Number of frames to compare.")
     parser.add_argument(

@@ -16,18 +16,21 @@ import numpy as np
 from PyQt5 import QtWidgets
 
 from onnx_test_utils import compute_display_base, green_overlay, print_system_info, set_cv2_threads
+from prompt_spec_utils import (
+    load_prompt_spec,
+    parse_box_text,
+    parse_points_text,
+    prompt_annotations_from_spec,
+    save_prompt_spec,
+)
 from sam3_onnx_session import (
     FAST_DEFAULT_MAX_MEM_FRAMES,
     FAST_DEFAULT_MAX_OBJ_PTRS,
     Sam3OnnxTrackerSession,
     VARIANT_PRESET_CAPS,
-    load_prompt_spec,
     mask_to_overlay,
-    parse_box_text,
-    parse_points_text,
     prepare_prompt_box,
     prepare_prompt_points,
-    save_prompt_spec,
 )
 
 
@@ -48,7 +51,67 @@ def _resolve_runtime_caps(args) -> tuple[str, int, int]:
     return preset, int(max_mem_frames), int(max_obj_ptrs)
 
 
-def _interactive_select_points(first_bgr, tracker: Sam3OnnxTrackerSession):
+def _parse_frame_indices_text(text: str, *, one_based: bool = False) -> list[int]:
+    frame_indices: list[int] = []
+    seen: set[int] = set()
+    if not text.strip():
+        return frame_indices
+    for item in text.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        frame_idx = int(value)
+        if one_based:
+            if frame_idx <= 0:
+                raise SystemExit(
+                    "--prompt_frames_1based expects positive frame numbers such as 1,10,20."
+                )
+            frame_idx -= 1
+        elif frame_idx < 0:
+            raise SystemExit("--prompt_frames expects non-negative frame indices.")
+        if frame_idx in seen:
+            raise SystemExit(f"--prompt_frames contains duplicate frame index {frame_idx}.")
+        seen.add(frame_idx)
+        frame_indices.append(frame_idx)
+    return sorted(frame_indices)
+
+
+def _read_frame_at(cap: cv2.VideoCapture, frame_idx: int, first_frame: np.ndarray) -> np.ndarray:
+    if frame_idx == 0:
+        return first_frame.copy()
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ok, frame_bgr = cap.read()
+    if not ok:
+        raise SystemExit(f"Could not read frame {frame_idx} from the selected video.")
+    return frame_bgr
+
+
+def _validate_prompt_annotations(
+    annotations: list[dict],
+    *,
+    max_frames: int,
+) -> None:
+    if not annotations:
+        raise SystemExit("At least one prompt annotation is required.")
+    if int(annotations[0]["frame_idx"]) != 0:
+        raise SystemExit(
+            "Multi-annotation video prompts currently require the first annotation to be on frame 0."
+        )
+    if max_frames > 0:
+        for annotation in annotations:
+            frame_idx = int(annotation["frame_idx"])
+            if frame_idx >= max_frames:
+                raise SystemExit(
+                    f"Prompt annotation frame {frame_idx} is outside --max_frames={max_frames}."
+                )
+
+
+def _interactive_select_points(
+    first_bgr,
+    tracker: Sam3OnnxTrackerSession,
+    *,
+    frame_label: str = "",
+):
     prepared = tracker.prepare_frame(first_bgr)
     base, scale = compute_display_base(first_bgr, max_side=1200)
     points, labels = [], []
@@ -58,6 +121,9 @@ def _interactive_select_points(first_bgr, tracker: Sam3OnnxTrackerSession):
         if mask_logits is not None:
             overlay = mask_to_overlay(first_bgr, mask_logits, prepared.info)
             vis = cv2.resize(overlay, (base.shape[1], base.shape[0]))
+        if frame_label:
+            cv2.putText(vis, frame_label, (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
+            cv2.putText(vis, frame_label, (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         for idx, (px, py) in enumerate(points):
             color = (0, 0, 255) if labels[idx] == 1 else (255, 0, 0)
             cv2.circle(vis, (int(px * scale), int(py * scale)), 6, color, -1)
@@ -87,7 +153,10 @@ def _interactive_select_points(first_bgr, tracker: Sam3OnnxTrackerSession):
     cv2.namedWindow("SAM3 ONNX Video")
     cv2.setMouseCallback("SAM3 ONNX Video", mouse_cb)
     update_preview()
-    print("[INFO] L-click=FG, R-click=BG, M-click=reset. Press Enter or ESC when done.")
+    print(
+        f"[INFO] {frame_label or 'Frame 0'} | "
+        "L-click=FG, R-click=BG, M-click=reset. Press Enter or ESC when done."
+    )
     while True:
         key = cv2.waitKey(20) & 0xFF
         if key in (13, 27):
@@ -102,7 +171,12 @@ def _interactive_select_points(first_bgr, tracker: Sam3OnnxTrackerSession):
     return prepared, prompt_points, prompt_labels, prompt_spec
 
 
-def _interactive_select_box(first_bgr, tracker: Sam3OnnxTrackerSession):
+def _interactive_select_box(
+    first_bgr,
+    tracker: Sam3OnnxTrackerSession,
+    *,
+    frame_label: str = "",
+):
     prepared = tracker.prepare_frame(first_bgr)
     base, scale = compute_display_base(first_bgr, max_side=1200)
     rect_start = None
@@ -125,6 +199,9 @@ def _interactive_select_box(first_bgr, tracker: Sam3OnnxTrackerSession):
         if mask_logits is not None:
             overlay = mask_to_overlay(first_bgr, mask_logits, prepared.info)
             vis = cv2.resize(overlay, (base.shape[1], base.shape[0]))
+        if frame_label:
+            cv2.putText(vis, frame_label, (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
+            cv2.putText(vis, frame_label, (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         if rect_start is not None and rect_end is not None:
             cv2.rectangle(vis, rect_start, rect_end, (0, 255, 255), 2)
         cv2.imshow("SAM3 ONNX Video", vis)
@@ -159,7 +236,7 @@ def _interactive_select_box(first_bgr, tracker: Sam3OnnxTrackerSession):
     cv2.namedWindow("SAM3 ONNX Video")
     cv2.setMouseCallback("SAM3 ONNX Video", mouse_cb)
     render()
-    print("[INFO] Drag a box on the first frame. Press Enter or ESC when done.")
+    print(f"[INFO] {frame_label or 'Frame 0'} | Drag a box. Press Enter or ESC when done.")
     while True:
         key = cv2.waitKey(20) & 0xFF
         if key in (13, 27):
@@ -173,6 +250,82 @@ def _interactive_select_box(first_bgr, tracker: Sam3OnnxTrackerSession):
         "box": list(box) if box is not None else None,
     }
     return prepared, prompt_points, prompt_labels, prompt_spec
+
+
+def _build_prompt_schedule_from_spec(
+    cap: cv2.VideoCapture,
+    first_frame: np.ndarray,
+    tracker: Sam3OnnxTrackerSession,
+    prompt_spec: dict,
+    *,
+    max_frames: int,
+) -> tuple[dict[int, dict[str, object]], dict]:
+    annotations = prompt_annotations_from_spec(prompt_spec)
+    _validate_prompt_annotations(annotations, max_frames=max_frames)
+
+    prompt_schedule: dict[int, dict[str, object]] = {}
+    for annotation in annotations:
+        frame_idx = int(annotation["frame_idx"])
+        frame_bgr = _read_frame_at(cap, frame_idx, first_frame)
+        prepared, prompt_points, prompt_labels = tracker.prepare_prompt_from_spec(
+            frame_bgr,
+            annotation,
+        )
+        prompt_schedule[frame_idx] = {
+            "prepared": prepared,
+            "prompt_points": prompt_points,
+            "prompt_labels": prompt_labels,
+            "annotation": dict(annotation),
+        }
+    return prompt_schedule, {"annotations": annotations}
+
+
+def _interactive_collect_prompt_schedule(
+    cap: cv2.VideoCapture,
+    first_frame: np.ndarray,
+    tracker: Sam3OnnxTrackerSession,
+    *,
+    prompt_kind: str,
+    frame_indices: list[int],
+    max_frames: int,
+) -> tuple[dict[int, dict[str, object]], dict]:
+    if not frame_indices:
+        frame_indices = [0]
+
+    annotations: list[dict] = []
+    prompt_schedule: dict[int, dict[str, object]] = {}
+    _validate_prompt_annotations(
+        [{"frame_idx": frame_idx, "prompt": prompt_kind} for frame_idx in frame_indices],
+        max_frames=max_frames,
+    )
+
+    for frame_idx in frame_indices:
+        frame_bgr = _read_frame_at(cap, frame_idx, first_frame)
+        frame_label = f"Frame {frame_idx}"
+        print(f"[INFO] Annotating {frame_label}...")
+        if prompt_kind == "bounding_box":
+            prepared, prompt_points, prompt_labels, prompt_spec = _interactive_select_box(
+                frame_bgr,
+                tracker,
+                frame_label=frame_label,
+            )
+        else:
+            prepared, prompt_points, prompt_labels, prompt_spec = _interactive_select_points(
+                frame_bgr,
+                tracker,
+                frame_label=frame_label,
+            )
+        annotation = dict(prompt_spec)
+        annotation["frame_idx"] = frame_idx
+        annotations.append(annotation)
+        prompt_schedule[frame_idx] = {
+            "prepared": prepared,
+            "prompt_points": prompt_points,
+            "prompt_labels": prompt_labels,
+            "annotation": annotation,
+        }
+
+    return prompt_schedule, {"annotations": annotations}
 
 
 def _resolve_video(args):
@@ -257,7 +410,7 @@ def main():
     parser.add_argument(
         "--prompt_json",
         default="",
-        help="Optional JSON file describing the prompt to replay.",
+        help="Optional prompt JSON to replay. Supports the legacy single-frame format or a multi-frame 'annotations' list.",
     )
     parser.add_argument(
         "--save_prompt_json",
@@ -279,7 +432,20 @@ def main():
         action="store_true",
         help="Disable ORT graph optimizations for all sessions.",
     )
+    parser.add_argument(
+        "--prompt_frames",
+        default="",
+        help="Optional comma-separated frame indices to annotate interactively, for example 0,40,90. The first annotation must be frame 0.",
+    )
+    parser.add_argument(
+        "--prompt_frames_1based",
+        default="",
+        help="Optional comma-separated 1-based frame numbers to annotate interactively, for example 1,10,20 for a 20-frame clip.",
+    )
     args = parser.parse_args()
+
+    if args.prompt_frames and args.prompt_frames_1based:
+        raise SystemExit("Use either --prompt_frames or --prompt_frames_1based, not both.")
 
     video_path = _resolve_video(args)
     print(f"[INFO] Video: {video_path}")
@@ -326,11 +492,36 @@ def main():
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     if args.prompt_json:
-        prompt_spec = load_prompt_spec(Path(args.prompt_json).resolve())
-        prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
+        prompt_schedule, prompt_spec = _build_prompt_schedule_from_spec(
+            cap,
+            first_frame,
+            tracker,
+            load_prompt_spec(Path(args.prompt_json).resolve()),
+            max_frames=args.max_frames,
+        )
+    elif args.prompt_frames or args.prompt_frames_1based:
+        prompt_schedule, prompt_spec = _interactive_collect_prompt_schedule(
+            cap,
+            first_frame,
+            tracker,
+            prompt_kind=args.prompt,
+            frame_indices=_parse_frame_indices_text(
+                args.prompt_frames_1based or args.prompt_frames,
+                one_based=bool(args.prompt_frames_1based),
+            ),
+            max_frames=args.max_frames,
+        )
     elif args.box:
         prompt_spec = {"prompt": "bounding_box", "box": list(parse_box_text(args.box))}
         prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
+        prompt_schedule = {
+            0: {
+                "prepared": prepared0,
+                "prompt_points": init_points,
+                "prompt_labels": init_labels,
+                "annotation": {"frame_idx": 0, **prompt_spec},
+            }
+        }
     elif args.points:
         points, labels = parse_points_text(args.points)
         prompt_spec = {
@@ -338,13 +529,50 @@ def main():
             "points": [[int(px), int(py), int(label)] for (px, py), label in zip(points, labels)],
         }
         prepared0, init_points, init_labels = tracker.prepare_prompt_from_spec(first_frame, prompt_spec)
+        prompt_schedule = {
+            0: {
+                "prepared": prepared0,
+                "prompt_points": init_points,
+                "prompt_labels": init_labels,
+                "annotation": {"frame_idx": 0, **prompt_spec},
+            }
+        }
     elif args.prompt == "bounding_box":
-        prepared0, init_points, init_labels, prompt_spec = _interactive_select_box(first_frame, tracker)
+        prepared0, init_points, init_labels, prompt_spec = _interactive_select_box(
+            first_frame,
+            tracker,
+            frame_label="Frame 0",
+        )
+        prompt_schedule = {
+            0: {
+                "prepared": prepared0,
+                "prompt_points": init_points,
+                "prompt_labels": init_labels,
+                "annotation": {"frame_idx": 0, **prompt_spec},
+            }
+        }
     else:
-        prepared0, init_points, init_labels, prompt_spec = _interactive_select_points(first_frame, tracker)
+        prepared0, init_points, init_labels, prompt_spec = _interactive_select_points(
+            first_frame,
+            tracker,
+            frame_label="Frame 0",
+        )
+        prompt_schedule = {
+            0: {
+                "prepared": prepared0,
+                "prompt_points": init_points,
+                "prompt_labels": init_labels,
+                "annotation": {"frame_idx": 0, **prompt_spec},
+            }
+        }
 
     if args.save_prompt_json:
         save_prompt_spec(Path(args.save_prompt_json).resolve(), prompt_spec)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    prompt_frame_indices = sorted(prompt_schedule)
+    print(f"[INFO] Prompt frames: {prompt_frame_indices}")
 
     tracker.reset()
 
@@ -376,13 +604,14 @@ def main():
         if args.max_frames > 0 and frame_idx >= args.max_frames:
             break
 
-        if frame_idx == 0:
+        schedule_entry = prompt_schedule.get(frame_idx)
+        if schedule_entry is not None:
             result = tracker.process_frame(
                 frame_idx,
                 frame_bgr,
-                prepared=prepared0,
-                prompt_points=init_points,
-                prompt_labels=init_labels,
+                prepared=schedule_entry["prepared"],
+                prompt_points=schedule_entry["prompt_points"],
+                prompt_labels=schedule_entry["prompt_labels"],
             )
         else:
             result = tracker.process_frame(frame_idx, frame_bgr)
@@ -397,13 +626,13 @@ def main():
         saved_dec_ms.append(result.timings.dec_ms)
         saved_mem_ms.append(result.timings.mem_ms)
         frame_total_ms = result.timings.total_ms
-        if frame_idx == 0:
+        if schedule_entry is not None:
             frame_total_ms += result.timings.prep_ms + result.timings.enc_ms
         saved_total_ms.append(frame_total_ms)
 
-        if frame_idx == 0:
+        if schedule_entry is not None:
             print(
-                f"Frame {frame_idx:03d} | Prep:{result.timings.prep_ms:.1f} ms | "
+                f"Frame {frame_idx:03d} | Cond | Prep:{result.timings.prep_ms:.1f} ms | "
                 f"Enc:{result.timings.enc_ms:.1f} ms | Dec:{result.timings.dec_ms:.1f} ms | "
                 f"MemEnc:{result.timings.mem_ms:.1f} ms | Total:{frame_total_ms:.1f} ms"
             )

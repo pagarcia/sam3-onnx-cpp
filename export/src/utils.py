@@ -147,6 +147,7 @@ def export_image_decoder(model, outdir: str, variant: ExportVariant) -> None:
             "pred_mask",
             "pred_mask_high_res",
             "object_score_logits",
+            "iou_scores",
         ],
         dynamic_axes={
             "point_coords": {1: "num_points"},

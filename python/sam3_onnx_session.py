@@ -51,6 +51,11 @@ def _to_numpy(value: np.ndarray | ort.OrtValue) -> np.ndarray:
     return np.ascontiguousarray(value.numpy())
 
 
+def _sigmoid_np(value: np.ndarray) -> np.ndarray:
+    value = np.clip(np.asarray(value, dtype=np.float32), -80.0, 80.0)
+    return 1.0 / (1.0 + np.exp(-value))
+
+
 def _fixed_meta_shape(shape: list[Any] | tuple[Any, ...]) -> tuple[int, ...] | None:
     dims: list[int] = []
     for dim in shape:
@@ -212,8 +217,7 @@ class TrackerFrameState:
     maskmem_features: np.ndarray | ort.OrtValue
     maskmem_pos_enc: np.ndarray | ort.OrtValue
     obj_ptr: np.ndarray | ort.OrtValue
-    pred_mask_high_res: np.ndarray | ort.OrtValue
-    object_score_logits: np.ndarray | ort.OrtValue
+    object_score_logits: np.ndarray | ort.OrtValue | None = None
     eff_iou_score: float | None = None
 
 
@@ -401,6 +405,8 @@ class Sam3OnnxTrackerSession:
         self.sess_dec = make_session(str(dec_path), tag="video_image_decoder", safe=safe)
         self.sess_mat = make_session(str(mat_path), tag="video_memory_attention", safe=safe)
         self.sess_men = make_session(str(men_path), tag="video_memory_encoder", safe=safe)
+        self.decoder_output_names = {output.name for output in self.sess_dec.get_outputs()}
+        self.decoder_has_iou_scores = "iou_scores" in self.decoder_output_names
 
         self._enc_runner = _OrtSessionRunner(self.sess_enc, "video_image_encoder")
         self._dec_runner = _OrtSessionRunner(self.sess_dec, "video_image_decoder")
@@ -437,6 +443,9 @@ class Sam3OnnxTrackerSession:
         )
         self.use_memory_selection = bool(
             int(self.constants.get("use_memory_selection", np.array([0], dtype=np.int64))[0])
+        )
+        self.mf_threshold = float(
+            self.constants.get("mf_threshold", np.array([0.01], dtype=np.float32))[0]
         )
         self._constant_ortvalues: dict[str, ort.OrtValue] = {}
         if self.device_type != "cpu" and "current_vision_pos_embed" in self.constants:
@@ -482,6 +491,9 @@ class Sam3OnnxTrackerSession:
             "keep_first_cond_frame": self.keep_first_cond_frame,
             "memory_temporal_stride_for_eval": self.memory_temporal_stride_for_eval,
             "use_memory_selection": self.use_memory_selection,
+            "mf_threshold": self.mf_threshold,
+            "decoder_has_iou_scores": self.decoder_has_iou_scores,
+            "max_non_cond_frames_kept": self._max_non_cond_history(),
         }
 
     def reset(self) -> None:
@@ -558,8 +570,14 @@ class Sam3OnnxTrackerSession:
         prompt_labels: np.ndarray | None = None,
     ) -> FrameResult:
         t_total = time.time()
+        has_prompt = (
+            prompt_points is not None
+            and prompt_labels is not None
+            and np.asarray(prompt_labels).size > 0
+        )
+        is_conditioning_frame = frame_idx == 0 or has_prompt
 
-        if frame_idx == 0:
+        if is_conditioning_frame:
             if prepared is None:
                 prepared = self.prepare_frame(frame_bgr)
             enc = prepared.encoder_outputs
@@ -616,23 +634,35 @@ class Sam3OnnxTrackerSession:
         )
         mem_ms = (time.time() - t_mem) * 1000.0
 
+        # Only keep the high-res mask as a transient output for visualization/benchmarking.
+        # Future frames only reuse memory features, memory positions, and object pointers.
+        pred_mask_high_res = _to_numpy(dec["pred_mask_high_res"])
+        stored_object_score_logits = None
+        eff_iou_score = None
+        if self.use_memory_selection:
+            stored_object_score_logits = _to_numpy(dec["object_score_logits"])
+            eff_iou_score = self._compute_eff_iou_score(dec, stored_object_score_logits)
+
         state = TrackerFrameState(
             maskmem_features=_to_numpy(mem["maskmem_features"]),
             maskmem_pos_enc=_to_numpy(mem["maskmem_pos_enc"]),
             obj_ptr=_to_numpy(dec["obj_ptr"]),
-            pred_mask_high_res=_to_numpy(dec["pred_mask_high_res"]),
-            object_score_logits=_to_numpy(dec["object_score_logits"]),
+            object_score_logits=stored_object_score_logits,
+            eff_iou_score=eff_iou_score,
         )
-        if frame_idx == 0:
+        if is_conditioning_frame:
+            self.non_cond_states.pop(frame_idx, None)
             self.cond_states[frame_idx] = state
         else:
+            self.cond_states.pop(frame_idx, None)
             self.non_cond_states[frame_idx] = state
+            self._trim_non_cond_history(frame_idx)
 
         return FrameResult(
             frame_idx=frame_idx,
             info=info,
             state=state,
-            mask_uint8=mask_to_uint8(state.pred_mask_high_res, info),
+            mask_uint8=mask_to_uint8(pred_mask_high_res, info),
             timings=FrameTimings(
                 prep_ms=prep_ms,
                 enc_ms=enc_ms,
@@ -758,7 +788,7 @@ class Sam3OnnxTrackerSession:
             state = self.non_cond_states.get(prev_idx)
             if state is None or state.eff_iou_score is None:
                 continue
-            if state.eff_iou_score > 0.0:
+            if state.eff_iou_score > self.mf_threshold:
                 valid_indices.insert(0, prev_idx)
             if len(valid_indices) >= max_num - 1:
                 break
@@ -767,6 +797,53 @@ class Sam3OnnxTrackerSession:
         if must_include >= 0 and must_include not in valid_indices:
             valid_indices.append(must_include)
         return valid_indices
+
+    def _max_non_cond_history(self) -> int:
+        spatial_window = max(0, self.num_maskmem - 1) * max(1, self.memory_temporal_stride_for_eval)
+        pointer_window = max(0, self.max_obj_ptrs - 1)
+        if not self.use_memory_selection:
+            return max(spatial_window, pointer_window)
+
+        # Native trimming for memory-selection mode keeps a much longer tail for pointer scoring.
+        return max(spatial_window, 20 * max(1, self.max_obj_ptrs))
+
+    def _trim_non_cond_history(self, frame_idx: int) -> None:
+        keep_window = self._max_non_cond_history()
+        if keep_window <= 0:
+            self.non_cond_states.clear()
+            return
+
+        min_frame_idx = frame_idx - keep_window
+        stale_indices = [idx for idx in self.non_cond_states if idx < min_frame_idx]
+        for idx in stale_indices:
+            self.non_cond_states.pop(idx, None)
+
+    def _compute_eff_iou_score(
+        self,
+        decoder_outputs: dict[str, np.ndarray | ort.OrtValue],
+        object_score_logits: np.ndarray,
+    ) -> float | None:
+        logits = np.asarray(object_score_logits, dtype=np.float32)
+        if logits.size == 0:
+            return None
+
+        object_score_norm = np.where(
+            logits > 0.0,
+            _sigmoid_np(logits) * 2.0 - 1.0,
+            0.0,
+        ).astype(np.float32, copy=False)
+
+        raw_iou_scores = decoder_outputs.get("iou_scores")
+        if raw_iou_scores is None:
+            # Backward-compatible fallback for older decoder exports that did not expose IoU scores.
+            return float(object_score_norm.mean())
+
+        iou_scores = np.asarray(_to_numpy(raw_iou_scores), dtype=np.float32)
+        if iou_scores.size == 0:
+            return float(object_score_norm.mean())
+
+        best_iou = np.max(iou_scores, axis=-1, keepdims=True).astype(np.float32, copy=False)
+        return float(np.mean(object_score_norm * best_iou))
 
     def _pack_memory_inputs(
         self,
@@ -784,6 +861,55 @@ class Sam3OnnxTrackerSession:
             buffer.array[:count] = value[:count]
         return buffer.sync()
 
+    def _limit_spatial_memory_entries(
+        self,
+        entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        target = self.static_num_mem_frames
+        if target is None or len(entries) <= target:
+            return entries
+
+        cond_entries = [entry for entry in entries if bool(entry["is_cond"])]
+        non_cond_entries = [entry for entry in entries if not bool(entry["is_cond"])]
+
+        selected_keys: set[tuple[bool, int]] = set()
+
+        def entry_key(entry: dict[str, Any]) -> tuple[bool, int]:
+            return bool(entry["is_cond"]), int(entry["frame_idx"])
+
+        def add_entry(entry: dict[str, Any] | None) -> None:
+            if entry is None or len(selected_keys) >= int(target):
+                return
+            selected_keys.add(entry_key(entry))
+
+        latest_cond = (
+            max(cond_entries, key=lambda entry: int(entry["frame_idx"])) if cond_entries else None
+        )
+        latest_non_cond = (
+            max(non_cond_entries, key=lambda entry: int(entry["frame_idx"]))
+            if non_cond_entries
+            else None
+        )
+        first_cond = (
+            min(cond_entries, key=lambda entry: int(entry["frame_idx"])) if cond_entries else None
+        )
+
+        # Preserve the most recent conditioning slice and the freshest dense memory first.
+        add_entry(latest_cond)
+        add_entry(latest_non_cond)
+        if self.keep_first_cond_frame:
+            add_entry(first_cond)
+
+        for entry in sorted(cond_entries, key=lambda item: int(item["frame_idx"]), reverse=True):
+            add_entry(entry)
+        for entry in sorted(non_cond_entries, key=lambda item: int(item["frame_idx"]), reverse=True):
+            add_entry(entry)
+
+        limited_entries = [entry for entry in entries if entry_key(entry) in selected_keys]
+        if limited_entries:
+            return limited_entries[: int(target)]
+        return entries[: int(target)]
+
     def _select_memory_inputs(self, frame_idx: int) -> dict[str, np.ndarray | ort.OrtValue]:
         if frame_idx <= 0:
             raise RuntimeError("Memory inputs are only defined for non-conditioning frames.")
@@ -795,8 +921,14 @@ class Sam3OnnxTrackerSession:
             keep_first_cond_frame=self.keep_first_cond_frame,
         )
 
-        spatial_items: list[tuple[TrackerFrameState, int]] = [
-            (state, self.num_maskmem - 1) for _idx, state in cond_outputs.items()
+        spatial_entries: list[dict[str, Any]] = [
+            {
+                "frame_idx": int(cond_idx),
+                "state": state,
+                "tpos_idx": self.num_maskmem - 1,
+                "is_cond": True,
+            }
+            for cond_idx, state in cond_outputs.items()
         ]
         r = max(1, int(self.memory_temporal_stride_for_eval))
         valid_indices = self._frame_filter(frame_idx, r) if self.use_memory_selection else []
@@ -819,20 +951,32 @@ class Sam3OnnxTrackerSession:
                 state = unselected_cond_outputs.get(prev_frame_idx)
             if state is None:
                 continue
-            spatial_items.append((state, self.num_maskmem - t_pos - 1))
+            spatial_entries.append(
+                {
+                    "frame_idx": int(prev_frame_idx),
+                    "state": state,
+                    "tpos_idx": self.num_maskmem - t_pos - 1,
+                    "is_cond": False,
+                }
+            )
 
-        if not spatial_items:
+        if not spatial_entries:
             raise RuntimeError("No spatial memory was available for memory attention.")
 
+        spatial_entries = self._limit_spatial_memory_entries(spatial_entries)
+
         memory_mask_feats = np.concatenate(
-            [_to_numpy(item[0].maskmem_features) for item in spatial_items],
+            [_to_numpy(entry["state"].maskmem_features) for entry in spatial_entries],
             axis=0,
         )
         memory_mask_pos = np.concatenate(
-            [_to_numpy(item[0].maskmem_pos_enc) for item in spatial_items],
+            [_to_numpy(entry["state"].maskmem_pos_enc) for entry in spatial_entries],
             axis=0,
         )
-        memory_mask_tpos_idx = np.asarray([item[1] for item in spatial_items], dtype=np.int64)
+        memory_mask_tpos_idx = np.asarray(
+            [int(entry["tpos_idx"]) for entry in spatial_entries],
+            dtype=np.int64,
+        )
 
         pointer_items: list[tuple[TrackerFrameState, float]] = [
             (state, float(frame_idx - cond_idx))
