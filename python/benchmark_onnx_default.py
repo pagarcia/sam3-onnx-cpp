@@ -83,7 +83,7 @@ def main() -> None:
     parser.add_argument(
         "--prompt_json",
         default="",
-        help="Optional prompt JSON to replay. Supports the legacy single-frame format or a multi-frame 'annotations' list.",
+        help="Optional prompt JSON to replay. Supports a single prompt object or a multi-frame 'annotations' list.",
     )
     parser.add_argument("--save_prompt_json", default="", help="Optional output path for the prompt JSON.")
     parser.add_argument("--max_frames", type=int, default=20, help="Number of frames to compare.")

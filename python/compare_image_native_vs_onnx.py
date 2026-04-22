@@ -109,10 +109,10 @@ def _annotate_tile(vis_bgr: np.ndarray, title: str, meta: dict) -> np.ndarray:
     cv2.putText(tile, line2, (16, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (215, 215, 215), 1, cv2.LINE_AA)
     cv2.putText(tile, line3, (16, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (215, 215, 215), 1, cv2.LINE_AA)
 
-    if meta.get("variant"):
+    if meta.get("mode"):
         cv2.putText(
             tile,
-            f"Mode: {meta['variant']}",
+            f"Mode: {meta['mode']}",
             (tile.shape[1] - 260, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -243,7 +243,7 @@ def _run_native_image_compare(
             "dec_ms": float(dec_ms),
             "mem_ms": float(mem_ms),
             "full_total_ms": float(full_total_ms),
-            "variant": "native",
+            "mode": "native",
         }
         return mask_uint8, meta
     finally:
@@ -290,7 +290,7 @@ def _run_onnx_worker(
         "dec_ms": float(payload["dec_ms"]),
         "mem_ms": float(payload["mem_ms"]),
         "full_total_ms": float(payload["full_total_ms"]),
-        "variant": payload["runtime"].get("mode", "default"),
+        "mode": payload["runtime"].get("mode", "default"),
     }
     return mask_uint8, meta
 

@@ -37,13 +37,21 @@ These are the models used by the image-only ONNX demo.
 The exporter in `export/` builds tracker-specific ONNX modules from a local SAM3 checkout:
 
 - `checkpoints/sam3/video_onnx/image_decoder_single.onnx`
+- `checkpoints/sam3/video_onnx/image_decoder_single_fp16.onnx`
 - `checkpoints/sam3/video_onnx/memory_attention_single.onnx`
+- `checkpoints/sam3/video_onnx/memory_attention_single_fp16.onnx`
 - `checkpoints/sam3/video_onnx/memory_encoder_single.onnx`
+- `checkpoints/sam3/video_onnx/memory_encoder_single_fp16.onnx`
 - `checkpoints/sam3/video_onnx/video_constants_single.npz`
+- `checkpoints/sam3/video_onnx/video_constants_single_fp16.npz`
 - `checkpoints/sam3/video_onnx/image_decoder_multi.onnx`
+- `checkpoints/sam3/video_onnx/image_decoder_multi_fp16.onnx`
 - `checkpoints/sam3/video_onnx/memory_attention_multi.onnx`
+- `checkpoints/sam3/video_onnx/memory_attention_multi_fp16.onnx`
 - `checkpoints/sam3/video_onnx/memory_encoder_multi.onnx`
+- `checkpoints/sam3/video_onnx/memory_encoder_multi_fp16.onnx`
 - `checkpoints/sam3/video_onnx/video_constants_multi.npz`
+- `checkpoints/sam3/video_onnx/video_constants_multi_fp16.npz`
 
 Important limitation:
 
@@ -63,6 +71,8 @@ Important limitation:
 - Tracker propagation over video frames.
 - Supports single-frame and multi-frame prompt annotations.
 - Uses an internal `single` graph for one annotation and a `multi` graph for multi-annotation clips.
+- There are no user-facing preset names anymore.
+- On CUDA/TensorRT, the runtime automatically prefers the fp16 tracker bundle and warms the kernels on startup.
 - Uses the downloaded vision encoder plus repo-exported tracker modules.
 
 ### Native reference path
@@ -141,6 +151,121 @@ You also need a local `sam3` repository next to this repo by default:
 
 or pass `--sam3-repo` explicitly.
 
+## Quick Deploy
+
+This is the shortest Windows-first path to get the project running from a fresh checkout.
+
+### ONNX-only deploy
+
+Use this if you want to run the ONNX image demo or the ONNX video tracker and you already have the exported tracker bundle, or you only care about the image path.
+
+1. Clone this repo.
+2. Create and activate the ONNX environment:
+
+```powershell
+python -m venv sam3_env
+.\sam3_env\Scripts\Activate.ps1
+pip install onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
+```
+
+3. Download the Hugging Face encoder/image ONNX files:
+
+```powershell
+.\fetch_onnx_models.bat fp32
+.\fetch_onnx_models.bat fp16
+```
+
+4. Make sure these files exist under `checkpoints/sam3/onnx`:
+
+- `vision_encoder.onnx`
+- `vision_encoder.onnx_data`
+- `vision_encoder_fp16.onnx`
+- `vision_encoder_fp16.onnx_data`
+- `prompt_encoder_mask_decoder.onnx`
+- `prompt_encoder_mask_decoder.onnx_data`
+- `prompt_encoder_mask_decoder_fp16.onnx`
+- `prompt_encoder_mask_decoder_fp16.onnx_data`
+
+5. For video tracking, also make sure the tracker bundle exists under `checkpoints/sam3/video_onnx`:
+
+- `image_decoder_single.onnx`
+- `memory_attention_single.onnx`
+- `memory_encoder_single.onnx`
+- `video_constants_single.npz`
+- `image_decoder_multi.onnx`
+- `memory_attention_multi.onnx`
+- `memory_encoder_multi.onnx`
+- `video_constants_multi.npz`
+
+The runtime will automatically pick the fp16 tracker files when CUDA/TensorRT is available and the `_fp16` bundle exists.
+
+6. Run the image demo:
+
+```powershell
+python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
+```
+
+7. Or run the video tracker:
+
+```powershell
+python python\onnx_test_video.py --video "C:\path\to\video.mp4" --prompt seed_points
+```
+
+### Full deploy with export and native comparison
+
+Use this if you want the complete repo workflow, including exporting tracker graphs from a local SAM3 checkout and benchmarking against native PyTorch SAM3.
+
+1. Clone this repo.
+2. Clone `sam3` next to it so the default layout is:
+
+```text
+../sam3
+../sam3-onnx-cpp
+```
+
+3. Create and activate the export/native environment:
+
+```powershell
+python -m venv sam3_api_env
+.\sam3_api_env\Scripts\Activate.ps1
+pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
+```
+
+4. Download the Hugging Face encoder/image ONNX files:
+
+```powershell
+.\fetch_onnx_models.bat fp32
+.\fetch_onnx_models.bat fp16
+```
+
+5. Export the tracker bundle:
+
+```powershell
+.\sam3_api_env\Scripts\python.exe export\onnx_export.py `
+  --sam3-repo "..\sam3" `
+  --load-from-hf
+```
+
+6. Verify that both directories now exist and are populated:
+
+- `checkpoints/sam3/onnx`
+- `checkpoints/sam3/video_onnx`
+
+7. Run the ONNX video demo:
+
+```powershell
+.\sam3_env\Scripts\python.exe python\onnx_test_video.py --video "C:\path\to\video.mp4"
+```
+
+8. Run the native-vs-ONNX comparison:
+
+```powershell
+.\sam3_api_env\Scripts\python.exe python\compare_native_vs_onnx.py `
+  --video "C:\path\to\video.mp4" `
+  --sam3_repo "..\sam3" `
+  --checkpoint "C:\path\to\sam3.pt"
+```
+
 ## Optional GPU Setup
 
 ### Modern NVIDIA stack
@@ -205,7 +330,7 @@ To remove the downloaded models:
 python python\inspect_onnx_io.py
 ```
 
-Force a specific variant:
+Force a specific image precision:
 
 ```powershell
 $env:SAM3_ONNX_VARIANT="fp16"
@@ -251,7 +376,7 @@ Disable ORT graph optimizations:
 python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points --safe
 ```
 
-Force CUDA and prefer the FP16 ONNX files:
+Force CUDA and prefer the FP16 image ONNX files:
 
 ```powershell
 $env:SAM3_ORT_ACCEL="cuda"
@@ -290,6 +415,8 @@ Default runtime behavior:
 - Single annotation: uses the internal `single` graph and defaults to `--max_mem_frames 2`.
 - Multi-annotation: uses the internal `multi` graph and defaults to `--max_mem_frames 4`.
 - `--max_obj_ptrs` defaults to `16`.
+- `SAM3_ORT_TRACKER_PRECISION=auto` prefers fp16 tracker graphs on CUDA/TensorRT and falls back to fp32 when needed.
+- `SAM3_ORT_WARMUP=auto` pre-warms the ONNX tracker kernels so the first real frame does not pay the full cold-start cost.
 
 ## Export the Tracker ONNX Modules
 
@@ -325,6 +452,8 @@ The exporter writes two internal tracker bundles:
 
 - `single`: static 2-slot memory graph for the common one-annotation path
 - `multi`: static 4-slot memory graph for multi-annotation clips
+
+It emits both `fp32` and `fp16` tracker graphs by default.
 
 ## Run the Native Image Reference Demo
 

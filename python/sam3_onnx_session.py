@@ -920,7 +920,7 @@ class Sam3OnnxTrackerSession:
 
         raw_iou_scores = decoder_outputs.get("iou_scores")
         if raw_iou_scores is None:
-            # Backward-compatible fallback for older decoder exports that did not expose IoU scores.
+            # Fallback for tracker bundles that do not expose IoU scores.
             return float(object_score_norm.mean())
 
         iou_scores = np.asarray(_to_numpy(raw_iou_scores), dtype=np.float32)
@@ -1174,26 +1174,6 @@ class Sam3OnnxTrackerSession:
             else SINGLE_GRAPH_PROFILE
         )
 
-    @classmethod
-    def _candidate_graph_profiles(cls, graph_profile: str) -> tuple[str, ...]:
-        # Keep a narrow compatibility bridge for workspaces that still have the old
-        # preset-era exports and have not been regenerated yet.
-        if graph_profile == SINGLE_GRAPH_PROFILE:
-            return (SINGLE_GRAPH_PROFILE, "fast", "default")
-        if graph_profile == MULTI_GRAPH_PROFILE:
-            return (MULTI_GRAPH_PROFILE, "quality", "default")
-        return (graph_profile, "default")
-
-    @classmethod
-    def _resolve_model_path(cls, onnx_dir: Path, base_name: str, graph_profile: str) -> Path:
-        last_candidate = onnx_dir / base_name
-        for candidate_profile in cls._candidate_graph_profiles(graph_profile):
-            candidate = onnx_dir / cls._profiled_name(base_name, candidate_profile)
-            last_candidate = candidate
-            if candidate.exists():
-                return candidate
-        return last_candidate
-
     @staticmethod
     def _preferred_tracker_precisions() -> tuple[str, ...]:
         requested_precision = os.getenv("SAM3_ORT_TRACKER_PRECISION", "auto").strip().lower()
@@ -1243,27 +1223,27 @@ class Sam3OnnxTrackerSession:
         }
 
         for precision in cls._preferred_tracker_precisions():
-            for candidate_profile in cls._candidate_graph_profiles(requested_graph_profile):
-                resolved = {
-                    key: onnx_dir
-                    / cls._profiled_precision_name(value, candidate_profile, precision)
-                    for key, value in base_names.items()
-                }
-                last_candidates = resolved
-                if all(path.exists() for path in resolved.values()):
-                    return _ResolvedTrackerBundle(
-                        graph_profile=candidate_profile,
-                        precision=precision,
-                        constants_path=resolved["constants_path"],
-                        decoder_path=resolved["decoder_path"],
-                        memory_attention_path=resolved["memory_attention_path"],
-                        memory_encoder_path=resolved["memory_encoder_path"],
-                    )
+            resolved = {
+                key: onnx_dir
+                / cls._profiled_precision_name(value, requested_graph_profile, precision)
+                for key, value in base_names.items()
+            }
+            last_candidates = resolved
+            if all(path.exists() for path in resolved.values()):
+                return _ResolvedTrackerBundle(
+                    graph_profile=requested_graph_profile,
+                    precision=precision,
+                    constants_path=resolved["constants_path"],
+                    decoder_path=resolved["decoder_path"],
+                    memory_attention_path=resolved["memory_attention_path"],
+                    memory_encoder_path=resolved["memory_encoder_path"],
+                )
 
         raise SystemExit(
-            "Missing a complete tracker ONNX bundle. Expected matching decoder, memory attention, "
-            f"memory encoder, and video constants files like {last_candidates['decoder_path'].name} "
-            "in the video export directory. Run export\\onnx_export.py first to regenerate the tracker graphs."
+            "Missing a complete tracker ONNX bundle for the requested runtime mode. Expected matching "
+            "decoder, memory attention, memory encoder, and video constants files like "
+            f"{last_candidates['decoder_path'].name} in the video export directory. "
+            "Run export\\onnx_export.py first to regenerate the tracker graphs."
         )
 
     @classmethod

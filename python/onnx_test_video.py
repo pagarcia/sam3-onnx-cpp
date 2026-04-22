@@ -384,7 +384,7 @@ def main():
     parser.add_argument(
         "--prompt_json",
         default="",
-        help="Optional prompt JSON to replay. Supports the legacy single-frame format or a multi-frame 'annotations' list.",
+        help="Optional prompt JSON to replay. Supports a single prompt object or a multi-frame 'annotations' list.",
     )
     parser.add_argument(
         "--save_prompt_json",

@@ -112,7 +112,7 @@ def _aggregate_timing_arrays(prefix: str, runs: list[dict]) -> dict:
     return summary
 
 
-def _aggregate_quality(native_ref: dict, onnx_runs: list[dict]) -> dict:
+def _aggregate_metrics(native_ref: dict, onnx_runs: list[dict]) -> dict:
     repeat_summaries = []
     all_frame_summaries = []
 
@@ -197,12 +197,12 @@ def _aggregate_quality(native_ref: dict, onnx_runs: list[dict]) -> dict:
 
 
 def _aggregate_summary(native_runs: list[dict], onnx_runs: list[dict], mem_frames: int, onnx_max_obj_ptrs: int):
-    quality = _aggregate_quality(native_runs[0], onnx_runs)
+    metrics = _aggregate_metrics(native_runs[0], onnx_runs)
     summary = {
         "onnx_max_mem_frames": int(mem_frames),
         "onnx_max_obj_ptrs": int(onnx_max_obj_ptrs),
     }
-    summary.update(quality)
+    summary.update(metrics)
     summary.update(_aggregate_timing_arrays("native", native_runs))
     summary.update(_aggregate_timing_arrays("onnx", onnx_runs))
     onnx_runtime = _decode_json_scalar(onnx_runs[0], "runtime_json") if onnx_runs else None
