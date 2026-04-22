@@ -3,17 +3,20 @@ import argparse
 import csv
 import json
 import tempfile
+import time
 from pathlib import Path
 
 from compare_native_vs_onnx import (
+    DEFAULT_RUN_ORDER,
     DEFAULT_CKPT,
     DEFAULT_ONNX_DIR,
     DEFAULT_SAM3_REPO,
     REPO_ROOT,
     _load_npz,
     _load_video_frames,
+    _parse_run_order,
     _resolve_prompt,
-    _run_native_tracker,
+    _run_native_subprocess,
     _run_onnx_subprocess,
     _save_prompt_spec,
 )
@@ -118,6 +121,17 @@ def main() -> None:
         action="store_true",
         help="Disable ORT graph optimizations in the ONNX subprocess.",
     )
+    parser.add_argument(
+        "--run_order",
+        default=DEFAULT_RUN_ORDER,
+        help="Comma-separated execution order for the isolated runs: onnx,native or native,onnx.",
+    )
+    parser.add_argument(
+        "--cooldown_sec",
+        type=float,
+        default=0.0,
+        help="Optional sleep inserted between the isolated ONNX/native runs.",
+    )
     args = parser.parse_args()
 
     if args.repeats <= 0:
@@ -137,6 +151,8 @@ def main() -> None:
         max_mem_frames=args.onnx_max_mem_frames,
         max_obj_ptrs=args.onnx_max_obj_ptrs,
     )
+    run_order = _parse_run_order(args.run_order)
+    cooldown_sec = max(0.0, float(args.cooldown_sec))
 
     summary_json = outdir / "benchmark_summary.json"
     summary_csv = outdir / "benchmark_summary.csv"
@@ -147,6 +163,9 @@ def main() -> None:
 
     print(f"[INFO] Output dir: {outdir}")
     print(f"[INFO] Repeats: {args.repeats}")
+    print(f"[INFO] Run order: {','.join(run_order)}")
+    if cooldown_sec > 0.0:
+        print(f"[INFO] Cooldown sec: {cooldown_sec:.1f}")
     print(
         f"[INFO] Default ONNX runtime caps: max_mem_frames={onnx_max_mem_frames}, "
         f"max_obj_ptrs={onnx_max_obj_ptrs}"
@@ -158,29 +177,39 @@ def main() -> None:
         native_npz = native_dir / f"repeat_{repeat_idx:02d}.npz"
         onnx_npz = onnx_dir / f"repeat_{repeat_idx:02d}.npz"
 
-        print(f"[INFO] Running native PyTorch tracker repeat {repeat_idx}/{args.repeats}...")
-        _run_native_tracker(
-            video=video,
-            prompt_spec=prompt_spec,
-            checkpoint=str(Path(args.checkpoint).resolve()),
-            sam3_repo=Path(args.sam3_repo).resolve(),
-            save_path=native_npz,
-            video_path=args.video,
-        )
-        native_runs.append(_load_npz(native_npz))
+        for step_idx, target in enumerate(run_order):
+            if target == "onnx":
+                print(f"[INFO] Running default ONNX tracker repeat {repeat_idx}/{args.repeats}...")
+                _run_onnx_subprocess(
+                    video_path=args.video,
+                    onnx_dir=Path(args.onnx_dir).resolve(),
+                    prompt_json=prompt_json_path,
+                    save_path=onnx_npz,
+                    max_frames=len(video.raw_frames),
+                    safe=args.safe,
+                    onnx_accel=args.onnx_accel,
+                    onnx_max_mem_frames=onnx_max_mem_frames,
+                    onnx_max_obj_ptrs=onnx_max_obj_ptrs,
+                )
+            else:
+                print(
+                    f"[INFO] Running native PyTorch tracker repeat {repeat_idx}/{args.repeats}..."
+                )
+                _run_native_subprocess(
+                    video_path=args.video,
+                    checkpoint=str(Path(args.checkpoint).resolve()),
+                    sam3_repo=Path(args.sam3_repo).resolve(),
+                    prompt_json=prompt_json_path,
+                    save_path=native_npz,
+                    max_frames=len(video.raw_frames),
+                )
+            if cooldown_sec > 0.0 and step_idx + 1 < len(run_order):
+                print(
+                    f"[INFO] Cooling down for {cooldown_sec:.1f}s before the next run..."
+                )
+                time.sleep(cooldown_sec)
 
-        print(f"[INFO] Running default ONNX tracker repeat {repeat_idx}/{args.repeats}...")
-        _run_onnx_subprocess(
-            video_path=args.video,
-            onnx_dir=Path(args.onnx_dir).resolve(),
-            prompt_json=prompt_json_path,
-            save_path=onnx_npz,
-            max_frames=len(video.raw_frames),
-            safe=args.safe,
-            onnx_accel=args.onnx_accel,
-            onnx_max_mem_frames=onnx_max_mem_frames,
-            onnx_max_obj_ptrs=onnx_max_obj_ptrs,
-        )
+        native_runs.append(_load_npz(native_npz))
         onnx_runs.append(_load_npz(onnx_npz))
 
     summary = _aggregate_summary(native_runs, onnx_runs, onnx_max_mem_frames, onnx_max_obj_ptrs)
@@ -193,6 +222,8 @@ def main() -> None:
         "prompt": prompt_spec,
         "repeats": int(args.repeats),
         "onnx_accel": args.onnx_accel,
+        "run_order": list(run_order),
+        "cooldown_sec": float(cooldown_sec),
         "summary": summary,
     }
 

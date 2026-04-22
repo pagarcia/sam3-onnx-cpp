@@ -33,6 +33,7 @@ DEFAULT_CKPT = Path(
     r"C:\Users\Pablo\.cache\huggingface\hub\models--facebook--sam3\snapshots\3c879f39826c281e95690f02c7821c4de09afae7\sam3.pt"
 )
 TARGET_SIZE = 1008
+DEFAULT_RUN_ORDER = "onnx,native"
 
 
 def _sync_cuda():
@@ -625,6 +626,43 @@ def _run_onnx_subprocess(
     subprocess.run(cmd, cwd=str(REPO_ROOT), check=True, env=env)
 
 
+def _run_native_subprocess(
+    video_path: str,
+    checkpoint: str,
+    sam3_repo: Path,
+    prompt_json: Path,
+    save_path: Path,
+    max_frames: int,
+):
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "python" / "compare_native_vs_onnx.py"),
+        "--worker_mode",
+        "native",
+        "--video",
+        video_path,
+        "--prompt_json",
+        str(prompt_json),
+        "--worker_save_npz",
+        str(save_path),
+        "--max_frames",
+        str(max_frames),
+        "--checkpoint",
+        str(Path(checkpoint).resolve()),
+        "--sam3_repo",
+        str(Path(sam3_repo).resolve()),
+    ]
+    subprocess.run(cmd, cwd=str(REPO_ROOT), check=True, env=os.environ.copy())
+
+
+def _parse_run_order(text: str) -> list[str]:
+    raw_items = [item.strip().lower() for item in text.split(",") if item.strip()]
+    allowed = {"onnx", "native"}
+    if sorted(raw_items) != ["native", "onnx"]:
+        raise SystemExit("--run_order must be exactly 'onnx,native' or 'native,onnx'.")
+    return raw_items
+
+
 def _frame_metrics(native_mask: np.ndarray, onnx_mask: np.ndarray):
     native_bool = native_mask > 0
     onnx_bool = onnx_mask > 0
@@ -698,6 +736,8 @@ def run_compare(
     onnx_accel: str,
     onnx_max_mem_frames: int,
     onnx_max_obj_ptrs: int,
+    run_order: list[str],
+    cooldown_sec: float,
     prompt_json_path: Path | None = None,
 ):
     outdir = Path(outdir).resolve()
@@ -714,27 +754,37 @@ def run_compare(
     summary_json = outdir / "summary.json"
 
     print(f"[INFO] Output dir: {outdir}")
-    print("[INFO] Running native PyTorch tracker...")
-    _run_native_tracker(
-        video=video,
-        prompt_spec=prompt_spec,
-        checkpoint=str(Path(checkpoint).resolve()),
-        sam3_repo=Path(sam3_repo).resolve(),
-        save_path=native_npz,
-        video_path=video_path,
-    )
-    print("[INFO] Running ONNX tracker...")
-    _run_onnx_subprocess(
-        video_path=video_path,
-        onnx_dir=Path(onnx_dir).resolve(),
-        prompt_json=prompt_json,
-        save_path=onnx_npz,
-        max_frames=len(video.raw_frames),
-        safe=safe,
-        onnx_accel=onnx_accel,
-        onnx_max_mem_frames=onnx_max_mem_frames,
-        onnx_max_obj_ptrs=onnx_max_obj_ptrs,
-    )
+    print(f"[INFO] Run order     : {','.join(run_order)}")
+    if cooldown_sec > 0.0:
+        print(f"[INFO] Cooldown sec  : {cooldown_sec:.1f}")
+
+    for step_idx, target in enumerate(run_order):
+        if target == "onnx":
+            print("[INFO] Running ONNX tracker in isolated subprocess...")
+            _run_onnx_subprocess(
+                video_path=video_path,
+                onnx_dir=Path(onnx_dir).resolve(),
+                prompt_json=prompt_json,
+                save_path=onnx_npz,
+                max_frames=len(video.raw_frames),
+                safe=safe,
+                onnx_accel=onnx_accel,
+                onnx_max_mem_frames=onnx_max_mem_frames,
+                onnx_max_obj_ptrs=onnx_max_obj_ptrs,
+            )
+        else:
+            print("[INFO] Running native PyTorch tracker in isolated subprocess...")
+            _run_native_subprocess(
+                video_path=video_path,
+                checkpoint=str(Path(checkpoint).resolve()),
+                sam3_repo=Path(sam3_repo).resolve(),
+                prompt_json=prompt_json,
+                save_path=native_npz,
+                max_frames=len(video.raw_frames),
+            )
+        if cooldown_sec > 0.0 and step_idx + 1 < len(run_order):
+            print(f"[INFO] Cooling down for {cooldown_sec:.1f}s before the next run...")
+            time.sleep(cooldown_sec)
 
     native = _load_npz(native_npz)
     onnx = _load_npz(onnx_npz)
@@ -765,6 +815,8 @@ def run_compare(
         "native_frame_count": native_frame_count,
         "onnx_frame_count": onnx_frame_count,
         "prompt": prompt_spec,
+        "run_order": list(run_order),
+        "cooldown_sec": float(cooldown_sec),
         "onnx_mode": onnx_runtime.get("mode", "default") if isinstance(onnx_runtime, dict) else "default",
         "onnx_max_mem_frames": int(onnx_max_mem_frames),
         "onnx_max_obj_ptrs": int(onnx_max_obj_ptrs),
@@ -854,7 +906,47 @@ def main():
         action="store_true",
         help="Disable ORT graph optimizations in the ONNX subprocess.",
     )
+    parser.add_argument(
+        "--run_order",
+        default=DEFAULT_RUN_ORDER,
+        help="Comma-separated execution order for the isolated runs: onnx,native or native,onnx.",
+    )
+    parser.add_argument(
+        "--cooldown_sec",
+        type=float,
+        default=0.0,
+        help="Optional sleep inserted between the isolated ONNX/native runs.",
+    )
+    parser.add_argument(
+        "--worker_mode",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--worker_save_npz",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    if args.worker_mode:
+        if args.worker_mode != "native":
+            raise SystemExit(f"Unsupported worker mode: {args.worker_mode}")
+        if not args.prompt_json:
+            raise SystemExit("--worker_mode native requires --prompt_json.")
+        if not args.worker_save_npz:
+            raise SystemExit("--worker_mode native requires --worker_save_npz.")
+        prompt_spec = _load_prompt_spec(Path(args.prompt_json).resolve())
+        video = _load_video_frames(args.video, args.max_frames)
+        _run_native_tracker(
+            video=video,
+            prompt_spec=prompt_spec,
+            checkpoint=str(Path(args.checkpoint).resolve()),
+            sam3_repo=Path(args.sam3_repo).resolve(),
+            save_path=Path(args.worker_save_npz).resolve(),
+            video_path=args.video,
+        )
+        return
 
     outdir = Path(args.outdir).resolve() if args.outdir else Path(
         tempfile.mkdtemp(prefix="sam3_compare_", dir=str(REPO_ROOT / "checkpoints" / "sam3"))
@@ -868,6 +960,8 @@ def main():
         max_mem_frames=args.onnx_max_mem_frames,
         max_obj_ptrs=args.onnx_max_obj_ptrs,
     )
+    run_order = _parse_run_order(args.run_order)
+    cooldown_sec = max(0.0, float(args.cooldown_sec))
     run = run_compare(
         video_path=args.video,
         onnx_dir=Path(args.onnx_dir).resolve(),
@@ -880,6 +974,8 @@ def main():
         onnx_accel=args.onnx_accel,
         onnx_max_mem_frames=onnx_max_mem_frames,
         onnx_max_obj_ptrs=onnx_max_obj_ptrs,
+        run_order=run_order,
+        cooldown_sec=cooldown_sec,
         prompt_json_path=Path(args.save_prompt_json).resolve() if args.save_prompt_json else None,
     )
     summary = run["summary"]
