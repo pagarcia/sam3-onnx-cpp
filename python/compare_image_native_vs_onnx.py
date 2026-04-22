@@ -262,7 +262,7 @@ def _run_onnx_worker(
     mask_path = outdir / "onnx_mask.png"
     json_path = outdir / "onnx_summary.json"
     cmd = [
-        str(REPO_ROOT / "sam3_env" / "Scripts" / "python.exe"),
+        sys.executable,
         str(REPO_ROOT / "python" / "onnx_compare_image_worker.py"),
         "--image",
         str(Path(image_path).resolve()),

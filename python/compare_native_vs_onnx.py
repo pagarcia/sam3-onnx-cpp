@@ -600,7 +600,7 @@ def _run_onnx_subprocess(
     onnx_max_obj_ptrs: int,
 ):
     cmd = [
-        str(REPO_ROOT / "sam3_env" / "Scripts" / "python.exe"),
+        sys.executable,
         str(REPO_ROOT / "python" / "onnx_test_video.py"),
         "--video",
         video_path,

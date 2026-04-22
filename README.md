@@ -119,29 +119,15 @@ Point and box coordinates are scaled independently with `scale_x` and `scale_y` 
 
 ## Environment Setup
 
-There are really two workflows in this repo.
-
-### 1. ONNX Runtime only
-
-Use this if you only want to run the downloaded image ONNX demo or the exported video ONNX demo.
+Use one environment for everything in this repo: ONNX demos, tracker export, and native SAM3 comparison.
 
 ```powershell
 python -m venv sam3_env
 .\sam3_env\Scripts\Activate.ps1
-pip install onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
-```
-
-### 2. Export / native comparison tooling
-
-Use this if you want to export tracker modules or run native PyTorch SAM3 comparisons. This environment needs `torch` plus access to a local SAM3 checkout.
-
-Example:
-
-```powershell
-python -m venv sam3_api_env
-.\sam3_api_env\Scripts\Activate.ps1
 pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
 ```
+
+If you also have `conda` active in the same shell, run `conda deactivate` first so the venv owns the DLL search path cleanly on Windows.
 
 You also need a local `sam3` repository next to this repo by default:
 
@@ -157,7 +143,7 @@ This is the shortest Windows-first path to get the project running from a fresh 
 
 ### ONNX-only deploy
 
-Use this if you want to run the ONNX image demo or the ONNX video tracker and you already have the exported tracker bundle, or you only care about the image path.
+Use the same `sam3_env` environment even if you only want the ONNX image demo or the ONNX video tracker.
 
 1. Clone this repo.
 2. Create and activate the ONNX environment:
@@ -165,7 +151,7 @@ Use this if you want to run the ONNX image demo or the ONNX video tracker and yo
 ```powershell
 python -m venv sam3_env
 .\sam3_env\Scripts\Activate.ps1
-pip install onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
+pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
 ```
 
 3. Download the Hugging Face encoder/image ONNX files:
@@ -208,7 +194,7 @@ python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_po
 7. Or run the video tracker:
 
 ```powershell
-python python\onnx_test_video.py --video "C:\path\to\video.mp4" --prompt seed_points
+.\sam3_env\Scripts\python.exe python\onnx_test_video.py --video "C:\path\to\video.mp4" --prompt seed_points
 ```
 
 ### Full deploy with export and native comparison
@@ -226,8 +212,8 @@ Use this if you want the complete repo workflow, including exporting tracker gra
 3. Create and activate the export/native environment:
 
 ```powershell
-python -m venv sam3_api_env
-.\sam3_api_env\Scripts\Activate.ps1
+python -m venv sam3_env
+.\sam3_env\Scripts\Activate.ps1
 pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
 ```
 
@@ -241,7 +227,7 @@ pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 nu
 5. Export the tracker bundle:
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe export\onnx_export.py `
+.\sam3_env\Scripts\python.exe export\onnx_export.py `
   --sam3-repo "..\sam3" `
   --load-from-hf
 ```
@@ -260,7 +246,7 @@ pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 nu
 8. Run the native-vs-ONNX comparison:
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe python\compare_native_vs_onnx.py `
+.\sam3_env\Scripts\python.exe python\compare_native_vs_onnx.py `
   --video "C:\path\to\video.mp4" `
   --sam3_repo "..\sam3" `
   --checkpoint "C:\path\to\sam3.pt"
@@ -429,7 +415,7 @@ The exporter requires:
 Example:
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe export\onnx_export.py `
+.\sam3_env\Scripts\python.exe export\onnx_export.py `
   --sam3-repo "..\sam3" `
   --load-from-hf
 ```
@@ -437,7 +423,7 @@ Example:
 Or with a local checkpoint:
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe export\onnx_export.py `
+.\sam3_env\Scripts\python.exe export\onnx_export.py `
   --sam3-repo "..\sam3" `
   --checkpoint "C:\path\to\sam3.pt"
 ```
@@ -460,13 +446,13 @@ It emits both `fp32` and `fp16` tracker graphs by default.
 This is useful for checking native SAM3 behavior outside ONNX:
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe python\api_test_image.py --prompt seed_points
+.\sam3_env\Scripts\python.exe python\api_test_image.py --prompt seed_points
 ```
 
 ## Compare Native vs ONNX Video Tracking
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe python\compare_native_vs_onnx.py `
+.\sam3_env\Scripts\python.exe python\compare_native_vs_onnx.py `
   --video "C:\path\to\video.mp4" `
   --sam3_repo "..\sam3" `
   --checkpoint "C:\path\to\sam3.pt" `
@@ -476,7 +462,7 @@ This is useful for checking native SAM3 behavior outside ONNX:
 ## Benchmark The Default ONNX Runtime
 
 ```powershell
-.\sam3_api_env\Scripts\python.exe python\benchmark_onnx_default.py `
+.\sam3_env\Scripts\python.exe python\benchmark_onnx_default.py `
   --video "C:\path\to\video.mp4" `
   --sam3_repo "..\sam3" `
   --checkpoint "C:\path\to\sam3.pt"
@@ -492,7 +478,7 @@ If you only want to segment one image with ONNX:
 4. Run:
 
 ```powershell
-python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
+.\sam3_env\Scripts\python.exe python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
 ```
 
 That is the shortest path for running SAM3 ONNX on a particular image in this repo.

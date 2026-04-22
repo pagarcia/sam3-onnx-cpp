@@ -8,6 +8,7 @@ __pycache__/
 
 # Environments and checkpoints
 sam3_env/
+sam3_api_env/
 checkpoints/
 
 # Distribution / packaging
