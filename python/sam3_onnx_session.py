@@ -457,8 +457,11 @@ class Sam3OnnxTrackerSession:
                 0,
             )
         self._memory_input_buffers = self._build_memory_input_buffers()
+        self.warmup_enabled = self._resolve_warmup_enabled()
 
         self.reset()
+        if self.warmup_enabled:
+            self._warmup_runtime()
 
     @property
     def uses_iobinding(self) -> bool:
@@ -486,6 +489,7 @@ class Sam3OnnxTrackerSession:
             },
             "device_type": self.device_type,
             "uses_iobinding": self.uses_iobinding,
+            "warmup_enabled": self.warmup_enabled,
             "static_num_mem_frames": self.static_num_mem_frames,
             "static_num_obj_ptrs": self.static_num_obj_ptrs,
             "effective_max_mem_frames": self.num_maskmem,
@@ -772,6 +776,84 @@ class Sam3OnnxTrackerSession:
                 np.float32,
             )
         return buffers
+
+    def _resolve_warmup_enabled(self) -> bool:
+        mode = os.getenv("SAM3_ORT_WARMUP", "auto").strip().lower()
+        if mode in ("", "auto"):
+            return self.device_type != "cpu"
+        if mode in ("1", "true", "yes", "on"):
+            return True
+        if mode in ("0", "false", "no", "off"):
+            return False
+        raise SystemExit("SAM3_ORT_WARMUP must be auto, on, or off.")
+
+    def _warmup_runtime(self) -> None:
+        print("[INFO] Warming up ONNX tracker kernels...")
+        try:
+            self.reset()
+
+            dummy_frame = np.zeros((1008, 1008, 3), dtype=np.uint8)
+            prepared = self.prepare_frame(dummy_frame)
+            warmup_points, warmup_labels = prepare_prompt_points(
+                [(prepared.info.target_size // 2, prepared.info.target_size // 2)],
+                [1],
+                prepared.info,
+            )
+
+            # Warm the interactive preview path as well so the first click is responsive.
+            self.preview_prompt_mask(prepared, warmup_points, warmup_labels)
+
+            enc = prepared.encoder_outputs
+            dec_cond = self._run_decoder(
+                warmup_points,
+                warmup_labels,
+                enc["image_embeddings"],
+                enc["high_res_features0"],
+                enc["high_res_features1"],
+                output_device="session",
+            )
+            mem_cond = self._run_memory_encoder(
+                dec_cond["pred_mask_high_res"],
+                enc["current_vision_feat"],
+                dec_cond["object_score_logits"],
+                is_mask_from_points=True,
+                output_device="session",
+            )
+            self.cond_states[0] = TrackerFrameState(
+                maskmem_features=_to_numpy(mem_cond["maskmem_features"]),
+                maskmem_pos_enc=_to_numpy(mem_cond["maskmem_pos_enc"]),
+                obj_ptr=_to_numpy(dec_cond["obj_ptr"]),
+            )
+
+            mem_inputs = self._select_memory_inputs(1)
+            fused_embed = self._run_memory_attention(
+                enc["current_vision_feat"],
+                enc["current_vision_pos_embed"],
+                mem_inputs["memory_obj_ptrs"],
+                mem_inputs["memory_obj_tpos"],
+                mem_inputs["memory_mask_feats"],
+                mem_inputs["memory_mask_pos"],
+                mem_inputs["memory_mask_tpos_idx"],
+                output_device="session",
+            )["fused_feat"]
+            dec_track = self._run_decoder(
+                *empty_prompt(),
+                fused_embed,
+                enc["high_res_features0"],
+                enc["high_res_features1"],
+                output_device="session",
+            )
+            self._run_memory_encoder(
+                dec_track["pred_mask_high_res"],
+                enc["current_vision_feat"],
+                dec_track["object_score_logits"],
+                is_mask_from_points=False,
+                output_device="session",
+            )
+        except Exception as exc:
+            print(f"[WARN] ONNX tracker warmup skipped: {exc}")
+        finally:
+            self.reset()
 
     def _make_input_buffer(self, shape: tuple[int, ...], dtype) -> _InputBuffer:
         array = np.zeros(shape, dtype=dtype)
