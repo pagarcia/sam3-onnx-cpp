@@ -46,6 +46,7 @@ def print_system_info() -> None:
     print("[INFO] onnxruntime:", ort.__version__)
     print("[INFO] ORT providers (available):", ort.get_available_providers())
     print("[INFO] SAM3_ORT_ACCEL:", ACCEL)
+    print("[INFO] SAM3_ORT_TRACKER_PRECISION:", os.getenv("SAM3_ORT_TRACKER_PRECISION", "auto"))
     print("[INFO] SAM3_ORT_GRAPH_OPT:", os.getenv("SAM3_ORT_GRAPH_OPT", "all"))
     print("[INFO] SAM3_ORT_IO_BINDING:", os.getenv("SAM3_ORT_IO_BINDING", "auto"))
 

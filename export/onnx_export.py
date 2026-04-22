@@ -277,7 +277,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--precisions",
-        default="fp32",
+        default="fp32,fp16",
         help="Comma-separated precisions to emit for the internal single/multi tracker bundles: fp32 and/or fp16.",
     )
     main(parser.parse_args())

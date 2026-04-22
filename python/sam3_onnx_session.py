@@ -237,6 +237,16 @@ class FrameResult:
     timings: FrameTimings
 
 
+@dataclass(frozen=True)
+class _ResolvedTrackerBundle:
+    graph_profile: str
+    precision: str
+    constants_path: Path
+    decoder_path: Path
+    memory_attention_path: Path
+    memory_encoder_path: Path
+
+
 @dataclass
 class _InputBuffer:
     array: np.ndarray
@@ -354,8 +364,12 @@ class Sam3OnnxTrackerSession:
     ) -> None:
         self.onnx_dir = Path(onnx_dir).resolve()
         self.mode = "default"
-        self.graph_profile = self._resolve_graph_profile(int(max_mem_frames))
-        self.constants = self._load_video_constants(self.onnx_dir, self.graph_profile)
+        requested_graph_profile = self._resolve_graph_profile(int(max_mem_frames))
+        tracker_bundle = self._resolve_tracker_bundle(self.onnx_dir, requested_graph_profile)
+        self.graph_profile = tracker_bundle.graph_profile
+        self.tracker_precision = tracker_bundle.precision
+        self.constants_path = tracker_bundle.constants_path
+        self.constants = self._load_video_constants(self.constants_path)
 
         native_num_maskmem = int(
             self.constants.get("num_maskmem", np.array([DEFAULT_NUM_MASKMEM], dtype=np.int64))[0]
@@ -375,9 +389,9 @@ class Sam3OnnxTrackerSession:
         )
 
         enc_path = self._resolve_encoder_path(self.onnx_dir)
-        dec_path = self._resolve_model_path(self.onnx_dir, "image_decoder.onnx", self.graph_profile)
-        mat_path = self._resolve_model_path(self.onnx_dir, "memory_attention.onnx", self.graph_profile)
-        men_path = self._resolve_model_path(self.onnx_dir, "memory_encoder.onnx", self.graph_profile)
+        dec_path = tracker_bundle.decoder_path
+        mat_path = tracker_bundle.memory_attention_path
+        men_path = tracker_bundle.memory_encoder_path
 
         for path in (enc_path, dec_path, mat_path, men_path):
             if not path.exists():
@@ -460,8 +474,10 @@ class Sam3OnnxTrackerSession:
         return {
             "mode": self.mode,
             "graph_profile": self.graph_profile,
+            "tracker_precision": self.tracker_precision,
             "model_names": {name: path.name for name, path in self.model_paths.items()},
             "model_paths": {name: str(path) for name, path in self.model_paths.items()},
+            "constants_path": str(self.constants_path),
             "providers": {
                 "encoder": self.sess_enc.get_providers(),
                 "decoder": self.sess_dec.get_providers(),
@@ -848,6 +864,35 @@ class Sam3OnnxTrackerSession:
             buffer.array[:count] = value[:count]
         return buffer.sync()
 
+    def _pack_memory_rows(
+        self,
+        name: str,
+        rows: list[np.ndarray],
+        target: int | None,
+        *,
+        dtype,
+        empty_shape: tuple[int, ...],
+    ) -> np.ndarray | ort.OrtValue:
+        if target is None:
+            if not rows:
+                return np.zeros(empty_shape, dtype=dtype)
+            return np.ascontiguousarray(np.stack(rows, axis=0).astype(dtype, copy=False))
+
+        buffer = self._memory_input_buffers[name]
+        buffer.array.fill(0)
+        count = min(len(rows), int(target))
+        if count > 0:
+            for idx in range(count):
+                buffer.array[idx] = rows[idx]
+        return buffer.sync()
+
+    @staticmethod
+    def _memory_row(value: np.ndarray | ort.OrtValue, *, dtype) -> np.ndarray:
+        row = np.asarray(_to_numpy(value))
+        if row.ndim > 0 and row.shape[0] == 1:
+            row = row[0]
+        return np.ascontiguousarray(row.astype(dtype, copy=False))
+
     def _limit_spatial_memory_entries(
         self,
         entries: list[dict[str, Any]],
@@ -952,13 +997,25 @@ class Sam3OnnxTrackerSession:
 
         spatial_entries = self._limit_spatial_memory_entries(spatial_entries)
 
-        memory_mask_feats = np.concatenate(
-            [_to_numpy(entry["state"].maskmem_features) for entry in spatial_entries],
-            axis=0,
+        memory_mask_feats = self._pack_memory_rows(
+            "memory_mask_feats",
+            [
+                self._memory_row(entry["state"].maskmem_features, dtype=np.float32)
+                for entry in spatial_entries
+            ],
+            self.static_num_mem_frames,
+            dtype=np.float32,
+            empty_shape=(0, 64, 72, 72),
         )
-        memory_mask_pos = np.concatenate(
-            [_to_numpy(entry["state"].maskmem_pos_enc) for entry in spatial_entries],
-            axis=0,
+        memory_mask_pos = self._pack_memory_rows(
+            "memory_mask_pos",
+            [
+                self._memory_row(entry["state"].maskmem_pos_enc, dtype=np.float32)
+                for entry in spatial_entries
+            ],
+            self.static_num_mem_frames,
+            dtype=np.float32,
+            empty_shape=(0, 64, 72, 72),
         )
         memory_mask_tpos_idx = np.asarray(
             [int(entry["tpos_idx"]) for entry in spatial_entries],
@@ -985,36 +1042,33 @@ class Sam3OnnxTrackerSession:
             pointer_items.append((state, float(t_diff)))
 
         if pointer_items:
-            memory_obj_ptrs = np.concatenate(
-                [_to_numpy(item[0].obj_ptr) for item in pointer_items],
-                axis=0,
+            memory_obj_ptrs = self._pack_memory_rows(
+                "memory_obj_ptrs",
+                [self._memory_row(item[0].obj_ptr, dtype=np.float32) for item in pointer_items],
+                self.static_num_obj_ptrs,
+                dtype=np.float32,
+                empty_shape=(0, 256),
             )
             memory_obj_tpos = np.asarray([item[1] for item in pointer_items], dtype=np.float32)
         else:
-            memory_obj_ptrs = np.zeros((0, 256), np.float32)
+            memory_obj_ptrs = self._pack_memory_rows(
+                "memory_obj_ptrs",
+                [],
+                self.static_num_obj_ptrs,
+                dtype=np.float32,
+                empty_shape=(0, 256),
+            )
             memory_obj_tpos = np.zeros((0,), np.float32)
 
         return {
-            "memory_obj_ptrs": self._pack_memory_inputs(
-                "memory_obj_ptrs",
-                memory_obj_ptrs,
-                self.static_num_obj_ptrs,
-            ),
+            "memory_obj_ptrs": memory_obj_ptrs,
             "memory_obj_tpos": self._pack_memory_inputs(
                 "memory_obj_tpos",
                 memory_obj_tpos,
                 self.static_num_obj_ptrs,
             ),
-            "memory_mask_feats": self._pack_memory_inputs(
-                "memory_mask_feats",
-                memory_mask_feats,
-                self.static_num_mem_frames,
-            ),
-            "memory_mask_pos": self._pack_memory_inputs(
-                "memory_mask_pos",
-                memory_mask_pos,
-                self.static_num_mem_frames,
-            ),
+            "memory_mask_feats": memory_mask_feats,
+            "memory_mask_pos": memory_mask_pos,
             "memory_mask_tpos_idx": self._pack_memory_inputs(
                 "memory_mask_tpos_idx",
                 memory_mask_tpos_idx,
@@ -1058,6 +1112,78 @@ class Sam3OnnxTrackerSession:
                 return candidate
         return last_candidate
 
+    @staticmethod
+    def _preferred_tracker_precisions() -> tuple[str, ...]:
+        requested_precision = os.getenv("SAM3_ORT_TRACKER_PRECISION", "auto").strip().lower()
+        if requested_precision in ("", "auto"):
+            accel = os.getenv("SAM3_ORT_ACCEL", "auto").strip().lower()
+            prefers_fp16 = accel != "cpu" and any(
+                provider in ("CUDAExecutionProvider", "TensorrtExecutionProvider")
+                for provider in ort.get_available_providers()
+            )
+            return ("fp16", "fp32") if prefers_fp16 else ("fp32", "fp16")
+        if requested_precision == "fp16":
+            return ("fp16", "fp32")
+        if requested_precision == "fp32":
+            return ("fp32", "fp16")
+        raise SystemExit(
+            "SAM3_ORT_TRACKER_PRECISION must be auto, fp16, or fp32."
+        )
+
+    @classmethod
+    def _profiled_precision_name(
+        cls,
+        base_name: str,
+        graph_profile: str,
+        precision: str,
+    ) -> str:
+        name = cls._profiled_name(base_name, graph_profile)
+        if precision != "fp16":
+            return name
+        stem = Path(name).stem
+        suffix = Path(name).suffix
+        return f"{stem}_fp16{suffix}"
+
+    @classmethod
+    def _resolve_tracker_bundle(
+        cls,
+        onnx_dir: Path,
+        requested_graph_profile: str,
+    ) -> _ResolvedTrackerBundle:
+        base_names = {
+            "constants_path": "video_constants.npz",
+            "decoder_path": "image_decoder.onnx",
+            "memory_attention_path": "memory_attention.onnx",
+            "memory_encoder_path": "memory_encoder.onnx",
+        }
+        last_candidates: dict[str, Path] = {
+            key: onnx_dir / value for key, value in base_names.items()
+        }
+
+        for precision in cls._preferred_tracker_precisions():
+            for candidate_profile in cls._candidate_graph_profiles(requested_graph_profile):
+                resolved = {
+                    key: onnx_dir
+                    / cls._profiled_precision_name(value, candidate_profile, precision)
+                    for key, value in base_names.items()
+                }
+                last_candidates = resolved
+                if all(path.exists() for path in resolved.values()):
+                    return _ResolvedTrackerBundle(
+                        graph_profile=candidate_profile,
+                        precision=precision,
+                        constants_path=resolved["constants_path"],
+                        decoder_path=resolved["decoder_path"],
+                        memory_attention_path=resolved["memory_attention_path"],
+                        memory_encoder_path=resolved["memory_encoder_path"],
+                    )
+
+        raise SystemExit(
+            "Missing a complete tracker ONNX bundle. Expected matching decoder, memory attention, "
+            f"memory encoder, and video constants files like {last_candidates['decoder_path'].name} "
+            "in the video export directory. Run export\\onnx_export.py first to regenerate the tracker graphs."
+        )
+
     @classmethod
     def _resolve_encoder_path(cls, onnx_dir: Path) -> Path:
         custom_candidates = [
@@ -1097,8 +1223,7 @@ class Sam3OnnxTrackerSession:
         )
 
     @classmethod
-    def _load_video_constants(cls, onnx_dir: Path, graph_profile: str) -> dict[str, np.ndarray]:
-        constants_path = cls._resolve_model_path(onnx_dir, "video_constants.npz", graph_profile)
+    def _load_video_constants(cls, constants_path: Path) -> dict[str, np.ndarray]:
         if not constants_path.exists():
             raise SystemExit(
                 f"Missing {constants_path}. Run export\\onnx_export.py first to generate the video constants bundle."
