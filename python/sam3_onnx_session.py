@@ -155,6 +155,37 @@ def parse_box_text(text: str) -> tuple[int, int, int, int]:
     return tuple(parts)
 
 
+def _binary_mask(mask_hw: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask_hw)
+    if mask.ndim != 2:
+        raise ValueError(f"Mask prompts expect a 2D array, got shape {mask.shape}.")
+    if np.issubdtype(mask.dtype, np.floating):
+        mask_bin = mask > 0.5
+    else:
+        mask_bin = mask > 0
+    return np.ascontiguousarray(mask_bin.astype(np.uint8, copy=False))
+
+
+def _mask_bbox_xyxy(mask_hw: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask_hw)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _mask_prompt_from_box(box_xyxy: tuple[int, int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+    x1, y1, x2, y2 = box_xyxy
+    points = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
+    labels = np.array([2, 3], dtype=np.int32)
+    return np.ascontiguousarray(points[None, ...]), np.ascontiguousarray(labels[None, ...])
+
+
+def _mask_prompt_from_point(point_xy: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    point = np.array([[point_xy[0], point_xy[1]]], dtype=np.float32)
+    labels = np.array([1], dtype=np.int32)
+    return np.ascontiguousarray(point[None, ...]), np.ascontiguousarray(labels[None, ...])
+
+
 def load_prompt_spec(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         spec = json.load(f)
@@ -184,6 +215,62 @@ def mask_to_overlay(frame_bgr: np.ndarray, mask_logits_high_res: np.ndarray, inf
     return green_overlay(frame_bgr, mask_uint8, alpha=0.5)
 
 
+def prepare_prompt_mask(
+    mask_hw: np.ndarray,
+    info: PrepInfo,
+    *,
+    prompt_strategy: str = "box",
+) -> "PreparedMaskPrompt":
+    if prompt_strategy not in {"box", "point"}:
+        raise ValueError("prompt_strategy must be 'box' or 'point'.")
+
+    mask_bin = _binary_mask(mask_hw)
+    target_hw = (int(info.target_size), int(info.target_size))
+    if mask_bin.shape == info.orig_hw:
+        mask_target_f32 = cv2.resize(
+            mask_bin.astype(np.float32, copy=False),
+            (info.target_size, info.target_size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        mask_target = np.ascontiguousarray((mask_target_f32 > 0.5).astype(np.uint8, copy=False))
+        mask_uint8 = np.ascontiguousarray(mask_bin.astype(np.uint8, copy=False) * 255)
+    elif mask_bin.shape == target_hw:
+        mask_target = mask_bin
+        mask_uint8 = None
+    else:
+        raise ValueError(
+            "Mask prompts must match either the original frame size "
+            f"{info.orig_hw} or the resized ONNX size {target_hw}; got {mask_bin.shape}."
+        )
+
+    bbox = _mask_bbox_xyxy(mask_target)
+    if bbox is None:
+        raise ValueError("Mask prompt cannot be empty.")
+
+    x1, y1, x2, y2 = bbox
+    use_point_prompt = prompt_strategy == "point" or x1 == x2 or y1 == y2
+    if use_point_prompt:
+        point = ((x1 + x2) // 2, (y1 + y2) // 2)
+        prompt_points, prompt_labels = _mask_prompt_from_point(point)
+        prompt_kind = "seed_points"
+    else:
+        prompt_points, prompt_labels = _mask_prompt_from_box(bbox)
+        prompt_kind = "bounding_box"
+
+    mask_logits_high_res = np.where(mask_target > 0, 20.0, -20.0).astype(np.float32, copy=False)
+    mask_logits_high_res = np.ascontiguousarray(mask_logits_high_res[None, None, ...])
+    if mask_uint8 is None:
+        mask_uint8 = mask_to_uint8(mask_logits_high_res, info)
+
+    return PreparedMaskPrompt(
+        mask_logits_high_res=mask_logits_high_res,
+        mask_uint8=mask_uint8,
+        prompt_points=prompt_points,
+        prompt_labels=prompt_labels,
+        prompt_kind=prompt_kind,
+    )
+
+
 def normalize_encoder_outputs(
     raw_outputs: dict[str, np.ndarray | ort.OrtValue],
     constants: dict[str, np.ndarray],
@@ -207,6 +294,15 @@ class PreparedFrame:
     info: PrepInfo
     prep_ms: float
     enc_ms: float
+
+
+@dataclass(frozen=True)
+class PreparedMaskPrompt:
+    mask_logits_high_res: np.ndarray
+    mask_uint8: np.ndarray
+    prompt_points: np.ndarray
+    prompt_labels: np.ndarray
+    prompt_kind: str
 
 
 @dataclass(frozen=True)
@@ -567,6 +663,63 @@ class Sam3OnnxTrackerSession:
         )
         return dec["pred_mask_high_res"]
 
+    def _condition_with_mask_prompt(
+        self,
+        prepared: PreparedFrame,
+        prompt_mask: np.ndarray,
+        *,
+        prompt_points: np.ndarray | None,
+        prompt_labels: np.ndarray | None,
+        prompt_mask_strategy: str,
+    ) -> tuple[TrackerFrameState, np.ndarray, float, float]:
+        enc = prepared.encoder_outputs
+        prepared_mask = prepare_prompt_mask(
+            prompt_mask,
+            prepared.info,
+            prompt_strategy=prompt_mask_strategy,
+        )
+
+        has_explicit_prompt = (
+            prompt_points is not None
+            and prompt_labels is not None
+            and np.asarray(prompt_labels).size > 0
+        )
+        if not has_explicit_prompt:
+            prompt_points = prepared_mask.prompt_points
+            prompt_labels = prepared_mask.prompt_labels
+
+        t_dec = time.time()
+        dec = self._run_decoder(
+            prompt_points,
+            prompt_labels,
+            enc["image_embeddings"],
+            enc["high_res_features0"],
+            enc["high_res_features1"],
+            output_device="session",
+        )
+        dec_ms = (time.time() - t_dec) * 1000.0
+
+        # The object is explicitly present in a user-provided mask, so force a positive
+        # object-presence signal even though the exported decoder cannot ingest masks directly.
+        object_present_logits = np.ascontiguousarray(np.ones((1, 1), dtype=np.float32))
+
+        t_mem = time.time()
+        mem = self._run_memory_encoder(
+            prepared_mask.mask_logits_high_res,
+            enc["current_vision_feat"],
+            object_present_logits,
+            is_mask_from_points=True,
+            output_device="session",
+        )
+        mem_ms = (time.time() - t_mem) * 1000.0
+
+        state = TrackerFrameState(
+            maskmem_features=_to_numpy(mem["maskmem_features"]),
+            maskmem_pos_enc=_to_numpy(mem["maskmem_pos_enc"]),
+            obj_ptr=_to_numpy(dec["obj_ptr"]),
+        )
+        return state, prepared_mask.mask_uint8, dec_ms, mem_ms
+
     def process_frame(
         self,
         frame_idx: int,
@@ -575,14 +728,49 @@ class Sam3OnnxTrackerSession:
         prepared: PreparedFrame | None = None,
         prompt_points: np.ndarray | None = None,
         prompt_labels: np.ndarray | None = None,
+        prompt_mask: np.ndarray | None = None,
+        prompt_mask_strategy: str = "box",
     ) -> FrameResult:
         t_total = time.time()
-        has_prompt = (
+        has_point_prompt = (
             prompt_points is not None
             and prompt_labels is not None
             and np.asarray(prompt_labels).size > 0
         )
+        has_mask_prompt = prompt_mask is not None and np.asarray(prompt_mask).size > 0
+        has_prompt = has_point_prompt or has_mask_prompt
         is_conditioning_frame = frame_idx == 0 or has_prompt
+
+        if is_conditioning_frame and has_mask_prompt:
+            if prepared is None:
+                prepared = self.prepare_frame(frame_bgr)
+            info = prepared.info
+            prep_ms = prepared.prep_ms
+            enc_ms = prepared.enc_ms
+
+            state, mask_uint8, dec_ms, mem_ms = self._condition_with_mask_prompt(
+                prepared,
+                prompt_mask,
+                prompt_points=prompt_points,
+                prompt_labels=prompt_labels,
+                prompt_mask_strategy=prompt_mask_strategy,
+            )
+            self.non_cond_states.pop(frame_idx, None)
+            self.cond_states[frame_idx] = state
+            return FrameResult(
+                frame_idx=frame_idx,
+                info=info,
+                state=state,
+                mask_uint8=mask_uint8,
+                timings=FrameTimings(
+                    prep_ms=prep_ms,
+                    enc_ms=enc_ms,
+                    attn_ms=0.0,
+                    dec_ms=dec_ms,
+                    mem_ms=mem_ms,
+                    total_ms=(time.time() - t_total) * 1000.0,
+                ),
+            )
 
         if is_conditioning_frame:
             if prepared is None:
