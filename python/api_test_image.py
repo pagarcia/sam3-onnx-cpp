@@ -4,8 +4,8 @@
 SAM3 native API interactive demo (image-only), similar UX to onnx_test_image.py.
 
 Assumptions:
-- The facebookresearch/sam3 repo is cloned next to sam3-onnx-cpp:
-    ../sam3
+- The facebookresearch/sam3 repo is available locally. By default this script
+  prefers `../sam3-3p1` when present, then falls back to `../sam3`.
 - You have access to SAM3 checkpoints (HF gated) and are authenticated if needed.
 
 Controls:
@@ -35,13 +35,14 @@ import numpy as np
 from PyQt5 import QtWidgets
 from PIL import Image
 
+from local_sam3_config import DEFAULT_SAM3_REPO
+
 
 def _add_sam3_repo_to_syspath():
     """
-    Add ../sam3 to sys.path so `import sam3` works without needing a pip install.
+    Add the local SAM3 checkout to sys.path so `import sam3` works without needing a pip install.
     """
-    repo_root = Path(__file__).resolve().parent.parent  # sam3-onnx-cpp/
-    sam3_repo = repo_root.parent / "sam3"
+    sam3_repo = DEFAULT_SAM3_REPO
     if sam3_repo.exists():
         sys.path.insert(0, str(sam3_repo))
         return sam3_repo

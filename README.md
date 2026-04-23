@@ -93,6 +93,7 @@ sam3-onnx-cpp/
 |   |-- inspect_onnx_io.py
 |   |-- compare_native_vs_onnx.py
 |   |-- benchmark_onnx_default.py
+|   |-- sam31_native_smoke.py
 |   |-- sweep_onnx_mem_frames.py
 |   |-- sweep_onnx_obj_ptrs.py
 |   `-- api_test_image.py
@@ -129,13 +130,20 @@ pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 nu
 
 If you also have `conda` active in the same shell, run `conda deactivate` first so the venv owns the DLL search path cleanly on Windows.
 
-You also need a local `sam3` repository next to this repo by default:
+For export/native comparison and SAM 3.1 experiments, also install the upstream SAM3 support dependencies used by the local checkout:
+
+```powershell
+pip install onnxscript pycocotools psutil timm safetensors einops ftfy iopath portalocker regex
+```
+
+You also need a local `sam3` repository. By default the tooling prefers:
 
 ```text
+../sam3-3p1
 ../sam3
 ```
 
-or pass `--sam3-repo` explicitly.
+You can also override this with `SAM3_REPO` or `--sam3-repo` explicitly. Existing ONNX export and native comparison scripts use the SAM 3 checkpoint from `SAM3_CKPT` or the newest local Hugging Face `facebook/sam3` checkpoint. SAM 3.1 experiments use `SAM31_CKPT` or the local `facebook/sam3.1` checkpoint separately, so the stable SAM 3 ONNX flow does not accidentally load `sam3.1_multiplex.pt`.
 
 ## Quick Deploy
 
@@ -202,7 +210,14 @@ python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_po
 Use this if you want the complete repo workflow, including exporting tracker graphs from a local SAM3 checkout and benchmarking against native PyTorch SAM3.
 
 1. Clone this repo.
-2. Clone `sam3` next to it so the default layout is:
+2. Clone `sam3` next to it so the default layout is one of:
+
+```text
+../sam3-3p1
+../sam3-onnx-cpp
+```
+
+or:
 
 ```text
 ../sam3
@@ -228,7 +243,7 @@ pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 nu
 
 ```powershell
 .\sam3_env\Scripts\python.exe export\onnx_export.py `
-  --sam3-repo "..\sam3" `
+  --sam3-repo "..\sam3-3p1" `
   --load-from-hf
 ```
 
@@ -248,9 +263,36 @@ pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 nu
 ```powershell
 .\sam3_env\Scripts\python.exe python\compare_native_vs_onnx.py `
   --video "C:\path\to\video.mp4" `
-  --sam3_repo "..\sam3" `
+  --sam3_repo "..\sam3-3p1" `
   --checkpoint "C:\path\to\sam3.pt"
 ```
+
+### Experimental SAM 3.1 Native Smoke Test
+
+SAM 3.1 support is currently isolated from the stable SAM 3 ONNX runtime. The new upstream `facebook/sam3.1` checkpoint is `sam3.1_multiplex.pt`, and the native predictor uses the newer multiplex API.
+
+First authenticate with Hugging Face and download the checkpoint:
+
+```powershell
+.\sam3_env\Scripts\hf.exe auth login
+.\sam3_env\Scripts\python.exe -c "from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id='facebook/sam3.1', filename='sam3.1_multiplex.pt'))"
+```
+
+Then run a small native smoke test:
+
+```powershell
+.\sam3_env\Scripts\python.exe python\sam31_native_smoke.py `
+  --video "C:\path\to\video.mp4" `
+  --prompt_json "C:\path\to\prompt.json" `
+  --max_frames 5
+```
+
+Notes:
+
+- The smoke test uses `SAM31_CKPT` or the local Hugging Face `facebook/sam3.1` cache by default.
+- On GPUs/runtimes without usable FlashAttention for SAM 3.1, the script patches the decoder to the safe PyTorch math attention backend. This validates compatibility but can be much slower than the existing ONNX runtime.
+- Pure point-only prompts are not yet a drop-in replacement for the current SAM 3 ONNX workflow. SAM 3.1 multiplex works best with a text or box seed plus optional point refinements, so the smoke runner also supports `--text_prompt`.
+- If your prompt JSON contains annotations beyond frame 5, pass a larger `--max_frames` such as `--max_frames 20`.
 
 ## Optional GPU Setup
 
@@ -408,7 +450,7 @@ Default runtime behavior:
 
 The exporter requires:
 
-- A local SAM3 checkout, defaulting to `../sam3`
+- A local SAM3 checkout, defaulting to `SAM3_REPO` or an auto-detected sibling checkout such as `../sam3-3p1` or `../sam3`
 - A PyTorch-capable environment
 - Either `--checkpoint` or `--load-from-hf`
 
@@ -416,7 +458,7 @@ Example:
 
 ```powershell
 .\sam3_env\Scripts\python.exe export\onnx_export.py `
-  --sam3-repo "..\sam3" `
+  --sam3-repo "..\sam3-3p1" `
   --load-from-hf
 ```
 
@@ -424,7 +466,7 @@ Or with a local checkpoint:
 
 ```powershell
 .\sam3_env\Scripts\python.exe export\onnx_export.py `
-  --sam3-repo "..\sam3" `
+  --sam3-repo "..\sam3-3p1" `
   --checkpoint "C:\path\to\sam3.pt"
 ```
 
@@ -454,7 +496,7 @@ This is useful for checking native SAM3 behavior outside ONNX:
 ```powershell
 .\sam3_env\Scripts\python.exe python\compare_native_vs_onnx.py `
   --video "C:\path\to\video.mp4" `
-  --sam3_repo "..\sam3" `
+  --sam3_repo "..\sam3-3p1" `
   --checkpoint "C:\path\to\sam3.pt" `
   --prompt seed_points
 ```
@@ -464,7 +506,7 @@ This is useful for checking native SAM3 behavior outside ONNX:
 ```powershell
 .\sam3_env\Scripts\python.exe python\benchmark_onnx_default.py `
   --video "C:\path\to\video.mp4" `
-  --sam3_repo "..\sam3" `
+  --sam3_repo "..\sam3-3p1" `
   --checkpoint "C:\path\to\sam3.pt"
 ```
 

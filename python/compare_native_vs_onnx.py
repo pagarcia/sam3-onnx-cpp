@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import torch
 
+from local_sam3_config import DEFAULT_CKPT, DEFAULT_SAM3_REPO
 from onnx_runtime_policy import resolve_runtime_caps as resolve_onnx_runtime_caps
 from prompt_spec_utils import (
     load_prompt_spec as _shared_load_prompt_spec,
@@ -27,11 +28,7 @@ from prompt_spec_utils import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SAM3_REPO = REPO_ROOT.parent / "sam3"
 DEFAULT_ONNX_DIR = REPO_ROOT / "checkpoints" / "sam3" / "video_onnx"
-DEFAULT_CKPT = Path(
-    r"C:\Users\Pablo\.cache\huggingface\hub\models--facebook--sam3\snapshots\3c879f39826c281e95690f02c7821c4de09afae7\sam3.pt"
-)
 TARGET_SIZE = 1008
 DEFAULT_RUN_ORDER = "onnx,native"
 
@@ -857,12 +854,12 @@ def main():
     parser.add_argument(
         "--checkpoint",
         default=str(DEFAULT_CKPT),
-        help="Path to the SAM3 checkpoint.",
+        help="Path to the SAM3 checkpoint. Defaults to SAM3_CKPT or the newest local Hugging Face facebook/sam3 checkpoint.",
     )
     parser.add_argument(
         "--sam3_repo",
         default=str(DEFAULT_SAM3_REPO),
-        help="Path to the local SAM3 repo.",
+        help="Path to the local SAM3 repo. Defaults to SAM3_REPO or an auto-detected sibling checkout such as ../sam3-3p1 or ../sam3.",
     )
     parser.add_argument(
         "--prompt",

@@ -1,5 +1,6 @@
 # sam3-onnx-cpp/export/onnx_export.py
 import argparse
+import contextlib
 import sys
 import types
 from dataclasses import dataclass
@@ -7,6 +8,23 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+_PYTHON_DIR = Path(__file__).resolve().parent.parent / "python"
+if str(_PYTHON_DIR.resolve()) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_DIR.resolve()))
+
+from local_sam3_config import DEFAULT_SAM3_REPO
+
+
+def _configure_console_encoding() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 def _repo_root() -> Path:
@@ -18,7 +36,7 @@ def _export_dir() -> Path:
 
 
 def _default_sam3_repo() -> Path:
-    return _repo_root().parent / "sam3"
+    return DEFAULT_SAM3_REPO
 
 
 def _add_import_paths(sam3_repo: Path) -> None:
@@ -163,9 +181,12 @@ def _build_export_variants(model, precisions: list[str]):
     return variants
 
 
-def _save_video_constants(model, outdir: Path, variant) -> None:
-    tracker = model.inst_interactive_predictor.model
-    with torch.no_grad():
+def _extract_backbone_pos_embeds(model, tracker, *, use_cpu_bf16_autocast: bool):
+    autocast_ctx = contextlib.nullcontext()
+    if use_cpu_bf16_autocast:
+        autocast_ctx = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+
+    with torch.no_grad(), autocast_ctx:
         dummy = torch.zeros(1, 3, 1008, 1008, dtype=torch.float32)
         backbone_out = model.backbone.forward_image(dummy)["sam2_backbone_out"].copy()
         backbone_out["backbone_fpn"] = list(backbone_out["backbone_fpn"])
@@ -177,12 +198,39 @@ def _save_video_constants(model, outdir: Path, variant) -> None:
             backbone_out["backbone_fpn"][1]
         )
         _, _feats, pos_embeds, _feat_sizes = tracker._prepare_backbone_features(backbone_out)
+    return pos_embeds
+
+
+def _save_video_constants(model, outdir: Path, variant) -> None:
+    tracker = model.inst_interactive_predictor.model
+    try:
+        pos_embeds = _extract_backbone_pos_embeds(
+            model,
+            tracker,
+            use_cpu_bf16_autocast=False,
+        )
+    except RuntimeError as exc:
+        if "must have the same dtype" not in str(exc):
+            raise
+        print(
+            "[WARN] Falling back to CPU bf16 autocast while extracting video constants. "
+            "This is needed for newer SAM3/SAM3.1 backbones on Windows.",
+        )
+        pos_embeds = _extract_backbone_pos_embeds(
+            model,
+            tracker,
+            use_cpu_bf16_autocast=True,
+        )
 
     constants_path = outdir / variant.filename("video_constants.npz")
     np.savez(
         constants_path,
-        no_mem_embed_bchw=tracker.no_mem_embed.detach().cpu().numpy().reshape(1, 256, 1, 1),
-        current_vision_pos_embed=pos_embeds[-1].detach().cpu().numpy(),
+        no_mem_embed_bchw=tracker.no_mem_embed.detach()
+        .to(torch.float32)
+        .cpu()
+        .numpy()
+        .reshape(1, 256, 1, 1),
+        current_vision_pos_embed=pos_embeds[-1].detach().to(torch.float32).cpu().numpy(),
         num_maskmem=np.array([tracker.num_maskmem], dtype=np.int64),
         max_obj_ptrs=np.array([tracker.max_obj_ptrs_in_encoder], dtype=np.int64),
         max_cond_frames_in_attn=np.array([tracker.max_cond_frames_in_attn], dtype=np.int64),
@@ -203,7 +251,7 @@ def main(args) -> None:
     sam3_repo = Path(args.sam3_repo).resolve() if args.sam3_repo else _default_sam3_repo()
     if not sam3_repo.exists():
         raise SystemExit(
-            f"SAM3 repo not found at {sam3_repo}. Pass --sam3-repo to the local facebookresearch/sam3 clone."
+            f"SAM3 repo not found at {sam3_repo}. Pass --sam3-repo or set SAM3_REPO to the local facebookresearch/sam3 clone."
         )
 
     _add_import_paths(sam3_repo)
@@ -252,6 +300,7 @@ def main(args) -> None:
 
 
 if __name__ == "__main__":
+    _configure_console_encoding()
     parser = argparse.ArgumentParser(
         description="Export SAM3 tracker-only video modules to ONNX."
     )
@@ -268,7 +317,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sam3-repo",
         default="",
-        help="Path to a local clone of the SAM3 repo. Defaults to ../sam3 next to this repo.",
+        help="Path to a local clone of the SAM3 repo. Defaults to SAM3_REPO or an auto-detected sibling checkout such as ../sam3-3p1 or ../sam3.",
     )
     parser.add_argument(
         "--outdir",
