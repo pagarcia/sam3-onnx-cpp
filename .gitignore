@@ -10,6 +10,7 @@ __pycache__/
 sam3_env/
 sam3_api_env/
 checkpoints/
+tmp/
 
 # Distribution / packaging
 .Python

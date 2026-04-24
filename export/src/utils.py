@@ -101,6 +101,7 @@ def _export_model(
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
+            dynamo=False,
         )
         if variant.precision == "fp16":
             _convert_to_fp16(export_path, dst_path, label)
@@ -240,5 +241,183 @@ def export_memory_encoder(model, outdir: str, variant: ExportVariant) -> None:
         ],
         output_names=["maskmem_features", "maskmem_pos_enc"],
         dynamic_axes=None,
+        variant=variant,
+    )
+
+
+def export_sam31_interactive_decoder(model, outdir: str, variant: ExportVariant) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, variant.filename("interactive_decoder.onnx"))
+
+    point_coords = torch.randn(1, 2, 2, dtype=torch.float32)
+    point_labels = torch.tensor([[1, 0]], dtype=torch.int32)
+    image_embed = torch.randn(1, 256, 72, 72, dtype=torch.float32)
+    high_res_0 = torch.randn(1, 32, 288, 288, dtype=torch.float32)
+    high_res_1 = torch.randn(1, 64, 144, 144, dtype=torch.float32)
+
+    _export_model(
+        model,
+        (point_coords, point_labels, image_embed, high_res_0, high_res_1),
+        path,
+        label=variant.label("SAM 3.1 interactive decoder"),
+        input_names=[
+            "point_coords",
+            "point_labels",
+            "image_embed",
+            "high_res_feats_0",
+            "high_res_feats_1",
+        ],
+        output_names=[
+            "obj_ptr",
+            "pred_mask",
+            "pred_mask_high_res",
+            "object_score_logits",
+            "iou_scores",
+        ],
+        dynamic_axes={
+            "point_coords": {0: "num_objects", 1: "num_points"},
+            "point_labels": {0: "num_objects", 1: "num_points"},
+            "image_embed": {0: "num_objects"},
+            "high_res_feats_0": {0: "num_objects"},
+            "high_res_feats_1": {0: "num_objects"},
+            "obj_ptr": {0: "num_objects"},
+            "pred_mask": {0: "num_objects"},
+            "pred_mask_high_res": {0: "num_objects"},
+            "object_score_logits": {0: "num_objects"},
+            "iou_scores": {0: "num_objects"},
+        },
+        variant=variant,
+    )
+
+
+def export_sam31_propagation_decoder(model, outdir: str, variant: ExportVariant) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, variant.filename("propagation_decoder.onnx"))
+
+    image_embed = torch.randn(1, 256, 72, 72, dtype=torch.float32)
+    high_res_0 = torch.randn(1, 32, 288, 288, dtype=torch.float32)
+    high_res_1 = torch.randn(1, 64, 144, 144, dtype=torch.float32)
+    valid_object_mask = torch.ones(1, 16, dtype=torch.float32)
+
+    _export_model(
+        model,
+        (image_embed, high_res_0, high_res_1, valid_object_mask),
+        path,
+        label=variant.label("SAM 3.1 propagation decoder"),
+        input_names=[
+            "image_embed",
+            "high_res_feats_0",
+            "high_res_feats_1",
+            "valid_object_mask",
+        ],
+        output_names=[
+            "obj_ptr_mux",
+            "pred_mask_mux",
+            "pred_mask_high_res_mux",
+            "object_score_logits_mux",
+            "iou_scores_mux",
+        ],
+        dynamic_axes={
+            "image_embed": {0: "num_buckets"},
+            "high_res_feats_0": {0: "num_buckets"},
+            "high_res_feats_1": {0: "num_buckets"},
+            "valid_object_mask": {0: "num_buckets"},
+            "obj_ptr_mux": {0: "num_buckets"},
+            "pred_mask_mux": {0: "num_buckets"},
+            "pred_mask_high_res_mux": {0: "num_buckets"},
+            "object_score_logits_mux": {0: "num_buckets"},
+            "iou_scores_mux": {0: "num_buckets"},
+        },
+        variant=variant,
+    )
+
+
+def export_sam31_memory_encoder(model, outdir: str, variant: ExportVariant) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, variant.filename("memory_encoder.onnx"))
+
+    pred_masks_high_res = torch.randn(1, 16, 1008, 1008, dtype=torch.float32)
+    current_vision_feat = torch.randn(1, 256, 72, 72, dtype=torch.float32)
+    object_score_logits = torch.randn(1, 16, 1, dtype=torch.float32)
+    conditioning_mask = torch.ones(1, 16, dtype=torch.float32)
+
+    _export_model(
+        model,
+        (
+            pred_masks_high_res,
+            current_vision_feat,
+            object_score_logits,
+            conditioning_mask,
+        ),
+        path,
+        label=variant.label("SAM 3.1 memory encoder"),
+        input_names=[
+            "pred_masks_high_res_mux",
+            "current_vision_feat",
+            "object_score_logits_mux",
+            "conditioning_mask",
+        ],
+        output_names=["maskmem_features", "maskmem_pos_enc"],
+        dynamic_axes={
+            "pred_masks_high_res_mux": {0: "num_buckets"},
+            "current_vision_feat": {0: "num_buckets"},
+            "object_score_logits_mux": {0: "num_buckets"},
+            "conditioning_mask": {0: "num_buckets"},
+            "maskmem_features": {0: "num_buckets"},
+            "maskmem_pos_enc": {0: "num_buckets"},
+        },
+        variant=variant,
+    )
+
+
+def export_sam31_memory_attention_core(model, outdir: str, variant: ExportVariant) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, variant.filename("memory_attention_core.onnx"))
+
+    image_tokens = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    src_tokens = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    memory_image_tokens = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    memory_tokens = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    image_pos = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    src_pos = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    memory_image_pos = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+    memory_pos = torch.randn(72 * 72, 1, 256, dtype=torch.float32)
+
+    _export_model(
+        model,
+        (
+            image_tokens,
+            src_tokens,
+            memory_image_tokens,
+            memory_tokens,
+            image_pos,
+            src_pos,
+            memory_image_pos,
+            memory_pos,
+        ),
+        path,
+        label=variant.label("SAM 3.1 memory attention core"),
+        input_names=[
+            "image_tokens",
+            "src_tokens",
+            "memory_image_tokens",
+            "memory_tokens",
+            "image_pos",
+            "src_pos",
+            "memory_image_pos",
+            "memory_pos",
+        ],
+        output_names=["memory_out"],
+        dynamic_axes={
+            "image_tokens": {1: "num_buckets"},
+            "src_tokens": {1: "num_buckets"},
+            "memory_image_tokens": {0: "num_memory_tokens", 1: "num_buckets"},
+            "memory_tokens": {0: "num_memory_tokens", 1: "num_buckets"},
+            "image_pos": {1: "num_buckets"},
+            "src_pos": {1: "num_buckets"},
+            "memory_image_pos": {0: "num_memory_tokens", 1: "num_buckets"},
+            "memory_pos": {0: "num_memory_tokens", 1: "num_buckets"},
+            "memory_out": {1: "num_buckets"},
+        },
         variant=variant,
     )

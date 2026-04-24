@@ -1,6 +1,7 @@
 # sam3-onnx-cpp/export/onnx_export.py
 import argparse
 import contextlib
+import json
 import sys
 import types
 from dataclasses import dataclass
@@ -37,6 +38,13 @@ def _export_dir() -> Path:
 
 def _default_sam3_repo() -> Path:
     return DEFAULT_SAM3_REPO
+
+
+def _default_outdir_for_version(version: str) -> Path:
+    checkpoints_dir = _repo_root() / "checkpoints" / "sam3"
+    if version == "sam3.1":
+        return checkpoints_dir / "sam31_video_onnx"
+    return checkpoints_dir / "video_onnx"
 
 
 def _add_import_paths(sam3_repo: Path) -> None:
@@ -113,7 +121,25 @@ def _install_optional_sam3_stubs() -> None:
         sys.modules["sam3.model.sam3_video_predictor"] = video_predictor_module
 
 
-def _build_model(args):
+def _parse_csv(text: str) -> list[str]:
+    values = []
+    for item in text.split(","):
+        value = item.strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _validate_precisions(precisions: list[str]) -> list[str]:
+    if not precisions:
+        raise SystemExit("No export precisions were selected.")
+    invalid = [precision for precision in precisions if precision not in ("fp32", "fp16")]
+    if invalid:
+        raise SystemExit("--precisions must contain only fp32 and/or fp16.")
+    return precisions
+
+
+def _build_sam3_model(args):
     from sam3.model_builder import build_sam3_image_model
 
     if not args.checkpoint and not args.load_from_hf:
@@ -139,16 +165,72 @@ def _build_model(args):
     return model
 
 
-def _parse_csv(text: str) -> list[str]:
-    values = []
-    for item in text.split(","):
-        value = item.strip()
-        if value and value not in values:
-            values.append(value)
-    return values
+def _resolve_sam31_checkpoint_path(args):
+    from sam3.model_builder import download_ckpt_from_hf
+
+    if args.checkpoint:
+        return Path(args.checkpoint).resolve()
+    if args.load_from_hf:
+        return Path(download_ckpt_from_hf(version="sam3.1")).resolve()
+    raise SystemExit(
+        "Provide --checkpoint or pass --load-from-hf so the SAM 3.1 exporter does not run on random weights."
+    )
 
 
-def _build_export_variants(model, precisions: list[str]):
+def _remap_sam31_tracker_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    remapped = {}
+    for key, value in state_dict.items():
+        new_key = None
+        if key.startswith("tracker.model."):
+            new_key = key[len("tracker.model.") :]
+        elif key.startswith("detector.backbone."):
+            new_key = "backbone." + key[len("detector.backbone.") :]
+        elif key.startswith("sam2_predictor."):
+            new_key = key[len("sam2_predictor.") :]
+        elif key.startswith("sam3_model.backbone."):
+            new_key = "backbone." + key[len("sam3_model.backbone.") :]
+        if new_key:
+            remapped[new_key] = value
+    if not remapped:
+        raise RuntimeError(
+            "Could not find tracker.model.* or detector.backbone.* keys in the SAM 3.1 checkpoint."
+        )
+    return remapped
+
+
+def _build_sam31_tracker(args):
+    from sam3.model_builder import build_sam3_multiplex_video_model
+
+    checkpoint_path = _resolve_sam31_checkpoint_path(args)
+    tracker = build_sam3_multiplex_video_model(
+        checkpoint_path=None,
+        load_from_HF=False,
+        device="cpu",
+        use_fa3=False,
+        use_rope_real=True,
+        strict_state_dict_loading=False,
+    )
+    tracker.eval()
+
+    state_dict = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+    if "model" in state_dict and isinstance(state_dict["model"], dict):
+        state_dict = state_dict["model"]
+    remapped_state = _remap_sam31_tracker_state_dict(state_dict)
+    missing_keys, unexpected_keys = tracker.load_state_dict(remapped_state, strict=False)
+    if missing_keys:
+        raise RuntimeError(
+            "Failed to load the SAM 3.1 tracker export model. Missing keys include "
+            f"{missing_keys[:10]}."
+        )
+    if unexpected_keys:
+        print(
+            "[WARN] Ignoring detector-only SAM 3.1 checkpoint keys during tracker export: "
+            f"{unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}"
+        )
+    return tracker, checkpoint_path
+
+
+def _build_sam3_export_variants(model, precisions: list[str]):
     from src.utils import ExportVariant
     from python.onnx_runtime_policy import DEFAULT_MAX_MEM_FRAMES, MULTI_ANNOTATION_MAX_MEM_FRAMES
 
@@ -157,9 +239,7 @@ def _build_export_variants(model, precisions: list[str]):
     native_obj_ptrs = int(tracker.max_obj_ptrs_in_encoder)
     variants = []
 
-    for precision in precisions:
-        if precision not in ("fp32", "fp16"):
-            raise SystemExit("--precisions must contain only fp32 and/or fp16.")
+    for precision in _validate_precisions(precisions):
         variants.extend(
             [
                 ExportVariant(
@@ -181,6 +261,12 @@ def _build_export_variants(model, precisions: list[str]):
     return variants
 
 
+def _build_sam31_export_variants(precisions: list[str]):
+    from src.utils import ExportVariant
+
+    return [ExportVariant(name="", precision=precision) for precision in _validate_precisions(precisions)]
+
+
 def _extract_backbone_pos_embeds(model, tracker, *, use_cpu_bf16_autocast: bool):
     autocast_ctx = contextlib.nullcontext()
     if use_cpu_bf16_autocast:
@@ -199,6 +285,23 @@ def _extract_backbone_pos_embeds(model, tracker, *, use_cpu_bf16_autocast: bool)
         )
         _, _feats, pos_embeds, _feat_sizes = tracker._prepare_backbone_features(backbone_out)
     return pos_embeds
+
+
+def _extract_sam31_backbone_features(tracker, *, use_cpu_bf16_autocast: bool):
+    from sam3.model.data_misc import NestedTensor
+
+    autocast_ctx = contextlib.nullcontext()
+    if use_cpu_bf16_autocast:
+        autocast_ctx = torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+
+    with torch.no_grad(), autocast_ctx:
+        dummy = torch.zeros(1, 3, 1008, 1008, dtype=torch.float32)
+        backbone_out = tracker.forward_image(
+            NestedTensor(tensors=dummy, mask=None),
+            need_interactive_out=True,
+            need_propagation_out=True,
+        )
+        return tracker._prepare_backbone_features(backbone_out)
 
 
 def _save_video_constants(model, outdir: Path, variant) -> None:
@@ -247,6 +350,106 @@ def _save_video_constants(model, outdir: Path, variant) -> None:
     print(f"[INFO] Saved video constants [{variant.token or 'default'}]: {constants_path}")
 
 
+def _save_sam31_constants(tracker, outdir: Path, variant) -> None:
+    try:
+        backbone_features = _extract_sam31_backbone_features(
+            tracker,
+            use_cpu_bf16_autocast=False,
+        )
+    except RuntimeError as exc:
+        if "must have the same dtype" not in str(exc):
+            raise
+        print(
+            "[WARN] Falling back to CPU bf16 autocast while extracting SAM 3.1 constants. "
+            "This is needed for newer SAM3/SAM3.1 backbones on Windows.",
+        )
+        backbone_features = _extract_sam31_backbone_features(
+            tracker,
+            use_cpu_bf16_autocast=True,
+        )
+
+    constants = {
+        "interactive_vision_pos_embed": backbone_features["interactive"]["vision_pos_embeds"][-1]
+        .detach()
+        .to(torch.float32)
+        .cpu()
+        .numpy(),
+        "current_vision_pos_embed": backbone_features["sam2_backbone_out"]["vision_pos_embeds"][-1]
+        .detach()
+        .to(torch.float32)
+        .cpu()
+        .numpy(),
+        "interactive_dense_pe": tracker.interactive_sam_prompt_encoder.get_dense_pe()
+        .detach()
+        .to(torch.float32)
+        .cpu()
+        .numpy(),
+        "propagation_dense_pe": tracker.get_propagation_dense_pe()
+        .detach()
+        .to(torch.float32)
+        .cpu()
+        .numpy(),
+        "interactivity_no_mem_embed": tracker.interactivity_no_mem_embed.detach()
+        .to(torch.float32)
+        .cpu()
+        .numpy(),
+        "maskmem_tpos_enc": tracker.maskmem_tpos_enc.detach().to(torch.float32).cpu().numpy(),
+        "output_valid_embed": tracker.output_valid_embed.detach().to(torch.float32).cpu().numpy(),
+        "output_invalid_embed": tracker.output_invalid_embed.detach().to(torch.float32).cpu().numpy(),
+        "multiplex_count": np.array([tracker.multiplex_count], dtype=np.int64),
+        "num_maskmem": np.array([tracker.num_maskmem], dtype=np.int64),
+        "max_obj_ptrs": np.array([tracker.max_obj_ptrs_in_encoder], dtype=np.int64),
+        "image_size": np.array([tracker.image_size], dtype=np.int64),
+        "sigmoid_scale_for_mem_enc": np.array(
+            [float(tracker.sigmoid_scale_for_mem_enc)],
+            dtype=np.float32,
+        ),
+        "sigmoid_bias_for_mem_enc": np.array(
+            [float(tracker.sigmoid_bias_for_mem_enc)],
+            dtype=np.float32,
+        ),
+        "object_score_logit_threshold": np.array(
+            [float(tracker.object_score_logit_threshold)],
+            dtype=np.float32,
+        ),
+    }
+    if tracker.no_obj_embed_spatial is not None:
+        constants["no_obj_embed_spatial"] = (
+            tracker.no_obj_embed_spatial.detach().to(torch.float32).cpu().numpy()
+        )
+
+    constants_path = outdir / variant.filename("sam31_constants.npz")
+    np.savez(constants_path, **constants)
+    print(f"[INFO] Saved SAM 3.1 constants [{variant.token or 'default'}]: {constants_path}")
+
+
+def _save_sam31_manifest(
+    outdir: Path,
+    checkpoint_path: Path,
+    variant,
+) -> None:
+    manifest = {
+        "version": "sam3.1",
+        "checkpoint": str(checkpoint_path),
+        "precision": variant.precision,
+        "files": {
+            "interactive_decoder": variant.filename("interactive_decoder.onnx"),
+            "propagation_decoder": variant.filename("propagation_decoder.onnx"),
+            "memory_encoder": variant.filename("memory_encoder.onnx"),
+            "memory_attention_core": variant.filename("memory_attention_core.onnx"),
+            "constants": variant.filename("sam31_constants.npz"),
+        },
+        "notes": [
+            "This bundle exports SAM 3.1 tracker components only.",
+            "The image encoder ONNX export remains disabled in this repo.",
+            "memory_attention_core.onnx expects token-space inputs with any object-pointer slots already padded into memory_image_tokens and memory_image_pos.",
+        ],
+    }
+    manifest_path = outdir / variant.filename("sam31_export_info.json")
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[INFO] Saved SAM 3.1 manifest [{variant.token or 'default'}]: {manifest_path}")
+
+
 def main(args) -> None:
     sam3_repo = Path(args.sam3_repo).resolve() if args.sam3_repo else _default_sam3_repo()
     if not sam3_repo.exists():
@@ -257,44 +460,76 @@ def main(args) -> None:
     _add_import_paths(sam3_repo)
     _install_optional_sam3_stubs()
 
-    from src.modules import ImageDecoder, MemAttention, MemEncoder
-    from src.utils import (
-        export_image_decoder,
-        export_memory_attention,
-        export_memory_encoder,
-    )
-
-    outdir = Path(args.outdir).resolve()
+    outdir = Path(args.outdir).resolve() if args.outdir else _default_outdir_for_version(args.version)
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] SAM3 repo   : {sam3_repo}")
+    print(f"[INFO] Version     : {args.version}")
     print(f"[INFO] Output dir  : {outdir}")
     if args.checkpoint:
         print(f"[INFO] Checkpoint  : {Path(args.checkpoint).resolve()}")
     else:
         print("[INFO] Checkpoint  : Hugging Face cache/download")
 
-    model = _build_model(args)
-
-    decoder = ImageDecoder(model).eval().cpu()
-    mem_attn = MemAttention(model).eval().cpu()
-    mem_enc = MemEncoder(model).eval().cpu()
-
     precisions = _parse_csv(args.precisions)
-    export_variants = _build_export_variants(model, precisions)
-    if not export_variants:
-        raise SystemExit("No export precisions were selected.")
 
-    print(
-        "[INFO] Exports     : "
-        + ", ".join(variant.token or "default" for variant in export_variants)
-    )
+    if args.version == "sam3":
+        from src.modules import ImageDecoder, MemAttention, MemEncoder
+        from src.utils import (
+            export_image_decoder,
+            export_memory_attention,
+            export_memory_encoder,
+        )
 
-    for variant in export_variants:
-        export_image_decoder(decoder, str(outdir), variant)
-        export_memory_attention(mem_attn, str(outdir), variant)
-        export_memory_encoder(mem_enc, str(outdir), variant)
-        _save_video_constants(model, outdir, variant)
+        model = _build_sam3_model(args)
+        decoder = ImageDecoder(model).eval().cpu()
+        mem_attn = MemAttention(model).eval().cpu()
+        mem_enc = MemEncoder(model).eval().cpu()
+        export_variants = _build_sam3_export_variants(model, precisions)
+
+        print(
+            "[INFO] Exports     : "
+            + ", ".join(variant.token or "default" for variant in export_variants)
+        )
+
+        for variant in export_variants:
+            export_image_decoder(decoder, str(outdir), variant)
+            export_memory_attention(mem_attn, str(outdir), variant)
+            export_memory_encoder(mem_enc, str(outdir), variant)
+            _save_video_constants(model, outdir, variant)
+    else:
+        from src.sam31_modules import (
+            SAM31InteractiveDecoder,
+            SAM31MemoryAttentionCore,
+            SAM31MemoryEncoder,
+            SAM31PropagationDecoder,
+        )
+        from src.utils import (
+            export_sam31_interactive_decoder,
+            export_sam31_memory_attention_core,
+            export_sam31_memory_encoder,
+            export_sam31_propagation_decoder,
+        )
+
+        tracker, checkpoint_path = _build_sam31_tracker(args)
+        interactive_decoder = SAM31InteractiveDecoder(tracker).eval().cpu()
+        propagation_decoder = SAM31PropagationDecoder(tracker).eval().cpu()
+        memory_encoder = SAM31MemoryEncoder(tracker).eval().cpu()
+        memory_attention_core = SAM31MemoryAttentionCore(tracker).eval().cpu()
+        export_variants = _build_sam31_export_variants(precisions)
+
+        print(
+            "[INFO] Exports     : "
+            + ", ".join(variant.token or "default" for variant in export_variants)
+        )
+
+        for variant in export_variants:
+            export_sam31_interactive_decoder(interactive_decoder, str(outdir), variant)
+            export_sam31_propagation_decoder(propagation_decoder, str(outdir), variant)
+            export_sam31_memory_encoder(memory_encoder, str(outdir), variant)
+            export_sam31_memory_attention_core(memory_attention_core, str(outdir), variant)
+            _save_sam31_constants(tracker, outdir, variant)
+            _save_sam31_manifest(outdir, checkpoint_path, variant)
 
     print("[INFO] Export complete.")
 
@@ -302,17 +537,23 @@ def main(args) -> None:
 if __name__ == "__main__":
     _configure_console_encoding()
     parser = argparse.ArgumentParser(
-        description="Export SAM3 tracker-only video modules to ONNX."
+        description="Export SAM3 or SAM 3.1 video modules to ONNX."
+    )
+    parser.add_argument(
+        "--version",
+        default="sam3",
+        choices=("sam3", "sam3.1"),
+        help="Model family to export. Use sam3.1 for the multiplex tracker-only bundle.",
     )
     parser.add_argument(
         "--checkpoint",
         default="",
-        help="Optional local SAM3 checkpoint (.pt).",
+        help="Optional local checkpoint (.pt). For --version sam3.1 this should be the merged sam3.1_multiplex.pt checkpoint.",
     )
     parser.add_argument(
         "--load-from-hf",
         action="store_true",
-        help="Load the official SAM3 checkpoint from Hugging Face instead of --checkpoint.",
+        help="Load the official checkpoint from Hugging Face instead of --checkpoint.",
     )
     parser.add_argument(
         "--sam3-repo",
@@ -321,12 +562,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--outdir",
-        default=str(_repo_root() / "checkpoints" / "sam3" / "video_onnx"),
-        help="Directory where the exported ONNX files will be written.",
+        default="",
+        help="Directory where the exported ONNX files will be written. Defaults to checkpoints/sam3/video_onnx for sam3 and checkpoints/sam3/sam31_video_onnx for sam3.1.",
     )
     parser.add_argument(
         "--precisions",
         default="fp32,fp16",
-        help="Comma-separated precisions to emit for the internal single/multi tracker bundles: fp32 and/or fp16.",
+        help="Comma-separated precisions to emit. sam3 keeps single/multi tracker variants; sam3.1 emits one bundle per selected precision.",
     )
     main(parser.parse_args())
