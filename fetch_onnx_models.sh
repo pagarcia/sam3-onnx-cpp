@@ -2,8 +2,9 @@
 # sam3-onnx-cpp/fetch_onnx_models.sh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ID="onnx-community/sam3-tracker-ONNX"
-OUTDIR="checkpoints/sam3"
+OUTDIR="${SCRIPT_DIR}/checkpoints/sam3"
 
 VARIANT="${1:-fp32}"   # fp32 | fp16 | clean
 

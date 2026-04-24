@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -50,6 +51,16 @@ struct LoadedNpyArray {
     std::vector<int64_t> shape;
     std::vector<uint8_t> bytes;
 };
+
+std::string lowerAsciiCopy(std::string value)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
 
 std::string trimCopy(const std::string& value)
 {
@@ -300,6 +311,61 @@ void ortThrowIf(OrtStatus* status, const char* what)
     throw std::runtime_error(stream.str());
 }
 
+bool envBool(const char* name, bool fallback)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+
+    const std::string lowered = lowerAsciiCopy(value);
+    if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+        return false;
+    }
+    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+        return true;
+    }
+    return fallback;
+}
+
+int envInt(const char* name, int fallback, int minValue = 1)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+
+    try {
+        return std::max(minValue, std::stoi(value));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+GraphOptimizationLevel resolveGraphOptimizationLevel(const std::string& device,
+                                                     GraphOptimizationLevel fallback)
+{
+    const char* value = std::getenv("SAM3_ORT_GRAPH_OPT");
+    if (!value || !*value) {
+        return fallback;
+    }
+
+    const std::string lowered = lowerAsciiCopy(value);
+    if (lowered == "disable" || lowered == "disabled" || lowered == "none" || lowered == "off") {
+        return GraphOptimizationLevel::ORT_DISABLE_ALL;
+    }
+    if (lowered == "basic") {
+        return GraphOptimizationLevel::ORT_ENABLE_BASIC;
+    }
+    if (lowered == "extended") {
+        return GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
+    }
+    if (lowered == "all" || lowered == "full" || lowered == "aggressive") {
+        return GraphOptimizationLevel::ORT_ENABLE_ALL;
+    }
+    return device == "cpu" ? GraphOptimizationLevel::ORT_ENABLE_ALL : fallback;
+}
+
 std::vector<int64_t> concreteEncoderInputShape(const std::vector<int64_t>& modelShape)
 {
     std::vector<int64_t> concreteShape = modelShape;
@@ -436,13 +502,26 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
                                const std::string& device)
 {
     const int safeThreads = std::max(1, threadsNumber);
+    const int safeInterOpThreads = envInt("SAM3_ORT_INTER_OP_THREADS", 1, 1);
+    const bool enableCpuArena = envBool("SAM3_ORT_CPU_ARENA", true);
+    const bool enableMemPattern = envBool("SAM3_ORT_MEM_PATTERN", true);
     options.SetIntraOpNumThreads(safeThreads);
-    options.SetInterOpNumThreads(1);
+    options.SetInterOpNumThreads(safeInterOpThreads);
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-    options.SetGraphOptimizationLevel(optLevel);
+    options.SetGraphOptimizationLevel(resolveGraphOptimizationLevel(device, optLevel));
+    if (enableCpuArena) {
+        options.EnableCpuMemArena();
+    } else {
+        options.DisableCpuMemArena();
+    }
+    if (enableMemPattern) {
+        options.EnableMemPattern();
+    } else {
+        options.DisableMemPattern();
+    }
 
     ortThrowIf(
-        OrtSessionOptionsAppendExecutionProvider_CPU(options, 1),
+        OrtSessionOptionsAppendExecutionProvider_CPU(options, enableCpuArena ? 1 : 0),
         "Append CPU EP failed");
 
     if (device.rfind("cuda:", 0) == 0) {
@@ -584,15 +663,17 @@ bool SAM3::initializeImage(const std::string& encoderPath,
 
     Ort::SessionOptions encoderOptions;
     Ort::SessionOptions decoderOptions;
+    const GraphOptimizationLevel optLevel =
+        device == "cpu" ? GraphOptimizationLevel::ORT_ENABLE_ALL : GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
     setupSessionOptions(
         encoderOptions,
         threadsNumber,
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+        optLevel,
         device);
     setupSessionOptions(
         decoderOptions,
         threadsNumber,
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+        optLevel,
         device);
 
     if (!initializeNamedSession(
@@ -748,26 +829,28 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
     Ort::SessionOptions decoderOptions;
     Ort::SessionOptions memoryAttentionOptions;
     Ort::SessionOptions memoryEncoderOptions;
+    const GraphOptimizationLevel optLevel =
+        device == "cpu" ? GraphOptimizationLevel::ORT_ENABLE_ALL : GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
 
     setupSessionOptions(
         encoderOptions,
         threadsNumber,
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+        optLevel,
         device);
     setupSessionOptions(
         decoderOptions,
         threadsNumber,
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+        optLevel,
         device);
     setupSessionOptions(
         memoryAttentionOptions,
         threadsNumber,
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+        optLevel,
         device);
     setupSessionOptions(
         memoryEncoderOptions,
         threadsNumber,
-        GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+        optLevel,
         device);
 
     if (!initializeNamedSession(

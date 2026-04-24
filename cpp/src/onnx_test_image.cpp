@@ -267,10 +267,11 @@ int runOnnxTestImage(int argc, char** argv)
     std::string pointsSpec;
     std::string boxSpec;
     std::string saveOverlayPath;
-    int threads = static_cast<int>(std::thread::hardware_concurrency());
-    if (threads <= 0) {
-        threads = 4;
+    int hardwareThreads = static_cast<int>(std::thread::hardware_concurrency());
+    if (hardwareThreads <= 0) {
+        hardwareThreads = 4;
     }
+    int threads = hardwareThreads;
     bool threadsExplicit = false;
     bool noGui = false;
     PromptMode promptMode = PromptMode::SeedPoints;
@@ -342,7 +343,7 @@ int runOnnxTestImage(int argc, char** argv)
     const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
     std::string device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
     if (!threadsExplicit) {
-        threads = ArtifactResolver::preferredRuntimeThreads(threads, device);
+        threads = ArtifactResolver::preferredRuntimeThreads(hardwareThreads, device);
     }
 
     const auto selection = ArtifactResolver::resolveImageRuntimePaths(encoderPath, decoderPath, device);
@@ -352,12 +353,17 @@ int runOnnxTestImage(int argc, char** argv)
               << "[INFO] mode=" << selection.mode << '\n'
               << "[INFO] device=" << device << '\n'
               << "[INFO] threads=" << threads << '\n';
+    if (device == "cpu" && ArtifactResolver::lowerCopy(selection.encoderPath).find("fp16") != std::string::npos) {
+        std::cout
+            << "[WARN] CPU runtime is using the fp16 vision encoder fallback. "
+            << "A fp32 or int8 encoder artifact will be much faster on CPU.\n";
+    }
 
     SAM3 sam;
     auto initializeOnDevice = [&](const std::string& initDevice) -> bool {
         const int initThreads = threadsExplicit
             ? threads
-            : ArtifactResolver::preferredRuntimeThreads(threads, initDevice);
+            : ArtifactResolver::preferredRuntimeThreads(hardwareThreads, initDevice);
         return sam.initializeImage(selection.encoderPath, selection.decoderPath, initThreads, initDevice);
     };
 

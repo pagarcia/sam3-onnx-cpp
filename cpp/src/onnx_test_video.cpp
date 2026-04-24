@@ -478,10 +478,11 @@ int runOnnxTestVideo(int argc, char** argv)
     std::string pointsSpec;
     std::string boxSpec;
     std::string outputPath;
-    int threads = static_cast<int>(std::thread::hardware_concurrency());
-    if (threads <= 0) {
-        threads = 4;
+    int hardwareThreads = static_cast<int>(std::thread::hardware_concurrency());
+    if (hardwareThreads <= 0) {
+        hardwareThreads = 4;
     }
+    int threads = hardwareThreads;
     bool threadsExplicit = false;
     int maxFrames = 0;
     PromptMode promptMode = PromptMode::SeedPoints;
@@ -555,7 +556,7 @@ int runOnnxTestVideo(int argc, char** argv)
     const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
     std::string device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
     if (!threadsExplicit) {
-        threads = ArtifactResolver::preferredRuntimeThreads(threads, device);
+        threads = ArtifactResolver::preferredRuntimeThreads(hardwareThreads, device);
     }
 
     const auto previewSelection = ArtifactResolver::resolveVideoRuntimePaths(
@@ -576,12 +577,17 @@ int runOnnxTestVideo(int argc, char** argv)
               << "       precision   = " << previewSelection.precision << '\n'
               << "       graph       = " << previewSelection.graphProfile << '\n'
               << "       device      = " << device << '\n';
+    if (device == "cpu" && ArtifactResolver::lowerCopy(previewSelection.encoderPath).find("fp16") != std::string::npos) {
+        std::cout
+            << "[WARN] CPU runtime is using the fp16 vision encoder fallback. "
+            << "A fp32 or int8 encoder artifact will be much faster on CPU.\n";
+    }
 
     SAM3 previewSam;
     auto initializePreviewOnDevice = [&](const std::string& initDevice) -> bool {
         const int initThreads = threadsExplicit
             ? threads
-            : ArtifactResolver::preferredRuntimeThreads(threads, initDevice);
+            : ArtifactResolver::preferredRuntimeThreads(hardwareThreads, initDevice);
         return previewSam.initializeVideo(
             previewSelection.encoderPath,
             previewSelection.decoderPath,
@@ -680,7 +686,7 @@ int runOnnxTestVideo(int argc, char** argv)
     auto initializeRuntimeOnDevice = [&](const std::string& initDevice) -> bool {
         const int initThreads = threadsExplicit
             ? threads
-            : ArtifactResolver::preferredRuntimeThreads(threads, initDevice);
+            : ArtifactResolver::preferredRuntimeThreads(hardwareThreads, initDevice);
         return runtimeSam.initializeVideo(
             runtimeSelection.encoderPath,
             runtimeSelection.decoderPath,

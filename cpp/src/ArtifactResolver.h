@@ -75,8 +75,11 @@ inline int preferredRuntimeThreads(int fallback, const std::string& device)
         }
     }
 
-    if (isLowCostCpuProfile() || device == "cpu") {
+    if (isLowCostCpuProfile()) {
         return std::max(1, std::min(fallback, 4));
+    }
+    if (device == "cpu") {
+        return std::max(1, fallback > 1 ? fallback - 1 : fallback);
     }
     return std::max(1, fallback);
 }
@@ -179,18 +182,113 @@ inline bool hasExternalDataSidecar(const std::filesystem::path& path)
     return pathExists(path) && pathExists(path.string() + "_data");
 }
 
-inline std::vector<std::string> preferredImagePrecisions(const std::string& device)
+inline bool hasUsableImageArtifact(const std::filesystem::path& path,
+                                   const std::string& variant)
 {
-    const std::string requested = lowerCopy(std::getenv("SAM3_ONNX_VARIANT") ? std::getenv("SAM3_ONNX_VARIANT") : "auto");
-    if (requested == "fp16") {
-        return {"fp16", "fp32"};
+    if (!pathExists(path)) {
+        return false;
+    }
+
+    // Downloaded fp32/fp16 Hugging Face image models are split across
+    // .onnx + .onnx_data, while our CPU int8 quantized models are emitted
+    // as a single embedded .onnx file.
+    if (variant == "int8") {
+        return true;
+    }
+
+    return pathExists(path.string() + "_data");
+}
+
+inline std::string preferredEncoderVariant()
+{
+    const char* value = std::getenv("SAM3_ORT_ENCODER_VARIANT");
+    if (!value || !*value) {
+        value = std::getenv("SAM3_ONNX_VARIANT");
+    }
+    if (!value || !*value) {
+        return "auto";
+    }
+
+    const std::string requested = lowerCopy(value);
+    if (requested == "int8" || requested == "fp32" || requested == "fp16" || requested == "auto") {
+        return requested;
+    }
+    return "auto";
+}
+
+inline std::string preferredDecoderVariant()
+{
+    const char* value = std::getenv("SAM3_ORT_DECODER_VARIANT");
+    if (!value || !*value) {
+        value = std::getenv("SAM3_ONNX_VARIANT");
+    }
+    if (!value || !*value) {
+        return "auto";
+    }
+
+    const std::string requested = lowerCopy(value);
+    if (requested == "int8" || requested == "fp32" || requested == "fp16" || requested == "auto") {
+        return requested;
+    }
+    return "auto";
+}
+
+inline std::vector<std::string> preferredImageEncoderVariants(const std::string& device)
+{
+    const std::string requested = preferredEncoderVariant();
+    if (requested == "int8") {
+        return {"int8", "fp32", "fp16"};
     }
     if (requested == "fp32") {
-        return {"fp32", "fp16"};
+        return {"fp32", "int8", "fp16"};
+    }
+    if (requested == "fp16") {
+        return {"fp16", "fp32", "int8"};
     }
     return device == "cpu"
-        ? std::vector<std::string>{"fp32", "fp16"}
-        : std::vector<std::string>{"fp16", "fp32"};
+        ? std::vector<std::string>{"int8", "fp32", "fp16"}
+        : std::vector<std::string>{"fp16", "fp32", "int8"};
+}
+
+inline std::vector<std::string> preferredImageDecoderVariants(const std::string& device)
+{
+    const std::string requested = preferredDecoderVariant();
+    if (requested == "int8") {
+        return {"int8", "fp32", "fp16"};
+    }
+    if (requested == "fp32") {
+        return {"fp32", "int8", "fp16"};
+    }
+    if (requested == "fp16") {
+        return {"fp16", "fp32", "int8"};
+    }
+    return device == "cpu"
+        ? std::vector<std::string>{"int8", "fp32", "fp16"}
+        : std::vector<std::string>{"fp16", "fp32", "int8"};
+}
+
+inline std::filesystem::path imageEncoderPathForVariant(const std::filesystem::path& onnxDir,
+                                                        const std::string& variant)
+{
+    if (variant == "int8") {
+        return onnxDir / "vision_encoder.int8.onnx";
+    }
+    if (variant == "fp16") {
+        return onnxDir / "vision_encoder_fp16.onnx";
+    }
+    return onnxDir / "vision_encoder.onnx";
+}
+
+inline std::filesystem::path imageDecoderPathForVariant(const std::filesystem::path& onnxDir,
+                                                        const std::string& variant)
+{
+    if (variant == "int8") {
+        return onnxDir / "prompt_encoder_mask_decoder.int8.onnx";
+    }
+    if (variant == "fp16") {
+        return onnxDir / "prompt_encoder_mask_decoder_fp16.onnx";
+    }
+    return onnxDir / "prompt_encoder_mask_decoder.onnx";
 }
 
 inline std::vector<std::string> preferredTrackerPrecisions(const std::string& device)
@@ -217,37 +315,52 @@ inline ImageRuntimeSelection resolveImageRuntimePaths(const std::string& encoder
     const auto onnxDir = defaultImageOnnxDir();
 
     ImageRuntimeSelection fallback;
-    fallback.encoderPath = normalizePath(candidatePath(encoderPath)).string();
-    fallback.decoderPath = normalizePath(candidatePath(decoderPath)).string();
+    fallback.encoderPath = encoderPath.empty() ? std::string() : normalizePath(candidatePath(encoderPath)).string();
+    fallback.decoderPath = decoderPath.empty() ? std::string() : normalizePath(candidatePath(decoderPath)).string();
     fallback.precision = "manual";
     fallback.mode = "manual";
 
-    if (encoderPath.empty() || decoderPath.empty()) {
-        for (const auto& precision : preferredImagePrecisions(device)) {
-            const std::filesystem::path encoderCandidate =
-                onnxDir / (precision == "fp16" ? "vision_encoder_fp16.onnx" : "vision_encoder.onnx");
-            const std::filesystem::path decoderCandidate =
-                onnxDir / (precision == "fp16"
-                    ? "prompt_encoder_mask_decoder_fp16.onnx"
-                    : "prompt_encoder_mask_decoder.onnx");
-
-            if (hasExternalDataSidecar(encoderCandidate) && hasExternalDataSidecar(decoderCandidate)) {
-                ImageRuntimeSelection selection;
-                selection.encoderPath = normalizePath(encoderCandidate).string();
-                selection.decoderPath = normalizePath(decoderCandidate).string();
-                selection.precision = precision;
-                selection.mode = "resolved";
-                if (!encoderPath.empty()) {
-                    selection.encoderPath = normalizePath(candidatePath(encoderPath)).string();
-                    selection.mode = "manual-encoder";
-                }
-                if (!decoderPath.empty()) {
-                    selection.decoderPath = normalizePath(candidatePath(decoderPath)).string();
-                    selection.mode = selection.mode == "resolved" ? "manual-decoder" : selection.mode + "+decoder";
-                }
-                return selection;
+    std::filesystem::path resolvedEncoderCandidate;
+    std::string resolvedEncoderVariant = "manual";
+    if (encoderPath.empty()) {
+        for (const auto& variant : preferredImageEncoderVariants(device)) {
+            const auto candidate = imageEncoderPathForVariant(onnxDir, variant);
+            if (hasUsableImageArtifact(candidate, variant)) {
+                resolvedEncoderCandidate = candidate;
+                resolvedEncoderVariant = variant;
+                break;
             }
         }
+    } else {
+        resolvedEncoderCandidate = candidatePath(encoderPath);
+    }
+
+    std::filesystem::path resolvedDecoderCandidate;
+    std::string resolvedDecoderVariant = "manual";
+    if (decoderPath.empty()) {
+        for (const auto& variant : preferredImageDecoderVariants(device)) {
+            const auto candidate = imageDecoderPathForVariant(onnxDir, variant);
+            if (hasUsableImageArtifact(candidate, variant)) {
+                resolvedDecoderCandidate = candidate;
+                resolvedDecoderVariant = variant;
+                break;
+            }
+        }
+    } else {
+        resolvedDecoderCandidate = candidatePath(decoderPath);
+    }
+
+    if (!resolvedEncoderCandidate.empty() && !resolvedDecoderCandidate.empty()) {
+        ImageRuntimeSelection selection;
+        selection.encoderPath = normalizePath(resolvedEncoderCandidate).string();
+        selection.decoderPath = normalizePath(resolvedDecoderCandidate).string();
+        selection.precision = resolvedEncoderVariant == resolvedDecoderVariant
+            ? resolvedEncoderVariant
+            : ("enc=" + resolvedEncoderVariant + ",dec=" + resolvedDecoderVariant);
+        selection.mode = (!encoderPath.empty() && !decoderPath.empty())
+            ? "manual"
+            : (!encoderPath.empty() ? "manual-encoder" : (!decoderPath.empty() ? "manual-decoder" : "resolved"));
+        return selection;
     }
 
     return fallback;

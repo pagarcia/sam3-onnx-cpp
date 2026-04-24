@@ -3,7 +3,8 @@ REM sam3-onnx-cpp/fetch_onnx_models.bat
 setlocal EnableExtensions
 
 set "REPO_ID=onnx-community/sam3-tracker-ONNX"
-set "OUTDIR=checkpoints\sam3"
+set "SCRIPT_DIR=%~dp0"
+set "OUTDIR=%SCRIPT_DIR%checkpoints\sam3"
 
 REM Optional arg: fp32 (default) | fp16 | clean
 set "VARIANT=%~1"
@@ -47,4 +48,3 @@ if errorlevel 1 (
 )
 
 echo [OK] Done.
-pause
