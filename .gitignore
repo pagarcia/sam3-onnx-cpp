@@ -14,6 +14,19 @@ checkpoints/
 # Distribution / packaging
 .Python
 build/
+/cpp/build*/
+/cpp/.vs/
+/cpp/CMakeCache.txt
+/cpp/CMakeFiles/
+/cpp/Testing/
+/cpp/cmake_install.cmake
+/cpp/CPackConfig.cmake
+/cpp/CPackSourceConfig.cmake
+/cpp/*.sln
+/cpp/*.vcxproj
+/cpp/*.vcxproj.filters
+/cpp/*.vcxproj.user
+/cpp/Info.plist.in
 develop-eggs/
 dist/
 downloads/
