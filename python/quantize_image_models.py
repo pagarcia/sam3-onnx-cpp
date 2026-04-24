@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -40,10 +42,19 @@ def external_data_path(model_path: Path) -> Path:
     return model_path.with_name(model_path.name + "_data")
 
 
+def remove_path(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
 def remove_artifact_pair(model_path: Path) -> None:
     for candidate in (model_path, external_data_path(model_path)):
         if candidate.exists():
-            candidate.unlink()
+            remove_path(candidate)
 
 
 def ensure_input_ready(model_path: Path) -> None:
@@ -62,14 +73,19 @@ def ensure_input_ready(model_path: Path) -> None:
 
 def preprocess_model(input_path: Path, workdir: Path) -> Path:
     output_path = workdir / input_path.name
-    quant_pre_process(
-        input_model=input_path,
-        output_model_path=output_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        external_data_location=output_path.name + "_data",
-        external_data_size_threshold=0,
-    )
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(workdir)
+        quant_pre_process(
+            input_model=input_path,
+            output_model_path=output_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            external_data_location=output_path.name + "_data",
+            external_data_size_threshold=0,
+        )
+    finally:
+        os.chdir(previous_cwd)
     return output_path
 
 
@@ -77,7 +93,8 @@ def quantize_model(input_path: Path,
                    output_path: Path,
                    model_kind: str,
                    do_preprocess: bool,
-                   op_types: list[str]) -> None:
+                   op_types: list[str],
+                   allow_preprocess_fallback: bool = True) -> dict[str, object]:
     ensure_input_ready(input_path)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +102,19 @@ def quantize_model(input_path: Path,
 
     with tempfile.TemporaryDirectory(prefix=f"sam3_quant_{input_path.stem}_") as tmp:
         workdir = Path(tmp)
-        model_for_quant = preprocess_model(input_path, workdir) if do_preprocess else input_path
+        preprocess_used = False
+        model_for_quant = input_path
+        if do_preprocess:
+            try:
+                model_for_quant = preprocess_model(input_path, workdir)
+                preprocess_used = True
+            except Exception as exc:
+                if not allow_preprocess_fallback:
+                    raise
+                print(
+                    f"[WARN] Preprocess failed for {input_path.name}; "
+                    f"falling back to direct quantization: {exc}"
+                )
 
         quantize_dynamic(
             model_input=model_for_quant,
@@ -99,6 +128,11 @@ def quantize_model(input_path: Path,
                 "MatMulConstBOnly": True,
             },
         )
+    return {
+        "preprocess_requested": do_preprocess,
+        "preprocess_used": preprocess_used,
+        "op_types": list(op_types),
+    }
 
 
 def main() -> None:
@@ -153,7 +187,7 @@ def main() -> None:
         print(f"       input  = {input_path}")
         print(f"       output = {output_path}")
         print(f"       ops    = {','.join(op_types)}")
-        quantize_model(
+        result = quantize_model(
             input_path,
             output_path,
             target,
@@ -165,6 +199,11 @@ def main() -> None:
         print(f"[OK] Wrote {output_path}")
         if sidecar.exists():
             print(f"[OK] Wrote {sidecar}")
+        if result["preprocess_requested"]:
+            print(
+                "[INFO] preprocess_used="
+                + ("yes" if result["preprocess_used"] else "no (fell back to direct quantization)")
+            )
 
 
 if __name__ == "__main__":
