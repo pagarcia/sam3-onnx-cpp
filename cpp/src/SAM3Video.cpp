@@ -341,22 +341,24 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         std::vector<Ort::Value> decoderInputs;
         double attnTimeMs = 0.0;
         bool isMaskFromPoints = conditioningFrame;
+        std::vector<float> pointCoordsStorage;
+        std::vector<int32_t> pointLabelsStorage;
+        std::vector<float> imageEmbedStorage;
+        std::vector<Ort::Value> memoryAttentionOutputs;
 
         if (conditioningFrame) {
-            std::vector<float> pointCoords;
-            std::vector<int32_t> pointLabels;
-            buildTrackerPromptInputs(prompts, originalImageSize, &pointCoords, &pointLabels);
-            if (pointLabels.empty()) {
+            buildTrackerPromptInputs(prompts, originalImageSize, &pointCoordsStorage, &pointLabelsStorage);
+            if (pointLabelsStorage.empty()) {
                 std::cerr << "[WARN] inferMultiFrame => conditioning frame has no prompt tensors.\n";
                 return Image<float>(originalImageSize.width, originalImageSize.height, 1);
             }
 
-            const std::vector<float> imageEmbed = buildNoMemoryImageEmbedding(currentVisionFeat);
-            const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabels.size()), 2};
-            const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabels.size())};
-            decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoords, pointCoordsShape));
-            decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabels, pointLabelsShape));
-            decoderInputs.push_back(createTensor<float>(m_memoryInfo, imageEmbed, currentVisionShape));
+            imageEmbedStorage = buildNoMemoryImageEmbedding(currentVisionFeat);
+            const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabelsStorage.size()), 2};
+            const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabelsStorage.size())};
+            decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, pointCoordsShape));
+            decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, pointLabelsShape));
+            decoderInputs.push_back(createTensor<float>(m_memoryInfo, imageEmbedStorage, currentVisionShape));
         } else {
             buildMemoryInputBuffers(m_segmentFrameIndex);
             const auto attnStart = std::chrono::steady_clock::now();
@@ -403,7 +405,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 return Image<float>();
             }
 
-            auto memoryAttentionOutputs = std::move(std::get<0>(memoryAttentionResult));
+            memoryAttentionOutputs = std::move(std::get<0>(memoryAttentionResult));
             if (memoryAttentionOutputs.size() <= static_cast<size_t>(m_memoryAttentionFusedFeatIndex)) {
                 std::cerr << "[ERROR] inferMultiFrame => memory attention returned no fused_feat output.\n";
                 return Image<float>();
@@ -411,10 +413,10 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
 
             Ort::Value& fusedFeat = memoryAttentionOutputs[static_cast<size_t>(m_memoryAttentionFusedFeatIndex)];
             const auto fusedShape = fusedFeat.GetTensorTypeAndShapeInfo().GetShape();
-            std::vector<float> emptyCoords;
-            std::vector<int32_t> emptyLabels;
-            decoderInputs.push_back(createTensor<float>(m_memoryInfo, emptyCoords, {1, 0, 2}));
-            decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, emptyLabels, {1, 0}));
+            pointCoordsStorage.clear();
+            pointLabelsStorage.clear();
+            decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, {1, 0, 2}));
+            decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, {1, 0}));
             decoderInputs.push_back(createTensorView<float>(
                 m_memoryInfo,
                 fusedFeat.GetTensorMutableData<float>(),

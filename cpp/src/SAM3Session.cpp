@@ -95,6 +95,18 @@ uint32_t readUInt32LE(const std::vector<uint8_t>& bytes, size_t offset)
         | (static_cast<uint32_t>(bytes[offset + 3]) << 24);
 }
 
+uint64_t readUInt64LE(const std::vector<uint8_t>& bytes, size_t offset)
+{
+    return static_cast<uint64_t>(bytes[offset])
+        | (static_cast<uint64_t>(bytes[offset + 1]) << 8)
+        | (static_cast<uint64_t>(bytes[offset + 2]) << 16)
+        | (static_cast<uint64_t>(bytes[offset + 3]) << 24)
+        | (static_cast<uint64_t>(bytes[offset + 4]) << 32)
+        | (static_cast<uint64_t>(bytes[offset + 5]) << 40)
+        | (static_cast<uint64_t>(bytes[offset + 6]) << 48)
+        | (static_cast<uint64_t>(bytes[offset + 7]) << 56);
+}
+
 std::vector<uint8_t> readBinaryFile(const std::string& path)
 {
     std::ifstream input(path, std::ios::binary);
@@ -176,6 +188,73 @@ std::vector<int64_t> parseHeaderShape(const std::string& header)
     return shape;
 }
 
+size_t elementSizeFromDescr(const std::string& descr)
+{
+    size_t digitStart = descr.size();
+    while (digitStart > 0 && std::isdigit(static_cast<unsigned char>(descr[digitStart - 1])) != 0) {
+        --digitStart;
+    }
+    if (digitStart >= descr.size()) {
+        throw std::runtime_error("Could not determine NPY element size from descr: " + descr);
+    }
+    return static_cast<size_t>(std::stoull(descr.substr(digitStart)));
+}
+
+size_t elementCountFromShape(const std::vector<int64_t>& shape)
+{
+    size_t count = 1;
+    for (const int64_t dim : shape) {
+        if (dim < 0) {
+            throw std::runtime_error("NPY shape has a negative dimension.");
+        }
+        count *= static_cast<size_t>(dim);
+    }
+    return count;
+}
+
+void reorderFortranBytesToCOrder(const std::vector<int64_t>& shape,
+                                 size_t elementSize,
+                                 std::vector<uint8_t>* bytes)
+{
+    if (!bytes || shape.size() <= 1) {
+        return;
+    }
+
+    const size_t elementCount = elementCountFromShape(shape);
+    if (elementCount == 0) {
+        bytes->clear();
+        return;
+    }
+    if (elementSize == 0 || bytes->size() != elementCount * elementSize) {
+        throw std::runtime_error("NPY payload size does not match shape and element size.");
+    }
+
+    std::vector<uint8_t> reordered(bytes->size());
+    std::vector<size_t> coords(shape.size(), 0);
+    for (size_t cIndex = 0; cIndex < elementCount; ++cIndex) {
+        size_t remaining = cIndex;
+        for (size_t dim = shape.size(); dim-- > 0;) {
+            const size_t extent = static_cast<size_t>(shape[dim]);
+            coords[dim] = remaining % extent;
+            remaining /= extent;
+        }
+
+        size_t fortranIndex = 0;
+        size_t fortranStride = 1;
+        for (size_t dim = 0; dim < shape.size(); ++dim) {
+            fortranIndex += coords[dim] * fortranStride;
+            fortranStride *= static_cast<size_t>(shape[dim]);
+        }
+
+        std::memcpy(
+            reordered.data() + cIndex * elementSize,
+            bytes->data() + fortranIndex * elementSize,
+            elementSize);
+    }
+
+    *bytes = std::move(reordered);
+}
+
 LoadedNpyArray parseNpyArray(const std::vector<uint8_t>& bytes)
 {
     if (bytes.size() < 10) {
@@ -209,9 +288,7 @@ LoadedNpyArray parseNpyArray(const std::vector<uint8_t>& bytes)
     const std::string header(
         reinterpret_cast<const char*>(bytes.data() + headerOffset),
         headerLength);
-    if (parseHeaderBoolValue(header, "fortran_order")) {
-        throw std::runtime_error("Fortran-ordered NPY arrays are not supported.");
-    }
+    const bool fortranOrder = parseHeaderBoolValue(header, "fortran_order");
 
     LoadedNpyArray array;
     array.descr = parseHeaderStringValue(header, "descr");
@@ -219,7 +296,61 @@ LoadedNpyArray parseNpyArray(const std::vector<uint8_t>& bytes)
 
     const size_t dataOffset = headerOffset + headerLength;
     array.bytes.assign(bytes.begin() + static_cast<ptrdiff_t>(dataOffset), bytes.end());
+    if (fortranOrder) {
+        reorderFortranBytesToCOrder(array.shape, elementSizeFromDescr(array.descr), &array.bytes);
+    }
     return array;
+}
+
+void applyZip64Sizes(const std::vector<uint8_t>& bytes,
+                     size_t extraFieldOffset,
+                     size_t extraFieldLength,
+                     bool needsUncompressedSize,
+                     bool needsCompressedSize,
+                     uint64_t* uncompressedSize,
+                     uint64_t* compressedSize)
+{
+    if (!uncompressedSize || !compressedSize) {
+        throw std::runtime_error("Invalid ZIP64 size output pointers.");
+    }
+    if (extraFieldOffset > bytes.size() || extraFieldLength > bytes.size() - extraFieldOffset) {
+        throw std::runtime_error("Truncated ZIP extra field.");
+    }
+
+    const size_t extraEnd = extraFieldOffset + extraFieldLength;
+    size_t cursor = extraFieldOffset;
+    while (cursor + 4 <= extraEnd) {
+        const uint16_t headerId = readUInt16LE(bytes, cursor);
+        const uint16_t dataSize = readUInt16LE(bytes, cursor + 2);
+        cursor += 4;
+        if (dataSize > extraEnd - cursor) {
+            throw std::runtime_error("Truncated ZIP extra field payload.");
+        }
+
+        if (headerId == 0x0001u) {
+            size_t valueOffset = cursor;
+            if (needsUncompressedSize) {
+                if (valueOffset + 8 > cursor + dataSize) {
+                    throw std::runtime_error("ZIP64 extra field is missing uncompressed size.");
+                }
+                *uncompressedSize = readUInt64LE(bytes, valueOffset);
+                valueOffset += 8;
+            }
+            if (needsCompressedSize) {
+                if (valueOffset + 8 > cursor + dataSize) {
+                    throw std::runtime_error("ZIP64 extra field is missing compressed size.");
+                }
+                *compressedSize = readUInt64LE(bytes, valueOffset);
+            }
+            return;
+        }
+
+        cursor += dataSize;
+    }
+
+    if (needsUncompressedSize || needsCompressedSize) {
+        throw std::runtime_error("ZIP64 extra field is required but was not found.");
+    }
 }
 
 std::map<std::string, LoadedNpyArray> loadNpzArchive(const std::string& path)
@@ -242,14 +373,32 @@ std::map<std::string, LoadedNpyArray> loadNpzArchive(const std::string& path)
         }
 
         const uint16_t compressionMethod = readUInt16LE(archiveBytes, offset + 8);
-        const uint32_t compressedSize = readUInt32LE(archiveBytes, offset + 18);
-        const uint32_t uncompressedSize = readUInt32LE(archiveBytes, offset + 22);
+        uint64_t compressedSize = readUInt32LE(archiveBytes, offset + 18);
+        uint64_t uncompressedSize = readUInt32LE(archiveBytes, offset + 22);
         const uint16_t fileNameLength = readUInt16LE(archiveBytes, offset + 26);
         const uint16_t extraFieldLength = readUInt16LE(archiveBytes, offset + 28);
         const size_t fileNameOffset = offset + 30;
-        const size_t dataOffset = fileNameOffset + fileNameLength + extraFieldLength;
+        const size_t extraFieldOffset = fileNameOffset + fileNameLength;
+        const size_t dataOffset = extraFieldOffset + extraFieldLength;
 
-        if (dataOffset + compressedSize > archiveBytes.size()) {
+        if (dataOffset > archiveBytes.size()) {
+            throw std::runtime_error("Truncated ZIP entry header in: " + path);
+        }
+
+        const bool needsCompressedSize = compressedSize == 0xFFFFFFFFull;
+        const bool needsUncompressedSize = uncompressedSize == 0xFFFFFFFFull;
+        if (needsCompressedSize || needsUncompressedSize) {
+            applyZip64Sizes(
+                archiveBytes,
+                extraFieldOffset,
+                extraFieldLength,
+                needsUncompressedSize,
+                needsCompressedSize,
+                &uncompressedSize,
+                &compressedSize);
+        }
+
+        if (compressedSize > archiveBytes.size() - dataOffset) {
             throw std::runtime_error("Truncated ZIP entry payload in: " + path);
         }
 
@@ -264,9 +413,10 @@ std::map<std::string, LoadedNpyArray> loadNpzArchive(const std::string& path)
         }
 
         if (fileName.size() > 4 && fileName.substr(fileName.size() - 4) == ".npy") {
+            const size_t payloadSize = static_cast<size_t>(compressedSize);
             std::vector<uint8_t> npyBytes(
                 archiveBytes.begin() + static_cast<ptrdiff_t>(dataOffset),
-                archiveBytes.begin() + static_cast<ptrdiff_t>(dataOffset + compressedSize));
+                archiveBytes.begin() + static_cast<ptrdiff_t>(dataOffset + payloadSize));
             arrays[fileName.substr(0, fileName.size() - 4)] = parseNpyArray(npyBytes);
         }
 
@@ -1313,13 +1463,49 @@ std::vector<float> SAM3::buildNoMemoryImageEmbedding(const Ort::Value& currentVi
     std::vector<int64_t> currentVisionShape;
     extractTensorData(currentVisionFeat, currentVisionValues, currentVisionShape);
 
-    if (currentVisionValues.size() != m_constants.noMemEmbed.size()) {
-        throw std::runtime_error("current_vision_feat and no_mem_embed_bchw sizes do not match.");
+    m_noMemoryImageEmbedScratch.resize(currentVisionValues.size());
+    if (currentVisionValues.size() == m_constants.noMemEmbed.size()) {
+        for (size_t index = 0; index < currentVisionValues.size(); ++index) {
+            m_noMemoryImageEmbedScratch[index] = currentVisionValues[index] + m_constants.noMemEmbed[index];
+        }
+        return m_noMemoryImageEmbedScratch;
     }
 
-    m_noMemoryImageEmbedScratch.resize(currentVisionValues.size());
-    for (size_t index = 0; index < currentVisionValues.size(); ++index) {
-        m_noMemoryImageEmbedScratch[index] = currentVisionValues[index] + m_constants.noMemEmbed[index];
+    if (currentVisionShape.size() != m_constants.noMemEmbedShape.size()
+        || m_constants.noMemEmbed.empty()) {
+        throw std::runtime_error("current_vision_feat and no_mem_embed_bchw shapes are not broadcast-compatible.");
+    }
+
+    std::vector<size_t> noMemStrides(m_constants.noMemEmbedShape.size(), 1);
+    for (size_t dim = m_constants.noMemEmbedShape.size(); dim-- > 1;) {
+        noMemStrides[dim - 1] = noMemStrides[dim] * static_cast<size_t>(m_constants.noMemEmbedShape[dim]);
+    }
+
+    for (size_t dim = 0; dim < currentVisionShape.size(); ++dim) {
+        const int64_t currentExtent = currentVisionShape[dim];
+        const int64_t noMemExtent = m_constants.noMemEmbedShape[dim];
+        if (currentExtent <= 0 || noMemExtent <= 0 || (noMemExtent != 1 && noMemExtent != currentExtent)) {
+            throw std::runtime_error("current_vision_feat and no_mem_embed_bchw shapes are not broadcast-compatible.");
+        }
+    }
+
+    std::vector<size_t> coords(currentVisionShape.size(), 0);
+    for (size_t currentIndex = 0; currentIndex < currentVisionValues.size(); ++currentIndex) {
+        size_t remaining = currentIndex;
+        for (size_t dim = currentVisionShape.size(); dim-- > 0;) {
+            const size_t extent = static_cast<size_t>(currentVisionShape[dim]);
+            coords[dim] = remaining % extent;
+            remaining /= extent;
+        }
+
+        size_t noMemIndex = 0;
+        for (size_t dim = 0; dim < currentVisionShape.size(); ++dim) {
+            const size_t sourceCoord = m_constants.noMemEmbedShape[dim] == 1 ? 0 : coords[dim];
+            noMemIndex += sourceCoord * noMemStrides[dim];
+        }
+
+        m_noMemoryImageEmbedScratch[currentIndex] =
+            currentVisionValues[currentIndex] + m_constants.noMemEmbed[noMemIndex];
     }
     return m_noMemoryImageEmbedScratch;
 }

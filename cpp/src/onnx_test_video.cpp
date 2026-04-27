@@ -644,6 +644,7 @@ int runOnnxTestVideo(int argc, char** argv)
             initSelection.constantsPath,
             initThreads,
             initDevice)) {
+            std::cerr << "[ERROR] Failed to initialize preview tracker runtime on " << initDevice << ".\n";
             return false;
         }
         previewSelection = initSelection;
@@ -754,6 +755,7 @@ int runOnnxTestVideo(int argc, char** argv)
             initSelection.constantsPath,
             initThreads,
             initDevice)) {
+            std::cerr << "[ERROR] Failed to initialize tracking runtime on " << initDevice << ".\n";
             return false;
         }
         runtimeSelection = initSelection;

@@ -1,4 +1,5 @@
 #include <iostream>
+#include <exception>
 #include <string>
 
 int runOnnxTestImage(int argc, char** argv);
@@ -22,20 +23,31 @@ static void printMainUsage()
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        char* fakeArgv[2] = {argv[0], const_cast<char*>("--onnx_test_image")};
-        return runOnnxTestImage(2, fakeArgv);
-    }
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
 
-    const std::string mode = argv[1];
-    if (mode == "--onnx_test_image") {
-        return runOnnxTestImage(argc, argv);
-    }
-    if (mode == "--onnx_test_video") {
-        return runOnnxTestVideo(argc, argv);
-    }
+    try {
+        if (argc < 2) {
+            char* fakeArgv[2] = {argv[0], const_cast<char*>("--onnx_test_image")};
+            return runOnnxTestImage(2, fakeArgv);
+        }
 
-    std::cerr << "[ERROR] Unknown mode: " << mode << '\n';
-    printMainUsage();
-    return 1;
+        const std::string mode = argv[1];
+        if (mode == "--onnx_test_image") {
+            return runOnnxTestImage(argc, argv);
+        }
+        if (mode == "--onnx_test_video") {
+            return runOnnxTestVideo(argc, argv);
+        }
+
+        std::cerr << "[ERROR] Unknown mode: " << mode << '\n';
+        printMainUsage();
+        return 1;
+    } catch (const std::exception& error) {
+        std::cerr << "[ERROR] Unhandled exception: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        std::cerr << "[ERROR] Unhandled non-standard exception.\n";
+        return 1;
+    }
 }
