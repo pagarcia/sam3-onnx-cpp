@@ -370,6 +370,22 @@ $env:SAM3_ONNX_VARIANT="fp16"
 python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
 ```
 
+### CPU Performance Notes
+
+The C++ runtime prefers CPU int8 image artifacts when they are available. It checks:
+
+- `checkpoints/sam3/onnx/vision_encoder.int8.onnx`
+- `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul_gather.onnx`
+- `checkpoints/sam3/onnx/bench_cpu/prompt_encoder_mask_decoder.int8.matmul_gemm.onnx`
+
+To force the original fp32 image models instead:
+
+```powershell
+$env:SAM3_ORT_ENCODER_VARIANT="fp32"
+$env:SAM3_ORT_DECODER_VARIANT="fp32"
+.\cpp\build_msvc\bin\Release\Segment.exe --onnx_test_image --device cpu --image "C:\path\to\image.jpg" --box 100,80,420,350 --no_gui
+```
+
 ## Run the ONNX Video Demo
 
 The video path expects:

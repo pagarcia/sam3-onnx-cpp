@@ -267,28 +267,36 @@ inline std::vector<std::string> preferredImageDecoderVariants(const std::string&
         : std::vector<std::string>{"fp16", "fp32", "int8"};
 }
 
-inline std::filesystem::path imageEncoderPathForVariant(const std::filesystem::path& onnxDir,
-                                                        const std::string& variant)
+inline std::vector<std::filesystem::path> imageEncoderPathsForVariant(const std::filesystem::path& onnxDir,
+                                                                      const std::string& variant)
 {
     if (variant == "int8") {
-        return onnxDir / "vision_encoder.int8.onnx";
+        return {
+            onnxDir / "vision_encoder.int8.onnx",
+            onnxDir / "bench_cpu" / "vision_encoder.int8.matmul_gather.onnx",
+            onnxDir / "bench_cpu" / "vision_encoder.int8.matmul_gather_pre.onnx",
+            onnxDir / "bench_cpu" / "vision_encoder.int8.matmul.onnx",
+        };
     }
     if (variant == "fp16") {
-        return onnxDir / "vision_encoder_fp16.onnx";
+        return {onnxDir / "vision_encoder_fp16.onnx"};
     }
-    return onnxDir / "vision_encoder.onnx";
+    return {onnxDir / "vision_encoder.onnx"};
 }
 
-inline std::filesystem::path imageDecoderPathForVariant(const std::filesystem::path& onnxDir,
-                                                        const std::string& variant)
+inline std::vector<std::filesystem::path> imageDecoderPathsForVariant(const std::filesystem::path& onnxDir,
+                                                                      const std::string& variant)
 {
     if (variant == "int8") {
-        return onnxDir / "prompt_encoder_mask_decoder.int8.onnx";
+        return {
+            onnxDir / "prompt_encoder_mask_decoder.int8.onnx",
+            onnxDir / "bench_cpu" / "prompt_encoder_mask_decoder.int8.matmul_gemm.onnx",
+        };
     }
     if (variant == "fp16") {
-        return onnxDir / "prompt_encoder_mask_decoder_fp16.onnx";
+        return {onnxDir / "prompt_encoder_mask_decoder_fp16.onnx"};
     }
-    return onnxDir / "prompt_encoder_mask_decoder.onnx";
+    return {onnxDir / "prompt_encoder_mask_decoder.onnx"};
 }
 
 inline std::vector<std::string> preferredTrackerPrecisions(const std::string& device)
@@ -324,10 +332,14 @@ inline ImageRuntimeSelection resolveImageRuntimePaths(const std::string& encoder
     std::string resolvedEncoderVariant = "manual";
     if (encoderPath.empty()) {
         for (const auto& variant : preferredImageEncoderVariants(device)) {
-            const auto candidate = imageEncoderPathForVariant(onnxDir, variant);
-            if (hasUsableImageArtifact(candidate, variant)) {
-                resolvedEncoderCandidate = candidate;
-                resolvedEncoderVariant = variant;
+            for (const auto& candidate : imageEncoderPathsForVariant(onnxDir, variant)) {
+                if (hasUsableImageArtifact(candidate, variant)) {
+                    resolvedEncoderCandidate = candidate;
+                    resolvedEncoderVariant = variant;
+                    break;
+                }
+            }
+            if (!resolvedEncoderCandidate.empty()) {
                 break;
             }
         }
@@ -339,10 +351,14 @@ inline ImageRuntimeSelection resolveImageRuntimePaths(const std::string& encoder
     std::string resolvedDecoderVariant = "manual";
     if (decoderPath.empty()) {
         for (const auto& variant : preferredImageDecoderVariants(device)) {
-            const auto candidate = imageDecoderPathForVariant(onnxDir, variant);
-            if (hasUsableImageArtifact(candidate, variant)) {
-                resolvedDecoderCandidate = candidate;
-                resolvedDecoderVariant = variant;
+            for (const auto& candidate : imageDecoderPathsForVariant(onnxDir, variant)) {
+                if (hasUsableImageArtifact(candidate, variant)) {
+                    resolvedDecoderCandidate = candidate;
+                    resolvedDecoderVariant = variant;
+                    break;
+                }
+            }
+            if (!resolvedDecoderCandidate.empty()) {
                 break;
             }
         }
