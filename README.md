@@ -23,19 +23,12 @@ Current working state:
 - CUDA auto mode prefers fp16 image/tracker artifacts.
 - The video smoke test should be kept small on CPU, for example `--max_frames 2` or `--max_frames 3`.
 
-Observed local smoke-test timings:
+Performance expectations:
 
-| Path | Device | Precision | Typical observed time |
-| --- | --- | --- | --- |
-| Image encoder | CPU fp32 | fp32 | about 22-24 s |
-| Image encoder | CPU int8 | int8 encoder | about 14-17 s, variable |
-| Image encoder | CUDA | fp16 | about 1.0-1.2 s |
-| Video propagated frame encoder | CPU | fp32/int8 | about 18-26 s per encoded frame |
-| Video propagated frame encoder | CUDA | fp16 | about 0.9-1.1 s per encoded frame |
-
-The first annotated video frame often reports `Enc: 0 ms` because the anchor-frame encoder outputs were already cached during preview. Propagated frames pay the encoder cost.
-
-CUDA warnings about added `Memcpy` nodes, constant folding, and `ScatterND` are expected with the current ONNX graphs. They are noisy but did not block the smoke tests.
+- CPU inference is supported but can be slow because the SAM3 vision encoder is large.
+- CUDA fp16 inference is the recommended path for interactive video use.
+- The first annotated video frame may report `Enc: 0 ms` when encoder outputs were already cached during preview. Propagated frames pay the encoder cost.
+- ONNX Runtime may print CUDA graph-optimization warnings with the current exported graphs.
 
 ## What Comes From Hugging Face vs This Repo
 
@@ -518,37 +511,16 @@ The CPU bottleneck is the SAM3 vision encoder, not the prompt decoder or the C++
 - Heads: `16`
 - Global attention blocks: `7, 15, 23, 31`
 
-That is why CUDA is dramatically faster than CPU here. SAM2 can be much faster on CPU because its backbone is cheaper and more hierarchical, but it also gives lower quality in many cases.
+That is why CUDA is expected to be significantly faster than CPU for this model.
 
 Practical CPU options:
 
 - Use the int8 artifacts for smoke tests and CPU fallback.
-- Try `--threads 7` or `--threads 8` on this 8-logical-CPU machine; results are noisy, so benchmark more than one run.
+- Try a few `--threads N` values for the target machine and benchmark more than one run.
 - Keep CPU video smoke tests to `2` or `3` frames.
-- For real video throughput, use CUDA/TensorRT or an approximate fast mode that skips/reuses encoder features.
+- For real video throughput, use CUDA or TensorRT.
 
-Not much speed is left in ordinary C++ wrapper tuning. A large CPU gain would require changing the model path, for example exporting a lower-resolution encoder or doing keyframe/feature reuse. Those are quality tradeoffs, not free optimizations.
-
-## SAM3.1 and Azure Notes
-
-SAM3.1 is worth trying on Azure if the goal is to evaluate newer SAM3.1 behavior, multiplex/video features, or production GPU throughput. It is not worth doing just to make the exact CPU path fast; the encoder bottleneck remains a large `1008x1008` ViT-style backbone.
-
-The interesting SAM3.1 source-code difference is that the local `sam3-3p1` checkout includes `use_rope_real` hooks in the vision backbone. That may make a custom image-encoder ONNX export more plausible than the current SAM3 path, where this repo intentionally disables image encoder export because of complex rotary ops. Treat that as an experiment, not a guaranteed quick win.
-
-Suggested Azure sizing strategy:
-
-- Start with a single-GPU CUDA VM for smoke tests and short videos.
-- `NCasT4_v3` is the cheaper inference-style family: NVIDIA T4 with 16 GB GPU memory.
-- `NVadsA10_v5` gives NVIDIA A10 options up to a full 24 GB GPU and is a good next step if T4 is too slow or too tight.
-- `NC_A100_v4` or `NCads_H100_v5` are for expensive batch inference/training-style experiments. Use them only after the smaller GPU proves the workflow.
-
-Useful Azure references:
-
-- [Azure GPU VM sizes overview](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes-gpu)
-- [NCasT4_v3 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/nct4-v3-series)
-- [NVadsA10_v5 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nvadsa10v5-series)
-- [NC_A100_v4 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nca100v4-series)
-- [NCads_H100_v5 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/ncadsh100v5-series)
+Further CPU acceleration would require model-level changes rather than wrapper-only changes.
 
 ## Run the ONNX Video Demo
 
