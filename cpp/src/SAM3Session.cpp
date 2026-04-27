@@ -7,9 +7,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -383,6 +386,244 @@ std::vector<int64_t> concreteEncoderInputShape(const std::vector<int64_t>& model
     return concreteShape;
 }
 
+#if defined(_WIN32)
+std::wstring trimWideCopy(const std::wstring& value)
+{
+    const auto first = std::find_if_not(
+        value.begin(),
+        value.end(),
+        [](wchar_t ch) { return std::iswspace(ch) != 0; });
+    const auto last = std::find_if_not(
+        value.rbegin(),
+        value.rend(),
+        [](wchar_t ch) { return std::iswspace(ch) != 0; }).base();
+    if (first >= last) {
+        return std::wstring();
+    }
+    return std::wstring(first, last);
+}
+
+std::wstring getEnvWide(const wchar_t* name)
+{
+    const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+    if (size == 0) {
+        return std::wstring();
+    }
+
+    std::wstring value(size - 1, L'\0');
+    GetEnvironmentVariableW(name, value.data(), size);
+    return value;
+}
+
+std::vector<std::wstring> splitWidePathList(const std::wstring& value)
+{
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t separator = value.find(L';', start);
+        std::wstring part = separator == std::wstring::npos
+            ? value.substr(start)
+            : value.substr(start, separator - start);
+        part = trimWideCopy(part);
+        if (part.size() >= 2 && part.front() == L'"' && part.back() == L'"') {
+            part = part.substr(1, part.size() - 2);
+        }
+        if (!part.empty()) {
+            parts.push_back(std::move(part));
+        }
+        if (separator == std::wstring::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+    return parts;
+}
+
+std::wstring getExecutableDirectory()
+{
+    std::wstring buffer(MAX_PATH, L'\0');
+    while (true) {
+        const DWORD written = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (written == 0) {
+            return std::wstring();
+        }
+        if (written < buffer.size() - 1) {
+            buffer.resize(written);
+            break;
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+
+    std::filesystem::path exePath(buffer);
+    return exePath.parent_path().native();
+}
+
+void appendExistingDirectory(const std::filesystem::path& candidate,
+                             std::vector<std::wstring>* directories,
+                             std::set<std::wstring>* seen)
+{
+    if (!directories || !seen || candidate.empty()) {
+        return;
+    }
+
+    std::error_code error;
+    if (!std::filesystem::exists(candidate, error) || !std::filesystem::is_directory(candidate, error)) {
+        return;
+    }
+
+    const std::wstring normalized = candidate.lexically_normal().native();
+    if (seen->insert(normalized).second) {
+        directories->push_back(normalized);
+    }
+}
+
+std::vector<std::wstring> collectCudaSearchDirectories()
+{
+    std::vector<std::wstring> directories;
+    std::set<std::wstring> seen;
+
+    appendExistingDirectory(getExecutableDirectory(), &directories, &seen);
+
+    std::error_code error;
+    appendExistingDirectory(std::filesystem::current_path(error), &directories, &seen);
+
+    for (const auto& entry : splitWidePathList(getEnvWide(L"SAM3_ORT_DLL_DIRS"))) {
+        appendExistingDirectory(entry, &directories, &seen);
+    }
+    for (const auto& entry : splitWidePathList(getEnvWide(L"SAM3_CUDA_DLL_DIRS"))) {
+        appendExistingDirectory(entry, &directories, &seen);
+    }
+    for (const auto& entry : splitWidePathList(getEnvWide(L"PATH"))) {
+        appendExistingDirectory(entry, &directories, &seen);
+    }
+
+    const std::filesystem::path programFiles = getEnvWide(L"ProgramFiles");
+    if (!programFiles.empty()) {
+        const std::filesystem::path cudaRoot = programFiles / "NVIDIA GPU Computing Toolkit" / "CUDA";
+        if (std::filesystem::exists(cudaRoot, error)) {
+            std::vector<std::filesystem::path> cudaBins;
+            for (const auto& entry : std::filesystem::directory_iterator(cudaRoot, error)) {
+                if (!entry.is_directory(error)) {
+                    continue;
+                }
+                const std::filesystem::path binDir = entry.path() / "bin";
+                if (std::filesystem::exists(binDir, error) && std::filesystem::is_directory(binDir, error)) {
+                    cudaBins.push_back(binDir);
+                }
+            }
+            std::sort(cudaBins.begin(), cudaBins.end(), [](const auto& a, const auto& b) {
+                return a.native() > b.native();
+            });
+            for (const auto& binDir : cudaBins) {
+                appendExistingDirectory(binDir, &directories, &seen);
+            }
+        }
+
+        const std::filesystem::path cudnnRoot = programFiles / "NVIDIA" / "CUDNN";
+        if (std::filesystem::exists(cudnnRoot, error)) {
+            std::vector<std::filesystem::path> cudnnBins;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(cudnnRoot, error)) {
+                if (!entry.is_regular_file(error)) {
+                    continue;
+                }
+                const std::wstring filename = entry.path().filename().native();
+                if (filename.rfind(L"cudnn", 0) == 0 && entry.path().extension() == ".dll") {
+                    cudnnBins.push_back(entry.path().parent_path());
+                }
+            }
+            std::sort(cudnnBins.begin(), cudnnBins.end(), [](const auto& a, const auto& b) {
+                return a.native() > b.native();
+            });
+            for (const auto& binDir : cudnnBins) {
+                appendExistingDirectory(binDir, &directories, &seen);
+            }
+        }
+    }
+
+    return directories;
+}
+
+HMODULE loadDllFromSearchDirectories(const std::wstring& dllName,
+                                     const std::vector<std::wstring>& directories)
+{
+    if (dllName.empty()) {
+        return nullptr;
+    }
+
+    if (HMODULE existing = GetModuleHandleW(dllName.c_str())) {
+        return existing;
+    }
+
+    if (HMODULE loaded = LoadLibraryW(dllName.c_str())) {
+        return loaded;
+    }
+
+    for (const auto& directory : directories) {
+        const std::filesystem::path candidate = std::filesystem::path(directory) / dllName;
+        std::error_code error;
+        if (!std::filesystem::exists(candidate, error)) {
+            continue;
+        }
+
+        if (HMODULE loaded = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
+            return loaded;
+        }
+    }
+
+    return nullptr;
+}
+
+bool preloadCudaWindowsRuntime()
+{
+    static int cached = -1;
+    static std::vector<HMODULE> loadedModules;
+    if (cached != -1) {
+        return cached != 0;
+    }
+
+    const std::vector<std::wstring> searchDirectories = collectCudaSearchDirectories();
+    const std::array<std::wstring, 11> requiredDlls = {
+        L"cudart64_12.dll",
+        L"cublas64_12.dll",
+        L"cublasLt64_12.dll",
+        L"cudnn64_9.dll",
+        L"cudnn_adv64_9.dll",
+        L"cudnn_cnn64_9.dll",
+        L"cudnn_engines_precompiled64_9.dll",
+        L"cudnn_engines_runtime_compiled64_9.dll",
+        L"cudnn_graph64_9.dll",
+        L"cudnn_heuristic64_9.dll",
+        L"cudnn_ops64_9.dll",
+    };
+    const std::array<std::wstring, 6> optionalDlls = {
+        L"cufft64_11.dll",
+        L"cufftw64_11.dll",
+        L"curand64_10.dll",
+        L"cusparse64_12.dll",
+        L"nvrtc64_120_0.dll",
+        L"nvrtc-builtins64_125.dll",
+    };
+
+    for (const auto& dllName : requiredDlls) {
+        HMODULE loaded = loadDllFromSearchDirectories(dllName, searchDirectories);
+        if (!loaded) {
+            cached = 0;
+            return false;
+        }
+        loadedModules.push_back(loaded);
+    }
+
+    for (const auto& dllName : optionalDlls) {
+        if (HMODULE loaded = loadDllFromSearchDirectories(dllName, searchDirectories)) {
+            loadedModules.push_back(loaded);
+        }
+    }
+
+    cached = 1;
+    return true;
+}
+#endif
+
 } // namespace
 
 SAM3::SAM3() = default;
@@ -520,12 +761,15 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
         options.DisableMemPattern();
     }
 
-    ortThrowIf(
-        OrtSessionOptionsAppendExecutionProvider_CPU(options, enableCpuArena ? 1 : 0),
-        "Append CPU EP failed");
-
     if (device.rfind("cuda:", 0) == 0) {
 #if !defined(__APPLE__)
+#if defined(_WIN32)
+        if (!preloadCudaWindowsRuntime()) {
+            std::cerr
+                << "[WARN] Could not preload the CUDA/cuDNN runtime from PATH or the default install locations. "
+                << "If CUDA session initialization fails, add the CUDA/cuDNN bin folders to PATH or SAM3_CUDA_DLL_DIRS.\n";
+        }
+#endif
         OrtCUDAProviderOptions cudaOptions{};
         try {
             cudaOptions.device_id = std::stoi(device.substr(5));
@@ -534,6 +778,9 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
         }
         options.AppendExecutionProvider_CUDA(cudaOptions);
 #endif
+        ortThrowIf(
+            OrtSessionOptionsAppendExecutionProvider_CPU(options, enableCpuArena ? 1 : 0),
+            "Append CPU EP (fallback) failed");
         return;
     }
 
@@ -542,8 +789,17 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
         ortThrowIf(
             OrtSessionOptionsAppendExecutionProvider_CoreML(options, 0),
             "Append CoreML EP failed");
+        return;
 #endif
+        ortThrowIf(
+            OrtSessionOptionsAppendExecutionProvider_CPU(options, enableCpuArena ? 1 : 0),
+            "Append CPU EP (fallback) failed");
+        return;
     }
+
+    ortThrowIf(
+        OrtSessionOptionsAppendExecutionProvider_CPU(options, enableCpuArena ? 1 : 0),
+        "Append CPU EP failed");
 }
 
 std::vector<SAM3Node> SAM3::getSessionNodes(Ort::Session* session, bool isInput)
@@ -1076,8 +1332,15 @@ bool SAM3::hasCudaDriver()
     }
 
 #if defined(_WIN32)
-    static HMODULE cudartHandle =
-        LoadLibraryExW(L"cudart64_12.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!preloadCudaWindowsRuntime()) {
+        cached = 0;
+        return false;
+    }
+
+    static HMODULE cudartHandle = GetModuleHandleW(L"cudart64_12.dll");
+    if (!cudartHandle) {
+        cudartHandle = loadDllFromSearchDirectories(L"cudart64_12.dll", collectCudaSearchDirectories());
+    }
     if (!cudartHandle) {
         cached = 0;
         return false;

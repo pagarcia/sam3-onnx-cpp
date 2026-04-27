@@ -465,6 +465,46 @@ std::string defaultOutputPath(const std::string& videoPath,
     return (path.parent_path() / (stem + suffix)).string();
 }
 
+std::string normalizeDeviceArgument(const std::string& value)
+{
+    const std::string lowered = ArtifactResolver::lowerCopy(value);
+    if (lowered.empty()) {
+        return std::string();
+    }
+    if (lowered == "cpu") {
+        return "cpu";
+    }
+    if (lowered == "cuda" || lowered == "gpu") {
+        return "cuda:0";
+    }
+    if (lowered.rfind("cuda:", 0) == 0) {
+        return lowered;
+    }
+    return std::string();
+}
+
+void printRuntimeSelection(const char* label,
+                           const ArtifactResolver::VideoRuntimeSelection& selection,
+                           const std::string& device,
+                           int threads)
+{
+    std::cout << "[INFO] " << label << '\n'
+              << "       encoder     = " << selection.encoderPath << '\n'
+              << "       decoder     = " << selection.decoderPath << '\n'
+              << "       memAttn     = " << selection.memoryAttentionPath << '\n'
+              << "       memEnc      = " << selection.memoryEncoderPath << '\n'
+              << "       constants   = " << selection.constantsPath << '\n'
+              << "       precision   = " << selection.precision << '\n'
+              << "       graph       = " << selection.graphProfile << '\n'
+              << "       device      = " << device << '\n'
+              << "       threads     = " << threads << '\n';
+    if (device == "cpu" && ArtifactResolver::lowerCopy(selection.encoderPath).find("fp16") != std::string::npos) {
+        std::cout
+            << "[WARN] CPU runtime is using the fp16 vision encoder fallback. "
+            << "A fp32 or int8 encoder artifact will be much faster on CPU.\n";
+    }
+}
+
 } // namespace
 
 int runOnnxTestVideo(int argc, char** argv)
@@ -474,6 +514,7 @@ int runOnnxTestVideo(int argc, char** argv)
     std::string memoryAttentionPath;
     std::string memoryEncoderPath;
     std::string constantsPath;
+    std::string requestedDevice;
     std::string videoPath;
     std::string pointsSpec;
     std::string boxSpec;
@@ -499,6 +540,8 @@ int runOnnxTestVideo(int argc, char** argv)
             memoryEncoderPath = argv[++index];
         } else if (arg == "--constants" && index + 1 < argc) {
             constantsPath = argv[++index];
+        } else if (arg == "--device" && index + 1 < argc) {
+            requestedDevice = argv[++index];
         } else if (arg == "--video" && index + 1 < argc) {
             videoPath = argv[++index];
         } else if (arg == "--threads" && index + 1 < argc) {
@@ -532,6 +575,7 @@ int runOnnxTestVideo(int argc, char** argv)
                 << "  --memattn path              optional memory attention override\n"
                 << "  --memenc path               optional memory encoder override\n"
                 << "  --constants path            optional NPZ constants override\n"
+                << "  --device cpu|cuda|cuda:N    optional runtime device override\n"
                 << "  --prompt seed_points|bounding_box\n"
                 << "  --points x,y,label;...      noninteractive frame-0 prompt\n"
                 << "  --box x1,y1,x2,y2           noninteractive frame-0 prompt\n"
@@ -552,14 +596,24 @@ int runOnnxTestVideo(int argc, char** argv)
         return 1;
     }
 
-    const bool forceCpu = ArtifactResolver::isLowCostCpuProfile();
-    const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
-    std::string device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
+    const bool deviceExplicit = !requestedDevice.empty();
+    std::string device;
+    if (deviceExplicit) {
+        device = normalizeDeviceArgument(requestedDevice);
+        if (device.empty()) {
+            std::cerr << "[ERROR] --device must be cpu|cuda|cuda:N\n";
+            return 1;
+        }
+    } else {
+        const bool forceCpu = ArtifactResolver::isLowCostCpuProfile();
+        const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
+        device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
+    }
     if (!threadsExplicit) {
         threads = ArtifactResolver::preferredRuntimeThreads(hardwareThreads, device);
     }
 
-    const auto previewSelection = ArtifactResolver::resolveVideoRuntimePaths(
+    auto previewSelection = ArtifactResolver::resolveVideoRuntimePaths(
         encoderPath,
         decoderPath,
         memoryAttentionPath,
@@ -568,40 +622,44 @@ int runOnnxTestVideo(int argc, char** argv)
         device,
         1);
 
-    std::cout << "[INFO] Preview tracker bundle\n"
-              << "       encoder     = " << previewSelection.encoderPath << '\n'
-              << "       decoder     = " << previewSelection.decoderPath << '\n'
-              << "       memAttn     = " << previewSelection.memoryAttentionPath << '\n'
-              << "       memEnc      = " << previewSelection.memoryEncoderPath << '\n'
-              << "       constants   = " << previewSelection.constantsPath << '\n'
-              << "       precision   = " << previewSelection.precision << '\n'
-              << "       graph       = " << previewSelection.graphProfile << '\n'
-              << "       device      = " << device << '\n';
-    if (device == "cpu" && ArtifactResolver::lowerCopy(previewSelection.encoderPath).find("fp16") != std::string::npos) {
-        std::cout
-            << "[WARN] CPU runtime is using the fp16 vision encoder fallback. "
-            << "A fp32 or int8 encoder artifact will be much faster on CPU.\n";
-    }
-
     SAM3 previewSam;
     auto initializePreviewOnDevice = [&](const std::string& initDevice) -> bool {
         const int initThreads = threadsExplicit
             ? threads
             : ArtifactResolver::preferredRuntimeThreads(hardwareThreads, initDevice);
-        return previewSam.initializeVideo(
-            previewSelection.encoderPath,
-            previewSelection.decoderPath,
-            previewSelection.memoryAttentionPath,
-            previewSelection.memoryEncoderPath,
-            previewSelection.constantsPath,
+        const auto initSelection = ArtifactResolver::resolveVideoRuntimePaths(
+            encoderPath,
+            decoderPath,
+            memoryAttentionPath,
+            memoryEncoderPath,
+            constantsPath,
+            initDevice,
+            1);
+        printRuntimeSelection("Preview tracker bundle", initSelection, initDevice, initThreads);
+        if (!previewSam.initializeVideo(
+            initSelection.encoderPath,
+            initSelection.decoderPath,
+            initSelection.memoryAttentionPath,
+            initSelection.memoryEncoderPath,
+            initSelection.constantsPath,
             initThreads,
-            initDevice);
+            initDevice)) {
+            return false;
+        }
+        previewSelection = initSelection;
+        device = initDevice;
+        if (!threadsExplicit) {
+            threads = initThreads;
+        }
+        return true;
     };
 
     if (!initializePreviewOnDevice(device)) {
-        if (device != "cpu" && initializePreviewOnDevice("cpu")) {
-            device = "cpu";
-        } else {
+        if (deviceExplicit || device == "cpu") {
+            return 1;
+        }
+        std::cerr << "[WARN] Falling back to CPU runtime for preview.\n";
+        if (!initializePreviewOnDevice("cpu")) {
             return 1;
         }
     }
@@ -665,7 +723,7 @@ int runOnnxTestVideo(int argc, char** argv)
         return 1;
     }
 
-    const auto runtimeSelection = ArtifactResolver::resolveVideoRuntimePaths(
+    auto runtimeSelection = ArtifactResolver::resolveVideoRuntimePaths(
         encoderPath,
         decoderPath,
         memoryAttentionPath,
@@ -673,34 +731,45 @@ int runOnnxTestVideo(int argc, char** argv)
         constantsPath,
         device,
         anchors.size());
-    std::cout << "[INFO] Runtime tracker bundle\n"
-              << "       encoder     = " << runtimeSelection.encoderPath << '\n'
-              << "       decoder     = " << runtimeSelection.decoderPath << '\n'
-              << "       memAttn     = " << runtimeSelection.memoryAttentionPath << '\n'
-              << "       memEnc      = " << runtimeSelection.memoryEncoderPath << '\n'
-              << "       constants   = " << runtimeSelection.constantsPath << '\n'
-              << "       precision   = " << runtimeSelection.precision << '\n'
-              << "       graph       = " << runtimeSelection.graphProfile << '\n';
 
     SAM3 runtimeSam;
     auto initializeRuntimeOnDevice = [&](const std::string& initDevice) -> bool {
         const int initThreads = threadsExplicit
             ? threads
             : ArtifactResolver::preferredRuntimeThreads(hardwareThreads, initDevice);
-        return runtimeSam.initializeVideo(
-            runtimeSelection.encoderPath,
-            runtimeSelection.decoderPath,
-            runtimeSelection.memoryAttentionPath,
-            runtimeSelection.memoryEncoderPath,
-            runtimeSelection.constantsPath,
+        const auto initSelection = ArtifactResolver::resolveVideoRuntimePaths(
+            encoderPath,
+            decoderPath,
+            memoryAttentionPath,
+            memoryEncoderPath,
+            constantsPath,
+            initDevice,
+            anchors.size());
+        printRuntimeSelection("Runtime tracker bundle", initSelection, initDevice, initThreads);
+        if (!runtimeSam.initializeVideo(
+            initSelection.encoderPath,
+            initSelection.decoderPath,
+            initSelection.memoryAttentionPath,
+            initSelection.memoryEncoderPath,
+            initSelection.constantsPath,
             initThreads,
-            initDevice);
+            initDevice)) {
+            return false;
+        }
+        runtimeSelection = initSelection;
+        device = initDevice;
+        if (!threadsExplicit) {
+            threads = initThreads;
+        }
+        return true;
     };
 
     if (!initializeRuntimeOnDevice(device)) {
-        if (device != "cpu" && initializeRuntimeOnDevice("cpu")) {
-            device = "cpu";
-        } else {
+        if (deviceExplicit || device == "cpu") {
+            return 1;
+        }
+        std::cerr << "[WARN] Falling back to CPU runtime for tracking.\n";
+        if (!initializeRuntimeOnDevice("cpu")) {
             return 1;
         }
     }

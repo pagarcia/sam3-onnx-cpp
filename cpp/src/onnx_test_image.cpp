@@ -257,12 +257,48 @@ std::string resolveImagePath(const std::string& imagePath)
     return openFileDialog(filter, L"Select an image");
 }
 
+std::string normalizeDeviceArgument(const std::string& value)
+{
+    const std::string lowered = ArtifactResolver::lowerCopy(value);
+    if (lowered.empty()) {
+        return std::string();
+    }
+    if (lowered == "cpu") {
+        return "cpu";
+    }
+    if (lowered == "cuda" || lowered == "gpu") {
+        return "cuda:0";
+    }
+    if (lowered.rfind("cuda:", 0) == 0) {
+        return lowered;
+    }
+    return std::string();
+}
+
+void printRuntimeSelection(const ArtifactResolver::ImageRuntimeSelection& selection,
+                           const std::string& device,
+                           int threads)
+{
+    std::cout << "[INFO] encoder=" << selection.encoderPath << '\n'
+              << "[INFO] decoder=" << selection.decoderPath << '\n'
+              << "[INFO] precision=" << selection.precision << '\n'
+              << "[INFO] mode=" << selection.mode << '\n'
+              << "[INFO] device=" << device << '\n'
+              << "[INFO] threads=" << threads << '\n';
+    if (device == "cpu" && ArtifactResolver::lowerCopy(selection.encoderPath).find("fp16") != std::string::npos) {
+        std::cout
+            << "[WARN] CPU runtime is using the fp16 vision encoder fallback. "
+            << "A fp32 or int8 encoder artifact will be much faster on CPU.\n";
+    }
+}
+
 } // namespace
 
 int runOnnxTestImage(int argc, char** argv)
 {
     std::string encoderPath;
     std::string decoderPath;
+    std::string requestedDevice;
     std::string imagePath;
     std::string pointsSpec;
     std::string boxSpec;
@@ -282,6 +318,8 @@ int runOnnxTestImage(int argc, char** argv)
             encoderPath = argv[++index];
         } else if (arg == "--decoder" && index + 1 < argc) {
             decoderPath = argv[++index];
+        } else if (arg == "--device" && index + 1 < argc) {
+            requestedDevice = argv[++index];
         } else if (arg == "--image" && index + 1 < argc) {
             imagePath = argv[++index];
         } else if (arg == "--threads" && index + 1 < argc) {
@@ -312,6 +350,7 @@ int runOnnxTestImage(int argc, char** argv)
                 << "  --image path                optional image path; opens a file dialog if omitted\n"
                 << "  --encoder path              optional image encoder override\n"
                 << "  --decoder path              optional prompt decoder override\n"
+                << "  --device cpu|cuda|cuda:N    optional runtime device override\n"
                 << "  --prompt seed_points|bounding_box\n"
                 << "  --points x,y,label;...      noninteractive seed-point prompt\n"
                 << "  --box x1,y1,x2,y2           noninteractive box prompt\n"
@@ -339,41 +378,48 @@ int runOnnxTestImage(int argc, char** argv)
         return 1;
     }
 
-    const bool forceCpu = ArtifactResolver::isLowCostCpuProfile();
-    const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
-    std::string device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
+    const bool deviceExplicit = !requestedDevice.empty();
+    std::string device;
+    if (deviceExplicit) {
+        device = normalizeDeviceArgument(requestedDevice);
+        if (device.empty()) {
+            std::cerr << "[ERROR] --device must be cpu|cuda|cuda:N\n";
+            return 1;
+        }
+    } else {
+        const bool forceCpu = ArtifactResolver::isLowCostCpuProfile();
+        const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
+        device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
+    }
     if (!threadsExplicit) {
         threads = ArtifactResolver::preferredRuntimeThreads(hardwareThreads, device);
     }
 
-    const auto selection = ArtifactResolver::resolveImageRuntimePaths(encoderPath, decoderPath, device);
-    std::cout << "[INFO] encoder=" << selection.encoderPath << '\n'
-              << "[INFO] decoder=" << selection.decoderPath << '\n'
-              << "[INFO] precision=" << selection.precision << '\n'
-              << "[INFO] mode=" << selection.mode << '\n'
-              << "[INFO] device=" << device << '\n'
-              << "[INFO] threads=" << threads << '\n';
-    if (device == "cpu" && ArtifactResolver::lowerCopy(selection.encoderPath).find("fp16") != std::string::npos) {
-        std::cout
-            << "[WARN] CPU runtime is using the fp16 vision encoder fallback. "
-            << "A fp32 or int8 encoder artifact will be much faster on CPU.\n";
-    }
-
     SAM3 sam;
+    auto selection = ArtifactResolver::resolveImageRuntimePaths(encoderPath, decoderPath, device);
     auto initializeOnDevice = [&](const std::string& initDevice) -> bool {
         const int initThreads = threadsExplicit
             ? threads
             : ArtifactResolver::preferredRuntimeThreads(hardwareThreads, initDevice);
-        return sam.initializeImage(selection.encoderPath, selection.decoderPath, initThreads, initDevice);
+        const auto initSelection = ArtifactResolver::resolveImageRuntimePaths(encoderPath, decoderPath, initDevice);
+        printRuntimeSelection(initSelection, initDevice, initThreads);
+        if (!sam.initializeImage(initSelection.encoderPath, initSelection.decoderPath, initThreads, initDevice)) {
+            return false;
+        }
+        selection = initSelection;
+        device = initDevice;
+        if (!threadsExplicit) {
+            threads = initThreads;
+        }
+        return true;
     };
 
     if (!initializeOnDevice(device)) {
-        if (device != "cpu") {
+        if (!deviceExplicit && device != "cpu") {
             std::cerr << "[WARN] Falling back to CPU runtime.\n";
             if (!initializeOnDevice("cpu")) {
                 return 1;
             }
-            device = "cpu";
         } else {
             return 1;
         }
