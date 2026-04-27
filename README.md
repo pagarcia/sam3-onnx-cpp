@@ -2,14 +2,40 @@
 
 SAM3 ONNX experiments and wrappers built around the SAM3 tracker/image model.
 
-This repo is currently Python-first. It contains:
+This repo now contains both Python and C++ paths:
 
-- An ONNX Runtime image demo that uses pre-exported Hugging Face ONNX models.
+- Python ONNX demos for image segmentation and video tracking.
+- A C++ `Segment` executable for image segmentation and video tracking through ONNX Runtime.
 - An exporter for tracker-specific video ONNX modules built from a local `sam3` checkout.
-- Video demos, comparison scripts, and benchmark helpers for the exported tracker path.
 - Native SAM3 reference scripts for checking parity against the ONNX path.
+- Benchmark helpers and CPU quantization experiments.
 
-There is no `cpp/` implementation checked into this checkout right now, despite the repository name.
+The image encoder is still the shipped Hugging Face ONNX encoder. The repo exports and wraps the video tracker-specific modules around that encoder.
+
+## Status Snapshot
+
+Current working state:
+
+- C++ image path works on CPU and CUDA.
+- C++ video path works on CPU and CUDA.
+- The video path uses the downloaded `vision_encoder*.onnx` plus the locally exported tracker bundle.
+- CPU auto mode prefers the available int8 image encoder/decoder artifacts.
+- CUDA auto mode prefers fp16 image/tracker artifacts.
+- The video smoke test should be kept small on CPU, for example `--max_frames 2` or `--max_frames 3`.
+
+Observed local smoke-test timings:
+
+| Path | Device | Precision | Typical observed time |
+| --- | --- | --- | --- |
+| Image encoder | CPU fp32 | fp32 | about 22-24 s |
+| Image encoder | CPU int8 | int8 encoder | about 14-17 s, variable |
+| Image encoder | CUDA | fp16 | about 1.0-1.2 s |
+| Video propagated frame encoder | CPU | fp32/int8 | about 18-26 s per encoded frame |
+| Video propagated frame encoder | CUDA | fp16 | about 0.9-1.1 s per encoded frame |
+
+The first annotated video frame often reports `Enc: 0 ms` because the anchor-frame encoder outputs were already cached during preview. Propagated frames pay the encoder cost.
+
+CUDA warnings about added `Memcpy` nodes, constant folding, and `ScatterND` are expected with the current ONNX graphs. They are noisy but did not block the smoke tests.
 
 ## What Comes From Hugging Face vs This Repo
 
@@ -84,6 +110,9 @@ Important limitation:
 
 ```text
 sam3-onnx-cpp/
+|-- cpp/
+|   |-- CMakeLists.txt
+|   `-- src/
 |-- export/
 |   |-- onnx_export.py
 |   `-- src/
@@ -285,6 +314,97 @@ pip install `
 python -c "import onnxruntime as ort; print(ort.get_available_providers())"
 ```
 
+## Build the C++ Runtime
+
+The C++ target is `Segment`. It wraps both the image and video ONNX paths.
+
+Configure with OpenCV and ONNX Runtime:
+
+```powershell
+cmake -S cpp -B cpp\build_msvc -G "Visual Studio 17 2022" -A x64 `
+  -DOpenCV_DIR="C:\path\to\opencv\build" `
+  -DONNXRUNTIME_DIR="C:\path\to\onnxruntime-win-x64-gpu-1.22.0"
+```
+
+Build:
+
+```powershell
+cmake --build cpp\build_msvc --config Release --target Segment -- /m:1
+```
+
+The executable is written to:
+
+```text
+cpp/build_msvc/bin/Release/Segment.exe
+```
+
+### C++ Image Smoke Tests
+
+CPU:
+
+```powershell
+.\cpp\build_msvc\bin\Release\Segment.exe `
+  --onnx_test_image `
+  --device cpu `
+  --threads 8 `
+  --image tmp\sam3_smoke.png `
+  --box 90,55,230,185 `
+  --save_overlay tmp\image_cpu.png `
+  --no_gui
+```
+
+CUDA:
+
+```powershell
+.\cpp\build_msvc\bin\Release\Segment.exe `
+  --onnx_test_image `
+  --device cuda `
+  --threads 4 `
+  --image tmp\sam3_smoke.png `
+  --box 90,55,230,185 `
+  --save_overlay tmp\image_gpu.png `
+  --no_gui
+```
+
+### C++ Video Smoke Tests
+
+CPU, keep this short:
+
+```powershell
+.\cpp\build_msvc\bin\Release\Segment.exe `
+  --onnx_test_video `
+  --device cpu `
+  --threads 8 `
+  --video tmp\sam3_smoke.avi `
+  --box 90,55,230,185 `
+  --max_frames 3 `
+  --output tmp\video_cpu.avi
+```
+
+CUDA:
+
+```powershell
+.\cpp\build_msvc\bin\Release\Segment.exe `
+  --onnx_test_video `
+  --device cuda `
+  --threads 4 `
+  --video tmp\sam3_smoke.avi `
+  --box 90,55,230,185 `
+  --max_frames 3 `
+  --output tmp\video_gpu.avi
+```
+
+Useful C++ options:
+
+- `--device cpu|cuda|cuda:N`
+- `--threads N`
+- `--points x,y,label;...`
+- `--box x1,y1,x2,y2`
+- `--max_frames N`
+- `--output path`
+- `--save_overlay path`
+- `--no_gui` for noninteractive image runs
+
 ## Download the Hugging Face ONNX Models
 
 You can keep both FP32 and FP16 variants in the same folder.
@@ -372,10 +492,12 @@ python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_po
 
 ### CPU Performance Notes
 
-The C++ runtime prefers CPU int8 image artifacts when they are available. It checks:
+The C++ runtime prefers CPU int8 image artifacts when they are available. It checks these paths before falling back to fp32:
 
 - `checkpoints/sam3/onnx/vision_encoder.int8.onnx`
 - `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul_gather.onnx`
+- `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul_gather_pre.onnx`
+- `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul.onnx`
 - `checkpoints/sam3/onnx/bench_cpu/prompt_encoder_mask_decoder.int8.matmul_gemm.onnx`
 
 To force the original fp32 image models instead:
@@ -385,6 +507,48 @@ $env:SAM3_ORT_ENCODER_VARIANT="fp32"
 $env:SAM3_ORT_DECODER_VARIANT="fp32"
 .\cpp\build_msvc\bin\Release\Segment.exe --onnx_test_image --device cpu --image "C:\path\to\image.jpg" --box 100,80,420,350 --no_gui
 ```
+
+The CPU bottleneck is the SAM3 vision encoder, not the prompt decoder or the C++ wrapper. The local SAM3 source builds the visual backbone as a large ViT:
+
+- Input resolution: `1008x1008`
+- Patch size: `14`
+- Token grid: `72x72`, or `5184` tokens
+- Width: `1024`
+- Depth: `32`
+- Heads: `16`
+- Global attention blocks: `7, 15, 23, 31`
+
+That is why CUDA is dramatically faster than CPU here. SAM2 can be much faster on CPU because its backbone is cheaper and more hierarchical, but it also gives lower quality in many cases.
+
+Practical CPU options:
+
+- Use the int8 artifacts for smoke tests and CPU fallback.
+- Try `--threads 7` or `--threads 8` on this 8-logical-CPU machine; results are noisy, so benchmark more than one run.
+- Keep CPU video smoke tests to `2` or `3` frames.
+- For real video throughput, use CUDA/TensorRT or an approximate fast mode that skips/reuses encoder features.
+
+Not much speed is left in ordinary C++ wrapper tuning. A large CPU gain would require changing the model path, for example exporting a lower-resolution encoder or doing keyframe/feature reuse. Those are quality tradeoffs, not free optimizations.
+
+## SAM3.1 and Azure Notes
+
+SAM3.1 is worth trying on Azure if the goal is to evaluate newer SAM3.1 behavior, multiplex/video features, or production GPU throughput. It is not worth doing just to make the exact CPU path fast; the encoder bottleneck remains a large `1008x1008` ViT-style backbone.
+
+The interesting SAM3.1 source-code difference is that the local `sam3-3p1` checkout includes `use_rope_real` hooks in the vision backbone. That may make a custom image-encoder ONNX export more plausible than the current SAM3 path, where this repo intentionally disables image encoder export because of complex rotary ops. Treat that as an experiment, not a guaranteed quick win.
+
+Suggested Azure sizing strategy:
+
+- Start with a single-GPU CUDA VM for smoke tests and short videos.
+- `NCasT4_v3` is the cheaper inference-style family: NVIDIA T4 with 16 GB GPU memory.
+- `NVadsA10_v5` gives NVIDIA A10 options up to a full 24 GB GPU and is a good next step if T4 is too slow or too tight.
+- `NC_A100_v4` or `NCads_H100_v5` are for expensive batch inference/training-style experiments. Use them only after the smaller GPU proves the workflow.
+
+Useful Azure references:
+
+- [Azure GPU VM sizes overview](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes-gpu)
+- [NCasT4_v3 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/nct4-v3-series)
+- [NVadsA10_v5 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nvadsa10v5-series)
+- [NC_A100_v4 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nca100v4-series)
+- [NCads_H100_v5 sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/ncadsh100v5-series)
 
 ## Run the ONNX Video Demo
 
