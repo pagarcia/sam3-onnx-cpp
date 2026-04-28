@@ -480,6 +480,12 @@ std::string normalizeDeviceArgument(const std::string& value)
     if (lowered.rfind("cuda:", 0) == 0) {
         return lowered;
     }
+    if (lowered == "dml" || lowered == "directml") {
+        return "dml:0";
+    }
+    if (lowered.rfind("dml:", 0) == 0) {
+        return lowered;
+    }
     return std::string();
 }
 
@@ -575,7 +581,7 @@ int runOnnxTestVideo(int argc, char** argv)
                 << "  --memattn path              optional memory attention override\n"
                 << "  --memenc path               optional memory encoder override\n"
                 << "  --constants path            optional NPZ constants override\n"
-                << "  --device cpu|cuda|cuda:N    optional runtime device override\n"
+                << "  --device cpu|cuda|cuda:N|dml|dml:N    optional runtime device override\n"
                 << "  --prompt seed_points|bounding_box\n"
                 << "  --points x,y,label;...      noninteractive frame-0 prompt\n"
                 << "  --box x1,y1,x2,y2           noninteractive frame-0 prompt\n"
@@ -601,13 +607,14 @@ int runOnnxTestVideo(int argc, char** argv)
     if (deviceExplicit) {
         device = normalizeDeviceArgument(requestedDevice);
         if (device.empty()) {
-            std::cerr << "[ERROR] --device must be cpu|cuda|cuda:N\n";
+            std::cerr << "[ERROR] --device must be cpu|cuda|cuda:N|dml|dml:N\n";
             return 1;
         }
     } else {
         const bool forceCpu = ArtifactResolver::isLowCostCpuProfile();
         const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
-        device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
+        const bool dmlAvailable = !forceCpu && SAM3::hasDirectMLProvider();
+        device = cudaAvailable ? "cuda:0" : (dmlAvailable ? "dml:0" : "cpu");
     }
     if (!threadsExplicit) {
         threads = ArtifactResolver::preferredRuntimeThreads(hardwareThreads, device);

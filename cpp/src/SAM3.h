@@ -175,6 +175,7 @@ public:
     bool modelExists(const std::string& modelPath) const;
 
     static bool hasCudaDriver();
+    static bool hasDirectMLProvider();
     static void setupSessionOptions(Ort::SessionOptions& options,
                                     int threadsNumber,
                                     GraphOptimizationLevel optLevel,

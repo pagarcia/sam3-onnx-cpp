@@ -272,6 +272,12 @@ std::string normalizeDeviceArgument(const std::string& value)
     if (lowered.rfind("cuda:", 0) == 0) {
         return lowered;
     }
+    if (lowered == "dml" || lowered == "directml") {
+        return "dml:0";
+    }
+    if (lowered.rfind("dml:", 0) == 0) {
+        return lowered;
+    }
     return std::string();
 }
 
@@ -350,7 +356,7 @@ int runOnnxTestImage(int argc, char** argv)
                 << "  --image path                optional image path; opens a file dialog if omitted\n"
                 << "  --encoder path              optional image encoder override\n"
                 << "  --decoder path              optional prompt decoder override\n"
-                << "  --device cpu|cuda|cuda:N    optional runtime device override\n"
+                << "  --device cpu|cuda|cuda:N|dml|dml:N    optional runtime device override\n"
                 << "  --prompt seed_points|bounding_box\n"
                 << "  --points x,y,label;...      noninteractive seed-point prompt\n"
                 << "  --box x1,y1,x2,y2           noninteractive box prompt\n"
@@ -383,13 +389,14 @@ int runOnnxTestImage(int argc, char** argv)
     if (deviceExplicit) {
         device = normalizeDeviceArgument(requestedDevice);
         if (device.empty()) {
-            std::cerr << "[ERROR] --device must be cpu|cuda|cuda:N\n";
+            std::cerr << "[ERROR] --device must be cpu|cuda|cuda:N|dml|dml:N\n";
             return 1;
         }
     } else {
         const bool forceCpu = ArtifactResolver::isLowCostCpuProfile();
         const bool cudaAvailable = !forceCpu && SAM3::hasCudaDriver();
-        device = (forceCpu || !cudaAvailable) ? "cpu" : "cuda:0";
+        const bool dmlAvailable = !forceCpu && SAM3::hasDirectMLProvider();
+        device = cudaAvailable ? "cuda:0" : (dmlAvailable ? "dml:0" : "cpu");
     }
     if (!threadsExplicit) {
         threads = ArtifactResolver::preferredRuntimeThreads(hardwareThreads, device);
@@ -449,9 +456,13 @@ int runOnnxTestImage(int argc, char** argv)
     }
 
     if (!pointsSpec.empty() || !boxSpec.empty()) {
+        const auto decoderStart = std::chrono::high_resolution_clock::now();
         const Image<float> mask = sam.inferSingleFrame(
             SAM3Size(image.cols, image.rows),
             nonInteractivePrompts);
+        const double decoderElapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - decoderStart).count();
+        std::cout << "[INFO] Image decoder => " << decoderElapsedMs << " ms\n";
         const cv::Mat overlay = overlayMask(
             image,
             CVHelpers::imageToCvMatWithType(mask, CV_8UC1, 255.0));

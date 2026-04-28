@@ -32,6 +32,9 @@ struct VideoRuntimeSelection {
     std::string mode;
 };
 
+inline bool pathExists(const std::filesystem::path& path);
+inline std::filesystem::path normalizePath(const std::filesystem::path& path);
+
 inline std::string lowerCopy(std::string value)
 {
     std::transform(
@@ -55,6 +58,28 @@ inline bool isLowCostCpuProfile()
         || profile == "lowcost_cpu"
         || profile == "cpu-lowcost"
         || profile == "low-cost-cpu";
+}
+
+inline bool isDirectMLDevice(const std::string& device)
+{
+    const std::string lowered = lowerCopy(device);
+    return lowered.rfind("dml", 0) == 0 || lowered.rfind("directml", 0) == 0;
+}
+
+inline std::filesystem::path preferDirectMLArtifactPath(const std::filesystem::path& path,
+                                                        const std::string& device)
+{
+    if (!isDirectMLDevice(device) || path.empty() || lowerCopy(path.extension().string()) != ".onnx") {
+        return path;
+    }
+
+    const std::filesystem::path dmlPath =
+        path.parent_path() / (path.stem().string() + ".dml.onnx");
+    if (pathExists(dmlPath)) {
+        return normalizePath(dmlPath);
+    }
+
+    return path;
 }
 
 inline int preferredRuntimeThreads(int fallback, const std::string& device)
@@ -368,8 +393,12 @@ inline ImageRuntimeSelection resolveImageRuntimePaths(const std::string& encoder
 
     if (!resolvedEncoderCandidate.empty() && !resolvedDecoderCandidate.empty()) {
         ImageRuntimeSelection selection;
-        selection.encoderPath = normalizePath(resolvedEncoderCandidate).string();
-        selection.decoderPath = normalizePath(resolvedDecoderCandidate).string();
+        selection.encoderPath = preferDirectMLArtifactPath(
+            normalizePath(resolvedEncoderCandidate),
+            device).string();
+        selection.decoderPath = preferDirectMLArtifactPath(
+            normalizePath(resolvedDecoderCandidate),
+            device).string();
         selection.precision = resolvedEncoderVariant == resolvedDecoderVariant
             ? resolvedEncoderVariant
             : ("enc=" + resolvedEncoderVariant + ",dec=" + resolvedDecoderVariant);
@@ -422,28 +451,42 @@ inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string& encoder
 
             VideoRuntimeSelection selection;
             selection.encoderPath = imageSelection.encoderPath;
-            selection.decoderPath = normalizePath(decoderCandidate).string();
-            selection.memoryAttentionPath = normalizePath(memoryAttentionCandidate).string();
-            selection.memoryEncoderPath = normalizePath(memoryEncoderCandidate).string();
+            selection.decoderPath = preferDirectMLArtifactPath(
+                normalizePath(decoderCandidate),
+                device).string();
+            selection.memoryAttentionPath = preferDirectMLArtifactPath(
+                normalizePath(memoryAttentionCandidate),
+                device).string();
+            selection.memoryEncoderPath = preferDirectMLArtifactPath(
+                normalizePath(memoryEncoderCandidate),
+                device).string();
             selection.constantsPath = normalizePath(constantsCandidate).string();
             selection.precision = precision;
             selection.graphProfile = graphProfile;
             selection.mode = "resolved";
 
             if (!encoderPath.empty()) {
-                selection.encoderPath = normalizePath(candidatePath(encoderPath)).string();
+                selection.encoderPath = preferDirectMLArtifactPath(
+                    normalizePath(candidatePath(encoderPath)),
+                    device).string();
                 selection.mode = "manual-encoder";
             }
             if (!decoderPath.empty()) {
-                selection.decoderPath = normalizePath(candidatePath(decoderPath)).string();
+                selection.decoderPath = preferDirectMLArtifactPath(
+                    normalizePath(candidatePath(decoderPath)),
+                    device).string();
                 selection.mode = "manual-decoder";
             }
             if (!memoryAttentionPath.empty()) {
-                selection.memoryAttentionPath = normalizePath(candidatePath(memoryAttentionPath)).string();
+                selection.memoryAttentionPath = preferDirectMLArtifactPath(
+                    normalizePath(candidatePath(memoryAttentionPath)),
+                    device).string();
                 selection.mode = "manual-memory-attention";
             }
             if (!memoryEncoderPath.empty()) {
-                selection.memoryEncoderPath = normalizePath(candidatePath(memoryEncoderPath)).string();
+                selection.memoryEncoderPath = preferDirectMLArtifactPath(
+                    normalizePath(candidatePath(memoryEncoderPath)),
+                    device).string();
                 selection.mode = "manual-memory-encoder";
             }
             if (!constantsPath.empty()) {
@@ -456,9 +499,15 @@ inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string& encoder
 
     VideoRuntimeSelection fallback;
     fallback.encoderPath = imageSelection.encoderPath;
-    fallback.decoderPath = normalizePath(candidatePath(decoderPath)).string();
-    fallback.memoryAttentionPath = normalizePath(candidatePath(memoryAttentionPath)).string();
-    fallback.memoryEncoderPath = normalizePath(candidatePath(memoryEncoderPath)).string();
+    fallback.decoderPath = preferDirectMLArtifactPath(
+        normalizePath(candidatePath(decoderPath)),
+        device).string();
+    fallback.memoryAttentionPath = preferDirectMLArtifactPath(
+        normalizePath(candidatePath(memoryAttentionPath)),
+        device).string();
+    fallback.memoryEncoderPath = preferDirectMLArtifactPath(
+        normalizePath(candidatePath(memoryEncoderPath)),
+        device).string();
     fallback.constantsPath = normalizePath(candidatePath(constantsPath)).string();
     fallback.precision = "manual";
     fallback.graphProfile = preferredGraphProfile;
