@@ -84,10 +84,25 @@ struct SAM3Rect {
     SAM3Point br() const { return SAM3Point(x + width, y + height); }
 };
 
+enum class SAM3MaskPromptStrategy {
+    Box,
+    Point,
+};
+
 struct SAM3Prompts {
     std::vector<SAM3Point> points;
     std::vector<int> pointLabels;
     std::vector<SAM3Rect> rects;
+    Image<float> mask;
+    SAM3MaskPromptStrategy maskPromptStrategy = SAM3MaskPromptStrategy::Box;
+};
+
+struct PreparedSAM3MaskPrompt {
+    std::vector<float> maskLogitsHighRes;
+    std::vector<int64_t> maskLogitsShape;
+    Image<float> originalMask;
+    std::vector<float> fallbackPointCoords;
+    std::vector<int32_t> fallbackPointLabels;
 };
 
 struct SAM3Node {
@@ -222,7 +237,11 @@ private:
                                            const SAM3Size& originalImageSize) const;
     Image<float> createTrackerMaskFromHighRes(const Ort::Value& predMaskHighRes,
                                               const SAM3Size& originalImageSize) const;
+    bool hasMaskPrompt(const SAM3Prompts& prompts) const;
     bool promptsEmpty(const SAM3Prompts& prompts) const;
+    bool prepareMaskPrompt(const SAM3Prompts& prompts,
+                           const SAM3Size& originalImageSize,
+                           PreparedSAM3MaskPrompt* preparedOut) const;
 
     Image<float> inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& encoderOutputs,
                                                    const SAM3Size& originalImageSize,

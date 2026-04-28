@@ -123,6 +123,37 @@ bool parseBoxSpec(const std::string& text, SAM3Rect* rectOut)
     return true;
 }
 
+bool parseMaskPromptStrategy(const std::string& text, SAM3MaskPromptStrategy* strategyOut)
+{
+    if (text == "box") {
+        *strategyOut = SAM3MaskPromptStrategy::Box;
+        return true;
+    }
+    if (text == "point") {
+        *strategyOut = SAM3MaskPromptStrategy::Point;
+        return true;
+    }
+    return false;
+}
+
+bool loadMaskPromptImage(const std::string& path, Image<float>* maskOut)
+{
+    if (path.empty() || !maskOut) {
+        return false;
+    }
+
+    const cv::Mat maskGray = cv::imread(path, cv::IMREAD_GRAYSCALE);
+    if (maskGray.empty()) {
+        std::cerr << "[ERROR] Could not read mask prompt " << path << '\n';
+        return false;
+    }
+
+    cv::Mat maskFloat;
+    maskGray.convertTo(maskFloat, CV_32FC1, 1.0 / 255.0);
+    *maskOut = CVHelpers::cvMatToImage<float>(maskFloat);
+    return true;
+}
+
 SAM3Rect normalizedRect(const SAM3Rect& rect)
 {
     SAM3Rect normalized = rect;
@@ -524,6 +555,7 @@ int runOnnxTestVideo(int argc, char** argv)
     std::string videoPath;
     std::string pointsSpec;
     std::string boxSpec;
+    std::string maskPath;
     std::string outputPath;
     int hardwareThreads = static_cast<int>(std::thread::hardware_concurrency());
     if (hardwareThreads <= 0) {
@@ -533,6 +565,7 @@ int runOnnxTestVideo(int argc, char** argv)
     bool threadsExplicit = false;
     int maxFrames = 0;
     PromptMode promptMode = PromptMode::SeedPoints;
+    SAM3MaskPromptStrategy maskPromptStrategy = SAM3MaskPromptStrategy::Box;
 
     for (int index = 2; index < argc; ++index) {
         const std::string arg = argv[index];
@@ -569,6 +602,13 @@ int runOnnxTestVideo(int argc, char** argv)
             pointsSpec = argv[++index];
         } else if (arg == "--box" && index + 1 < argc) {
             boxSpec = argv[++index];
+        } else if (arg == "--mask" && index + 1 < argc) {
+            maskPath = argv[++index];
+        } else if (arg == "--mask_prompt_strategy" && index + 1 < argc) {
+            if (!parseMaskPromptStrategy(argv[++index], &maskPromptStrategy)) {
+                std::cerr << "[ERROR] --mask_prompt_strategy must be box|point\n";
+                return 1;
+            }
         } else if (arg == "--output" && index + 1 < argc) {
             outputPath = argv[++index];
         } else if (arg == "--help" || arg == "-h") {
@@ -585,6 +625,8 @@ int runOnnxTestVideo(int argc, char** argv)
                 << "  --prompt seed_points|bounding_box\n"
                 << "  --points x,y,label;...      noninteractive frame-0 prompt\n"
                 << "  --box x1,y1,x2,y2           noninteractive frame-0 prompt\n"
+                << "  --mask path                 noninteractive dense mask prompt image for frame 0\n"
+                << "  --mask_prompt_strategy box|point\n"
                 << "  --max_frames N              frame limit\n"
                 << "  --output path               output overlay video path\n";
             return 0;
@@ -676,7 +718,7 @@ int runOnnxTestVideo(int argc, char** argv)
     std::map<int, CachedEncoderOutputs> anchorCaches;
     int totalFrames = 0;
 
-    if (!pointsSpec.empty() || !boxSpec.empty()) {
+    if (!pointsSpec.empty() || !boxSpec.empty() || !maskPath.empty()) {
         cv::VideoCapture capture(videoPath);
         if (!capture.isOpened()) {
             std::cerr << "[ERROR] Could not open the input video.\n";
@@ -694,12 +736,18 @@ int runOnnxTestVideo(int argc, char** argv)
         }
 
         SAM3Prompts prompts;
+        if (!maskPath.empty()) {
+            if (!loadMaskPromptImage(maskPath, &prompts.mask)) {
+                return 1;
+            }
+            prompts.maskPromptStrategy = maskPromptStrategy;
+        }
         if (!pointsSpec.empty()) {
             if (!parsePointsSpec(pointsSpec, &prompts.points, &prompts.pointLabels)) {
                 std::cerr << "[ERROR] Could not parse --points.\n";
                 return 1;
             }
-        } else {
+        } else if (!boxSpec.empty()) {
             SAM3Rect rect;
             if (!parseBoxSpec(boxSpec, &rect)) {
                 std::cerr << "[ERROR] Could not parse --box.\n";

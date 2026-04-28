@@ -17,7 +17,129 @@ constexpr float kSam3Std = 0.5f;
 
 bool SAM3::promptsEmpty(const SAM3Prompts& prompts) const
 {
-    return prompts.points.empty() && prompts.rects.empty();
+    return prompts.points.empty() && prompts.rects.empty() && !hasMaskPrompt(prompts);
+}
+
+bool SAM3::hasMaskPrompt(const SAM3Prompts& prompts) const
+{
+    return prompts.mask.getWidth() > 0
+        && prompts.mask.getHeight() > 0
+        && prompts.mask.getChannels() == 1;
+}
+
+bool SAM3::prepareMaskPrompt(const SAM3Prompts& prompts,
+                             const SAM3Size& originalImageSize,
+                             PreparedSAM3MaskPrompt* preparedOut) const
+{
+    if (!preparedOut) {
+        return false;
+    }
+    *preparedOut = PreparedSAM3MaskPrompt();
+
+    const SAM3Size inputSize = getInputSize();
+    if (!hasMaskPrompt(prompts)
+        || inputSize.width <= 0 || inputSize.height <= 0
+        || originalImageSize.width <= 0 || originalImageSize.height <= 0) {
+        return false;
+    }
+
+    try {
+        cv::Mat maskFloat = CVHelpers::imageToCvMat(prompts.mask);
+        if (maskFloat.type() != CV_32FC1) {
+            maskFloat.convertTo(maskFloat, CV_32FC1);
+        }
+
+        cv::Mat targetFloat;
+        cv::Mat originalBinary;
+        if (prompts.mask.getWidth() == originalImageSize.width
+            && prompts.mask.getHeight() == originalImageSize.height) {
+            cv::threshold(maskFloat, originalBinary, 0.5, 1.0, cv::THRESH_BINARY);
+
+            cv::Mat resized;
+            cv::resize(
+                originalBinary,
+                resized,
+                cv::Size(inputSize.width, inputSize.height),
+                0.0,
+                0.0,
+                cv::INTER_LINEAR);
+            cv::threshold(resized, targetFloat, 0.5, 1.0, cv::THRESH_BINARY);
+            preparedOut->originalMask = CVHelpers::cvMatToImage<float>(originalBinary);
+        } else if (prompts.mask.getWidth() == inputSize.width
+                   && prompts.mask.getHeight() == inputSize.height) {
+            cv::threshold(maskFloat, targetFloat, 0.5, 1.0, cv::THRESH_BINARY);
+        } else {
+            std::cerr
+                << "[ERROR] Mask prompt must match either the original image size ("
+                << originalImageSize.width << "x" << originalImageSize.height
+                << ") or the SAM3 input size (" << inputSize.width << "x" << inputSize.height
+                << "); got " << prompts.mask.getWidth() << "x" << prompts.mask.getHeight() << ".\n";
+            return false;
+        }
+
+        int xMin = inputSize.width;
+        int yMin = inputSize.height;
+        int xMax = -1;
+        int yMax = -1;
+        preparedOut->maskLogitsHighRes.assign(
+            static_cast<size_t>(inputSize.width) * static_cast<size_t>(inputSize.height),
+            -20.0f);
+        for (int y = 0; y < inputSize.height; ++y) {
+            const float* row = targetFloat.ptr<float>(y);
+            for (int x = 0; x < inputSize.width; ++x) {
+                if (row[x] <= 0.5f) {
+                    continue;
+                }
+                preparedOut->maskLogitsHighRes[static_cast<size_t>(y) * inputSize.width + x] = 20.0f;
+                xMin = std::min(xMin, x);
+                yMin = std::min(yMin, y);
+                xMax = std::max(xMax, x);
+                yMax = std::max(yMax, y);
+            }
+        }
+
+        if (xMax < 0 || yMax < 0) {
+            std::cerr << "[ERROR] Mask prompt cannot be empty.\n";
+            return false;
+        }
+
+        preparedOut->maskLogitsShape = {
+            1,
+            1,
+            static_cast<int64_t>(inputSize.height),
+            static_cast<int64_t>(inputSize.width),
+        };
+        if (preparedOut->originalMask.getWidth() <= 0 || preparedOut->originalMask.getHeight() <= 0) {
+            preparedOut->originalMask = CVHelpers::resizeAndThresholdMask(
+                preparedOut->maskLogitsHighRes.data(),
+                inputSize.width,
+                inputSize.height,
+                originalImageSize.width,
+                originalImageSize.height,
+                0.0f);
+        }
+
+        const bool usePointPrompt =
+            prompts.maskPromptStrategy == SAM3MaskPromptStrategy::Point
+            || xMin == xMax
+            || yMin == yMax;
+        if (usePointPrompt) {
+            preparedOut->fallbackPointCoords.push_back((xMin + xMax) * 0.5f);
+            preparedOut->fallbackPointCoords.push_back((yMin + yMax) * 0.5f);
+            preparedOut->fallbackPointLabels.push_back(1);
+        } else {
+            preparedOut->fallbackPointCoords.push_back(static_cast<float>(xMin));
+            preparedOut->fallbackPointCoords.push_back(static_cast<float>(yMin));
+            preparedOut->fallbackPointLabels.push_back(2);
+            preparedOut->fallbackPointCoords.push_back(static_cast<float>(xMax));
+            preparedOut->fallbackPointCoords.push_back(static_cast<float>(yMax));
+            preparedOut->fallbackPointLabels.push_back(3);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "[ERROR] prepareMaskPrompt => " << error.what() << '\n';
+        return false;
+    }
 }
 
 void SAM3::buildImagePromptInputs(const SAM3Prompts& prompts,
@@ -56,6 +178,25 @@ void SAM3::buildImagePromptInputs(const SAM3Prompts& prompts,
         pointsOut->push_back(
             prompts.points[index].y * static_cast<float>(inputSize.height) / originalImageSize.height);
         labelsOut->push_back(static_cast<int64_t>(prompts.pointLabels[index]));
+    }
+
+    if (labelsOut->empty() && hasMaskPrompt(prompts)) {
+        PreparedSAM3MaskPrompt preparedMask;
+        if (!prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
+            return;
+        }
+
+        if (preparedMask.fallbackPointLabels.size() == 2
+            && preparedMask.fallbackPointLabels[0] == 2
+            && preparedMask.fallbackPointLabels[1] == 3) {
+            *boxesOut = preparedMask.fallbackPointCoords;
+            return;
+        }
+
+        *pointsOut = preparedMask.fallbackPointCoords;
+        labelsOut->assign(
+            preparedMask.fallbackPointLabels.begin(),
+            preparedMask.fallbackPointLabels.end());
     }
 }
 

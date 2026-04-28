@@ -114,6 +114,37 @@ bool parseBoxSpec(const std::string& text, SAM3Rect* rectOut)
     return true;
 }
 
+bool parseMaskPromptStrategy(const std::string& text, SAM3MaskPromptStrategy* strategyOut)
+{
+    if (text == "box") {
+        *strategyOut = SAM3MaskPromptStrategy::Box;
+        return true;
+    }
+    if (text == "point") {
+        *strategyOut = SAM3MaskPromptStrategy::Point;
+        return true;
+    }
+    return false;
+}
+
+bool loadMaskPromptImage(const std::string& path, Image<float>* maskOut)
+{
+    if (path.empty() || !maskOut) {
+        return false;
+    }
+
+    const cv::Mat maskGray = cv::imread(path, cv::IMREAD_GRAYSCALE);
+    if (maskGray.empty()) {
+        std::cerr << "[ERROR] Could not read mask prompt " << path << '\n';
+        return false;
+    }
+
+    cv::Mat maskFloat;
+    maskGray.convertTo(maskFloat, CV_32FC1, 1.0 / 255.0);
+    *maskOut = CVHelpers::cvMatToImage<float>(maskFloat);
+    return true;
+}
+
 SAM3Rect normalizedRect(const SAM3Rect& rect)
 {
     SAM3Rect normalized = rect;
@@ -308,6 +339,7 @@ int runOnnxTestImage(int argc, char** argv)
     std::string imagePath;
     std::string pointsSpec;
     std::string boxSpec;
+    std::string maskPath;
     std::string saveOverlayPath;
     int hardwareThreads = static_cast<int>(std::thread::hardware_concurrency());
     if (hardwareThreads <= 0) {
@@ -317,6 +349,7 @@ int runOnnxTestImage(int argc, char** argv)
     bool threadsExplicit = false;
     bool noGui = false;
     PromptMode promptMode = PromptMode::SeedPoints;
+    SAM3MaskPromptStrategy maskPromptStrategy = SAM3MaskPromptStrategy::Box;
 
     for (int index = 2; index < argc; ++index) {
         const std::string arg = argv[index];
@@ -345,6 +378,13 @@ int runOnnxTestImage(int argc, char** argv)
             pointsSpec = argv[++index];
         } else if (arg == "--box" && index + 1 < argc) {
             boxSpec = argv[++index];
+        } else if (arg == "--mask" && index + 1 < argc) {
+            maskPath = argv[++index];
+        } else if (arg == "--mask_prompt_strategy" && index + 1 < argc) {
+            if (!parseMaskPromptStrategy(argv[++index], &maskPromptStrategy)) {
+                std::cerr << "[ERROR] --mask_prompt_strategy must be box|point\n";
+                return 1;
+            }
         } else if (arg == "--save_overlay" && index + 1 < argc) {
             saveOverlayPath = argv[++index];
         } else if (arg == "--no_gui") {
@@ -360,6 +400,8 @@ int runOnnxTestImage(int argc, char** argv)
                 << "  --prompt seed_points|bounding_box\n"
                 << "  --points x,y,label;...      noninteractive seed-point prompt\n"
                 << "  --box x1,y1,x2,y2           noninteractive box prompt\n"
+                << "  --mask path                 noninteractive dense mask prompt image\n"
+                << "  --mask_prompt_strategy box|point\n"
                 << "  --save_overlay path         write the overlay image\n"
                 << "  --no_gui                    do not open an OpenCV window\n"
                 << "  --threads N                 ORT intra-op threads\n";
@@ -441,6 +483,12 @@ int runOnnxTestImage(int argc, char** argv)
     std::cout << "[INFO] Encoder => " << encoderElapsedMs << " ms\n";
 
     SAM3Prompts nonInteractivePrompts;
+    if (!maskPath.empty()) {
+        if (!loadMaskPromptImage(maskPath, &nonInteractivePrompts.mask)) {
+            return 1;
+        }
+        nonInteractivePrompts.maskPromptStrategy = maskPromptStrategy;
+    }
     if (!pointsSpec.empty()) {
         if (!parsePointsSpec(pointsSpec, &nonInteractivePrompts.points, &nonInteractivePrompts.pointLabels)) {
             std::cerr << "[ERROR] Could not parse --points.\n";
@@ -455,7 +503,7 @@ int runOnnxTestImage(int argc, char** argv)
         nonInteractivePrompts.rects.push_back(rect);
     }
 
-    if (!pointsSpec.empty() || !boxSpec.empty()) {
+    if (!pointsSpec.empty() || !boxSpec.empty() || !maskPath.empty()) {
         const auto decoderStart = std::chrono::high_resolution_clock::now();
         const Image<float> mask = sam.inferSingleFrame(
             SAM3Size(image.cols, image.rows),
@@ -480,7 +528,7 @@ int runOnnxTestImage(int argc, char** argv)
     }
 
     if (noGui) {
-        std::cerr << "[ERROR] --no_gui requires --points or --box.\n";
+        std::cerr << "[ERROR] --no_gui requires --points, --box, or --mask.\n";
         return 1;
     }
 

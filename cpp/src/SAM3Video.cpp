@@ -227,6 +227,14 @@ Image<float> SAM3::previewConditioningFrame(const SAM3Size& originalImageSize,
         return Image<float>(originalImageSize.width, originalImageSize.height, 1);
     }
 
+    if (hasMaskPrompt(prompts)) {
+        PreparedSAM3MaskPrompt preparedMask;
+        if (prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
+            return preparedMask.originalMask;
+        }
+        return Image<float>(originalImageSize.width, originalImageSize.height, 1);
+    }
+
     try {
         std::vector<float> pointCoords;
         std::vector<int32_t> pointLabels;
@@ -331,6 +339,13 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
     }
 
     try {
+        const bool denseMaskConditioning = conditioningFrame && hasMaskPrompt(prompts);
+        PreparedSAM3MaskPrompt preparedMask;
+        if (denseMaskConditioning
+            && !prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
+            return Image<float>(originalImageSize.width, originalImageSize.height, 1);
+        }
+
         const Ort::Value& highRes0 = encoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)];
         const Ort::Value& highRes1 = encoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)];
         const Ort::Value& currentVisionFeat = encoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)];
@@ -348,6 +363,10 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
 
         if (conditioningFrame) {
             buildTrackerPromptInputs(prompts, originalImageSize, &pointCoordsStorage, &pointLabelsStorage);
+            if (pointLabelsStorage.empty() && denseMaskConditioning) {
+                pointCoordsStorage = preparedMask.fallbackPointCoords;
+                pointLabelsStorage = preparedMask.fallbackPointLabels;
+            }
             if (pointLabelsStorage.empty()) {
                 std::cerr << "[WARN] inferMultiFrame => conditioning frame has no prompt tensors.\n";
                 return Image<float>(originalImageSize.width, originalImageSize.height, 1);
@@ -455,18 +474,34 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
 
         const auto memoryEncoderStart = std::chrono::steady_clock::now();
         std::vector<Ort::Value> memoryEncoderInputs;
-        memoryEncoderInputs.push_back(createTensorView<float>(
-            m_memoryInfo,
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)].GetTensorMutableData<float>(),
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)].GetTensorTypeAndShapeInfo().GetShape()));
+        if (denseMaskConditioning) {
+            memoryEncoderInputs.push_back(createTensor<float>(
+                m_memoryInfo,
+                preparedMask.maskLogitsHighRes,
+                preparedMask.maskLogitsShape));
+        } else {
+            memoryEncoderInputs.push_back(createTensorView<float>(
+                m_memoryInfo,
+                decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)].GetTensorMutableData<float>(),
+                decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)].GetTensorTypeAndShapeInfo().GetShape()));
+        }
         memoryEncoderInputs.push_back(createTensorView<float>(
             m_memoryInfo,
             encoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)].GetTensorMutableData<float>(),
             currentVisionShape));
-        memoryEncoderInputs.push_back(createTensorView<float>(
-            m_memoryInfo,
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderObjectScoreIndex)].GetTensorMutableData<float>(),
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderObjectScoreIndex)].GetTensorTypeAndShapeInfo().GetShape()));
+        std::vector<float> objectPresentLogitsStorage;
+        if (denseMaskConditioning) {
+            objectPresentLogitsStorage = {1.0f};
+            memoryEncoderInputs.push_back(createTensor<float>(
+                m_memoryInfo,
+                objectPresentLogitsStorage,
+                {1, 1}));
+        } else {
+            memoryEncoderInputs.push_back(createTensorView<float>(
+                m_memoryInfo,
+                decoderOutputs[static_cast<size_t>(m_trackerDecoderObjectScoreIndex)].GetTensorMutableData<float>(),
+                decoderOutputs[static_cast<size_t>(m_trackerDecoderObjectScoreIndex)].GetTensorTypeAndShapeInfo().GetShape()));
+        }
         const std::vector<float> isMaskFromPointsTensor = {isMaskFromPoints ? 1.0f : 0.0f};
         memoryEncoderInputs.push_back(createTensor<float>(
             m_memoryInfo,
@@ -499,9 +534,11 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             appendNonConditioningState(frameState);
         }
 
-        const Image<float> mask = createTrackerMaskFromHighRes(
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)],
-            originalImageSize);
+        const Image<float> mask = denseMaskConditioning
+            ? preparedMask.originalMask
+            : createTrackerMaskFromHighRes(
+                decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)],
+                originalImageSize);
         ++m_segmentFrameIndex;
 
         std::cout << "[INFO] Frame times => Enc: " << encTimeMs
