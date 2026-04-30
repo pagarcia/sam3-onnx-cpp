@@ -570,6 +570,27 @@ Noninteractive smoke tests:
 - On CPU video, use `--safe` in Python and `SAM3_ORT_GRAPH_OPT=disable` in C++ to avoid aggressive ORT graph rewrites on the exported tracker modules.
 - Keep live CPU video demos to `2` or `3` frames.
 
+## Known Issues And Next Steps
+
+- macOS is currently CPU-first. ONNX Runtime may list CoreML as an available
+  provider, but the SAM3 Python and C++ paths still need a validated CoreML
+  integration. The first useful target is encoder acceleration.
+- SAM3 video on CPU is slow because the 1008x1008 vision encoder and memory
+  attention are expensive. CUDA, TensorRT, FP16 tracker artifacts, and I/O
+  binding are the main acceleration paths to harden next.
+- The repo intentionally uses a hybrid image strategy: downloaded
+  Hugging Face/community image ONNX artifacts plus locally exported video
+  tracker modules. A future milestone is a fully reproducible local image export
+  once the remaining export-sensitive SAM3 internals are handled cleanly.
+- Some tracker graphs are sensitive to ONNX Runtime graph optimization. For now,
+  use `--safe` in Python or `SAM3_ORT_GRAPH_OPT=disable` in C++ when needed;
+  future work should identify the smallest graph changes needed to make higher
+  optimization levels reliable.
+- The macOS C++ package depends on Homebrew OpenCV and local ONNX Runtime dylibs.
+  A proper redistributable app should bundle or relink those dependencies.
+- The Windows CUDA path should be kept in parity with macOS using the same
+  noninteractive image and short-video smoke tests.
+
 ## Native Reference Demo
 
 The native reference path uses the sibling `../sam3` checkout:
