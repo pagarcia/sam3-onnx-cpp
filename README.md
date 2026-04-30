@@ -14,6 +14,21 @@ Important distinction:
 
 For live CPU demos, keep video very short with `--max_frames 2` or `--max_frames 3`.
 
+## Table Of Contents
+
+- [How The Pieces Fit](#how-the-pieces-fit)
+- [ONNX Export Strategy](#onnx-export-strategy)
+- [Repository Layout](#repository-layout)
+- [Demo Controls](#demo-controls)
+- [Artifacts](#artifacts)
+- [macOS Workflow](#macos-workflow)
+- [Windows Workflow](#windows-workflow)
+- [Runtime Variables](#runtime-variables)
+- [Quality And Performance Notes](#quality-and-performance-notes)
+- [Known Issues And Next Steps](#known-issues-and-next-steps)
+- [Native Reference Demo](#native-reference-demo)
+- [License](#license)
+
 ## How The Pieces Fit
 
 ```mermaid
