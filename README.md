@@ -1,108 +1,27 @@
 # sam3-onnx-cpp
 
-SAM3 ONNX experiments and wrappers built around the SAM3 tracker/image model.
+SAM3 ONNX demos for Python and C++.
 
-This repo now contains both Python and C++ paths:
+This repository shows the SAM3 image ONNX path and the SAM3 tracker/video ONNX
+path through ONNX Runtime. It is intended for quick demos, smoke tests, and
+experiments around exporting SAM3 pieces into ONNX/C++.
 
-- Python ONNX demos for image segmentation and video tracking.
-- A C++ `Segment` executable for image segmentation and video tracking through ONNX Runtime.
-- An exporter for tracker-specific video ONNX modules built from a local `sam3` checkout.
-- Native SAM3 reference scripts for checking parity against the ONNX path.
-- Benchmark helpers and CPU quantization experiments.
+Important distinction:
 
-The image encoder is still the shipped Hugging Face ONNX encoder. The repo exports and wraps the video tracker-specific modules around that encoder.
+- Image demos use the downloaded Hugging Face/community ONNX pair.
+- Video demos use that downloaded vision encoder plus tracker modules exported by this repo.
+- The ONNX image demo is a low-level prompt-head demo, not a full production SAM3 quality comparison.
 
-## Status Snapshot
-
-Current working state:
-
-- C++ image path works on CPU and CUDA.
-- C++ video path works on CPU and CUDA.
-- The video path uses the downloaded `vision_encoder*.onnx` plus the locally exported tracker bundle.
-- CPU auto mode prefers the available int8 image encoder/decoder artifacts.
-- CUDA auto mode prefers fp16 image/tracker artifacts.
-- The video smoke test should be kept small on CPU, for example `--max_frames 2` or `--max_frames 3`.
-
-Performance expectations:
-
-- CPU inference is supported but can be slow because the SAM3 vision encoder is large.
-- CUDA fp16 inference is the recommended path for interactive video use.
-- The first annotated video frame may report `Enc: 0 ms` when encoder outputs were already cached during preview. Propagated frames pay the encoder cost.
-- ONNX Runtime may print CUDA graph-optimization warnings with the current exported graphs.
-
-## What Comes From Hugging Face vs This Repo
-
-### Downloaded from Hugging Face
-
-The image ONNX pair is downloaded from:
-
-- `onnx-community/sam3-tracker-ONNX`
-
-Files fetched by `fetch_onnx_models.bat` / `fetch_onnx_models.sh`:
-
-- `onnx/vision_encoder.onnx`
-- `onnx/vision_encoder.onnx_data`
-- `onnx/vision_encoder_fp16.onnx`
-- `onnx/vision_encoder_fp16.onnx_data`
-- `onnx/prompt_encoder_mask_decoder.onnx`
-- `onnx/prompt_encoder_mask_decoder.onnx_data`
-- `onnx/prompt_encoder_mask_decoder_fp16.onnx`
-- `onnx/prompt_encoder_mask_decoder_fp16.onnx_data`
-
-These are the models used by the image-only ONNX demo.
-
-### Exported by this repo
-
-The exporter in `export/` builds tracker-specific ONNX modules from a local SAM3 checkout:
-
-- `checkpoints/sam3/video_onnx/image_decoder_single.onnx`
-- `checkpoints/sam3/video_onnx/image_decoder_single_fp16.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention_single.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention_single_fp16.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder_single.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder_single_fp16.onnx`
-- `checkpoints/sam3/video_onnx/video_constants_single.npz`
-- `checkpoints/sam3/video_onnx/video_constants_single_fp16.npz`
-- `checkpoints/sam3/video_onnx/image_decoder_multi.onnx`
-- `checkpoints/sam3/video_onnx/image_decoder_multi_fp16.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention_multi.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention_multi_fp16.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder_multi.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder_multi_fp16.onnx`
-- `checkpoints/sam3/video_onnx/video_constants_multi.npz`
-- `checkpoints/sam3/video_onnx/video_constants_multi_fp16.npz`
-
-Important limitation:
-
-- This repo does not currently export its own image encoder ONNX.
-- The video path reuses the downloaded `vision_encoder*.onnx` model and combines it with the locally exported tracker modules above.
-
-## Current Capabilities
-
-### Image ONNX path
-
-- Interactive segmentation on a single image.
-- Prompt types: positive / negative seed points and bounding boxes.
-- Uses ONNX Runtime with CPU, CUDA, or TensorRT execution providers when available.
-
-### Video ONNX path
-
-- Tracker propagation over video frames.
-- Supports single-frame and multi-frame prompt annotations.
-- Uses an internal `single` graph for one annotation and a `multi` graph for multi-annotation clips.
-- There are no user-facing preset names anymore.
-- On CUDA/TensorRT, the runtime automatically prefers the fp16 tracker bundle and warms the kernels on startup.
-- Uses the downloaded vision encoder plus repo-exported tracker modules.
-
-### Native reference path
-
-- Native SAM3 image demo.
-- Native-vs-ONNX comparison and benchmark scripts for the video tracker path.
+For live CPU demos, keep video very short with `--max_frames 2` or `--max_frames 3`.
 
 ## Repository Layout
 
 ```text
 sam3-onnx-cpp/
+|-- checkpoints/
+|   `-- sam3/
+|       |-- onnx/
+|       `-- video_onnx/
 |-- cpp/
 |   |-- CMakeLists.txt
 |   `-- src/
@@ -113,524 +32,503 @@ sam3-onnx-cpp/
 |   |-- onnx_test_image.py
 |   |-- onnx_test_video.py
 |   |-- inspect_onnx_io.py
-|   |-- compare_native_vs_onnx.py
-|   |-- benchmark_onnx_default.py
-|   |-- sweep_onnx_mem_frames.py
-|   |-- sweep_onnx_obj_ptrs.py
 |   `-- api_test_image.py
-|-- checkpoints/
-|   `-- sam3/
-|       |-- onnx/
-|       `-- video_onnx/
 |-- fetch_onnx_models.bat
 |-- fetch_onnx_models.sh
 `-- README.md
 ```
 
-## Preprocessing Notes
+## Demo Controls
 
-The downloaded image ONNX export expects:
+Seed points:
 
-- `pixel_values` resized directly to `1008x1008`
-- No padding
-- RGB input
-- Values scaled by `1/255`
-- Mean/std normalization with `0.5`
+- Left click: foreground point
+- Right click: background point
+- Middle click: clear
+- `Enter` or `Esc`: accept/continue in video prompt windows
+- `Esc`: quit image windows
 
-Point and box coordinates are scaled independently with `scale_x` and `scale_y` to match the resized image.
+Bounding box:
 
-## Environment Setup
+- Drag left mouse button: draw box
+- Right click or double click: clear
+- `Enter` or `Esc`: accept/continue in video prompt windows
+- `Esc`: quit image windows
 
-Use one environment for everything in this repo: ONNX demos, tracker export, and native SAM3 comparison.
+If `--image` or `--video` is omitted, the demo opens a file selector.
 
-```powershell
-python -m venv sam3_env
-.\sam3_env\Scripts\Activate.ps1
-pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
-```
+## Artifacts
 
-If you also have `conda` active in the same shell, run `conda deactivate` first so the venv owns the DLL search path cleanly on Windows.
-
-You also need a local `sam3` repository next to this repo by default:
+Downloaded image ONNX files live in:
 
 ```text
-../sam3
+checkpoints/sam3/onnx/
 ```
 
-or pass `--sam3-repo` explicitly.
-
-## Quick Deploy
-
-This is the shortest Windows-first path to get the project running from a fresh checkout.
-
-### ONNX-only deploy
-
-Use the same `sam3_env` environment even if you only want the ONNX image demo or the ONNX video tracker.
-
-1. Clone this repo.
-2. Create and activate the ONNX environment:
-
-```powershell
-python -m venv sam3_env
-.\sam3_env\Scripts\Activate.ps1
-pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
-```
-
-3. Download the Hugging Face encoder/image ONNX files:
-
-```powershell
-.\fetch_onnx_models.bat fp32
-.\fetch_onnx_models.bat fp16
-```
-
-4. Make sure these files exist under `checkpoints/sam3/onnx`:
-
-- `vision_encoder.onnx`
-- `vision_encoder.onnx_data`
-- `vision_encoder_fp16.onnx`
-- `vision_encoder_fp16.onnx_data`
-- `prompt_encoder_mask_decoder.onnx`
-- `prompt_encoder_mask_decoder.onnx_data`
-- `prompt_encoder_mask_decoder_fp16.onnx`
-- `prompt_encoder_mask_decoder_fp16.onnx_data`
-
-5. For video tracking, also make sure the tracker bundle exists under `checkpoints/sam3/video_onnx`:
-
-- `image_decoder_single.onnx`
-- `memory_attention_single.onnx`
-- `memory_encoder_single.onnx`
-- `video_constants_single.npz`
-- `image_decoder_multi.onnx`
-- `memory_attention_multi.onnx`
-- `memory_encoder_multi.onnx`
-- `video_constants_multi.npz`
-
-The runtime will automatically pick the fp16 tracker files when CUDA/TensorRT is available and the `_fp16` bundle exists.
-
-6. Run the image demo:
-
-```powershell
-python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
-```
-
-7. Or run the video tracker:
-
-```powershell
-.\sam3_env\Scripts\python.exe python\onnx_test_video.py --video "C:\path\to\video.mp4" --prompt seed_points
-```
-
-### Full deploy with export and native comparison
-
-Use this if you want the complete repo workflow, including exporting tracker graphs from a local SAM3 checkout and benchmarking against native PyTorch SAM3.
-
-1. Clone this repo.
-2. Clone `sam3` next to it so the default layout is:
+Expected FP32 files:
 
 ```text
-../sam3
-../sam3-onnx-cpp
+vision_encoder.onnx
+vision_encoder.onnx_data
+prompt_encoder_mask_decoder.onnx
+prompt_encoder_mask_decoder.onnx_data
 ```
 
-3. Create and activate the export/native environment:
-
-```powershell
-python -m venv sam3_env
-.\sam3_env\Scripts\Activate.ps1
-pip install torch onnx onnxruntime huggingface_hub pillow opencv-python pyqt5 numpy
-```
-
-4. Download the Hugging Face encoder/image ONNX files:
-
-```powershell
-.\fetch_onnx_models.bat fp32
-.\fetch_onnx_models.bat fp16
-```
-
-5. Export the tracker bundle:
-
-```powershell
-.\sam3_env\Scripts\python.exe export\onnx_export.py `
-  --sam3-repo "..\sam3" `
-  --load-from-hf
-```
-
-6. Verify that both directories now exist and are populated:
-
-- `checkpoints/sam3/onnx`
-- `checkpoints/sam3/video_onnx`
-
-7. Run the ONNX video demo:
-
-```powershell
-.\sam3_env\Scripts\python.exe python\onnx_test_video.py --video "C:\path\to\video.mp4"
-```
-
-8. Run the native-vs-ONNX comparison:
-
-```powershell
-.\sam3_env\Scripts\python.exe python\compare_native_vs_onnx.py `
-  --video "C:\path\to\video.mp4" `
-  --sam3_repo "..\sam3" `
-  --checkpoint "C:\path\to\sam3.pt"
-```
-
-## Optional GPU Setup
-
-### Modern NVIDIA stack
-
-```powershell
-pip uninstall -y onnxruntime
-pip install onnx "onnxruntime-gpu[cuda,cudnn]" huggingface_hub pillow opencv-python pyqt5 numpy
-python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-```
-
-You want to see `CUDAExecutionProvider`.
-
-### Pascal / Volta-friendly stack
-
-```powershell
-pip uninstall -y onnxruntime onnxruntime-gpu `
-  nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12 `
-  nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-nvjitlink-cu12 nvidia-cudnn-cu12
-
-pip install onnx "onnxruntime-gpu==1.22.0" huggingface_hub pillow opencv-python pyqt5 numpy
-
-pip install `
-  "nvidia-cuda-runtime-cu12==12.5.82" `
-  "nvidia-cuda-nvrtc-cu12==12.5.82" `
-  "nvidia-cublas-cu12==12.5.3.2" `
-  "nvidia-cufft-cu12==11.4.1.4" `
-  "nvidia-curand-cu12==10.3.10.19" `
-  "nvidia-nvjitlink-cu12==12.5.82" `
-  "nvidia-cudnn-cu12==9.10.2.21"
-
-python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-```
-
-## Build the C++ Runtime
-
-The C++ target is `Segment`. It wraps both the image and video ONNX paths.
-
-Configure with OpenCV and ONNX Runtime:
-
-```powershell
-cmake -S cpp -B cpp\build_msvc -G "Visual Studio 17 2022" -A x64 `
-  -DOpenCV_DIR="C:\path\to\opencv\build" `
-  -DONNXRUNTIME_DIR="C:\path\to\onnxruntime-win-x64-gpu-1.22.0"
-```
-
-Build:
-
-```powershell
-cmake --build cpp\build_msvc --config Release --target Segment -- /m:1
-```
-
-The executable is written to:
+Optional FP16 files:
 
 ```text
-cpp/build_msvc/bin/Release/Segment.exe
+vision_encoder_fp16.onnx
+vision_encoder_fp16.onnx_data
+prompt_encoder_mask_decoder_fp16.onnx
+prompt_encoder_mask_decoder_fp16.onnx_data
 ```
 
-### C++ Image Smoke Tests
+Exported video tracker files live in:
 
-CPU:
-
-```powershell
-.\cpp\build_msvc\bin\Release\Segment.exe `
-  --onnx_test_image `
-  --device cpu `
-  --threads 8 `
-  --image tmp\sam3_smoke.png `
-  --box 90,55,230,185 `
-  --save_overlay tmp\image_cpu.png `
-  --no_gui
+```text
+checkpoints/sam3/video_onnx/
 ```
 
-CUDA:
+Expected FP32 files:
 
-```powershell
-.\cpp\build_msvc\bin\Release\Segment.exe `
-  --onnx_test_image `
-  --device cuda `
-  --threads 4 `
-  --image tmp\sam3_smoke.png `
-  --box 90,55,230,185 `
-  --save_overlay tmp\image_gpu.png `
-  --no_gui
+```text
+image_decoder_single.onnx
+memory_attention_single.onnx
+memory_encoder_single.onnx
+video_constants_single.npz
+image_decoder_multi.onnx
+memory_attention_multi.onnx
+memory_encoder_multi.onnx
+video_constants_multi.npz
 ```
 
-### C++ Video Smoke Tests
+## macOS Workflow
 
-CPU, keep this short:
+These commands assume Apple Silicon with Homebrew in `/opt/homebrew`.
 
-```powershell
-.\cpp\build_msvc\bin\Release\Segment.exe `
-  --onnx_test_video `
-  --device cpu `
-  --threads 8 `
-  --video tmp\sam3_smoke.avi `
-  --box 90,55,230,185 `
-  --max_frames 3 `
-  --output tmp\video_cpu.avi
+### 1. Create the Python environment
+
+```bash
+cd /Users/pgarcia/Documents/sam3-onnx-cpp
+python3 -m venv sam3_env
+source sam3_env/bin/activate
+python -m pip install --upgrade pip
+python -m pip install onnxruntime opencv-python PyQt5 numpy
 ```
 
-CUDA:
+For exporting tracker modules from a local SAM3 checkout, also install:
 
-```powershell
-.\cpp\build_msvc\bin\Release\Segment.exe `
-  --onnx_test_video `
-  --device cuda `
-  --threads 4 `
-  --video tmp\sam3_smoke.avi `
-  --box 90,55,230,185 `
-  --max_frames 3 `
-  --output tmp\video_gpu.avi
+```bash
+python -m pip install torch torchvision onnx onnxscript huggingface_hub timm ftfy iopath einops setuptools
+python -m pip install -e ../sam3
 ```
 
-Useful C++ options:
-
-- `--device cpu|cuda|cuda:N`
-- `--threads N`
-- `--points x,y,label;...`
-- `--box x1,y1,x2,y2`
-- `--max_frames N`
-- `--output path`
-- `--save_overlay path`
-- `--no_gui` for noninteractive image runs
-
-## Download the Hugging Face ONNX Models
-
-You can keep both FP32 and FP16 variants in the same folder.
-
-### Windows
-
-```powershell
-.\fetch_onnx_models.bat fp32
-.\fetch_onnx_models.bat fp16
-```
-
-### macOS / Linux
+### 2. Download image ONNX files
 
 ```bash
 chmod +x fetch_onnx_models.sh
 ./fetch_onnx_models.sh fp32
+```
+
+Optional CUDA/FP16 artifacts:
+
+```bash
 ./fetch_onnx_models.sh fp16
 ```
 
-To remove the downloaded models:
+### 3. Export video tracker modules
 
-```powershell
-.\fetch_onnx_models.bat clean
+The exporter expects a local SAM3 checkout next to this repo:
+
+```text
+/Users/pgarcia/Documents/sam3
+/Users/pgarcia/Documents/sam3-onnx-cpp
 ```
 
-## Inspect ONNX I/O
+On a CPU-only Mac, fp32-only export is the clean path:
 
-```powershell
-python python\inspect_onnx_io.py
+```bash
+source sam3_env/bin/activate
+python export/onnx_export.py \
+  --sam3-repo ../sam3 \
+  --load-from-hf \
+  --precisions fp32
 ```
 
-Force a specific image precision:
+If the upstream SAM3 checkout assumes CUDA during model construction, patch those
+construction-time tensors to use CUDA when available and CPU otherwise. The needed
+change is not macOS-specific; it is CPU portability for non-CUDA machines.
 
-```powershell
-$env:SAM3_ONNX_VARIANT="fp16"
-python python\inspect_onnx_io.py
+### 4. Inspect the ONNX models
+
+```bash
+source sam3_env/bin/activate
+python python/inspect_onnx_io.py
 ```
 
-## Run SAM3 ONNX on a Particular Image
+### 5. Run Python image demos
 
-This is the simplest way to run the ONNX image path on one exact file:
+```bash
+source sam3_env/bin/activate
 
-```powershell
-python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
+python python/onnx_test_image.py \
+  --prompt seed_points \
+  --safe
+
+python python/onnx_test_image.py \
+  --prompt bounding_box \
+  --safe
 ```
 
-Or with a box prompt:
+To avoid the file selector:
 
-```powershell
-python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt bounding_box
+```bash
+python python/onnx_test_image.py \
+  --prompt bounding_box \
+  --safe \
+  --image /Users/pgarcia/Downloads/kodak_pictures/kodim10.png
 ```
 
-If you omit `--image`, the script opens a file picker instead.
+Expected CPU behavior:
 
-### Controls
+- Vision encoder: several seconds
+- Prompt decoder: tens of milliseconds
 
-#### Seed points mode
+### 6. Run Python video demos
 
-- Left click: positive point
-- Right click: negative point
-- Middle click: clear points
-- `Esc`: quit
+The video tracker uses the exported `video_onnx` bundle. On CPU, disable graph
+optimizations with `--safe` and keep the frame count tiny:
 
-#### Bounding box mode
-
-- Drag left mouse button: draw box
-- Right click or double click: clear box
-- `Esc`: quit
-
-### Useful options
-
-Disable ORT graph optimizations:
-
-```powershell
-python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points --safe
+```bash
+SAM3_ORT_ACCEL=cpu SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
+python python/onnx_test_video.py \
+  --prompt bounding_box \
+  --max_frames 2 \
+  --safe
 ```
 
-Force CUDA and prefer the FP16 image ONNX files:
+To avoid the file selector:
 
-```powershell
-$env:SAM3_ORT_ACCEL="cuda"
-$env:SAM3_ONNX_VARIANT="fp16"
-python python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
+```bash
+SAM3_ORT_ACCEL=cpu SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
+python python/onnx_test_video.py \
+  --video /Users/pgarcia/Downloads/video_sample.mp4 \
+  --box 120,80,520,430 \
+  --max_frames 2 \
+  --safe
 ```
 
-### CPU Performance Notes
+### 7. Build C++ on macOS
 
-The C++ runtime prefers CPU int8 image artifacts when they are available. It checks these paths before falling back to fp32:
+Install OpenCV with Homebrew:
 
-- `checkpoints/sam3/onnx/vision_encoder.int8.onnx`
-- `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul_gather.onnx`
-- `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul_gather_pre.onnx`
-- `checkpoints/sam3/onnx/bench_cpu/vision_encoder.int8.matmul.onnx`
-- `checkpoints/sam3/onnx/bench_cpu/prompt_encoder_mask_decoder.int8.matmul_gemm.onnx`
-
-To force the original fp32 image models instead:
-
-```powershell
-$env:SAM3_ORT_ENCODER_VARIANT="fp32"
-$env:SAM3_ORT_DECODER_VARIANT="fp32"
-.\cpp\build_msvc\bin\Release\Segment.exe --onnx_test_image --device cpu --image "C:\path\to\image.jpg" --box 100,80,420,350 --no_gui
+```bash
+brew install opencv
 ```
 
-The CPU bottleneck is the SAM3 vision encoder, not the prompt decoder or the C++ wrapper. The local SAM3 source builds the visual backbone as a large ViT:
+Download or unpack ONNX Runtime for macOS arm64, then point CMake at it. Example:
 
-- Input resolution: `1008x1008`
-- Patch size: `14`
-- Token grid: `72x72`, or `5184` tokens
-- Width: `1024`
-- Depth: `32`
-- Heads: `16`
-- Global attention blocks: `7, 15, 23, 31`
+```bash
+cd /Users/pgarcia/Documents/sam3-onnx-cpp/cpp
 
-That is why CUDA is expected to be significantly faster than CPU for this model.
+cmake -S . -B build_release \
+  -DOpenCV_DIR="$(brew --prefix opencv)/lib/cmake/opencv4" \
+  -DONNXRUNTIME_DIR="/opt/onnxruntime-osx-arm64-1.23.2"
 
-Practical CPU options:
-
-- Use the int8 artifacts for smoke tests and CPU fallback.
-- Try a few `--threads N` values for the target machine and benchmark more than one run.
-- Keep CPU video smoke tests to `2` or `3` frames.
-- For real video throughput, use CUDA or TensorRT.
-
-Further CPU acceleration would require model-level changes rather than wrapper-only changes.
-
-## Run the ONNX Video Demo
-
-The video path expects:
-
-- `checkpoints/sam3/video_onnx/image_decoder_single.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention_single.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder_single.onnx`
-- `checkpoints/sam3/video_onnx/video_constants_single.npz`
-- `checkpoints/sam3/video_onnx/image_decoder_multi.onnx`
-- `checkpoints/sam3/video_onnx/memory_attention_multi.onnx`
-- `checkpoints/sam3/video_onnx/memory_encoder_multi.onnx`
-- `checkpoints/sam3/video_onnx/video_constants_multi.npz`
-- A complete `vision_encoder*.onnx` plus matching `.onnx_data` under `checkpoints/sam3/onnx`
-
-Example with interactive first-frame points:
-
-```powershell
-python python\onnx_test_video.py --video "C:\path\to\video.mp4" --prompt seed_points
+cmake --build build_release --target Segment --clean-first
+cmake --install build_release --prefix package
 ```
 
-Example with a noninteractive box:
+The packaged app is:
 
-```powershell
-python python\onnx_test_video.py --video "C:\path\to\video.mp4" --box "120,80,520,430"
+```text
+cpp/package/Segment.app/Contents/MacOS/Segment
 ```
 
-Default runtime behavior:
+### 8. Run C++ demos on macOS
 
-- Single annotation: uses the internal `single` graph and defaults to `--max_mem_frames 2`.
-- Multi-annotation: uses the internal `multi` graph and defaults to `--max_mem_frames 4`.
-- `--max_obj_ptrs` defaults to `16`.
-- `SAM3_ORT_TRACKER_PRECISION=auto` prefers fp16 tracker graphs on CUDA/TensorRT and falls back to fp32 when needed.
-- `SAM3_ORT_WARMUP=auto` pre-warms the ONNX tracker kernels so the first real frame does not pay the full cold-start cost.
+```bash
+cd /Users/pgarcia/Documents/sam3-onnx-cpp
+SEG=cpp/package/Segment.app/Contents/MacOS/Segment
+```
 
-## Export the Tracker ONNX Modules
+Image:
 
-The exporter requires:
+```bash
+SAM3_ONNX_VARIANT=fp32 "$SEG" --onnx_test_image \
+  --prompt seed_points \
+  --device cpu \
+  --threads 4
 
-- A local SAM3 checkout, defaulting to `../sam3`
-- A PyTorch-capable environment
-- Either `--checkpoint` or `--load-from-hf`
+SAM3_ONNX_VARIANT=fp32 "$SEG" --onnx_test_image \
+  --prompt bounding_box \
+  --device cpu \
+  --threads 4
+```
 
-Example:
+Video:
+
+```bash
+SAM3_ORT_GRAPH_OPT=disable SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
+"$SEG" --onnx_test_video \
+  --prompt bounding_box \
+  --max_frames 2 \
+  --device cpu \
+  --threads 4
+```
+
+Noninteractive smoke tests:
+
+```bash
+SAM3_ONNX_VARIANT=fp32 "$SEG" --onnx_test_image \
+  --no_gui \
+  --image ../sam3/assets/images/truck.jpg \
+  --box 90,55,230,185 \
+  --device cpu \
+  --threads 4 \
+  --save_overlay /tmp/sam3_cpp_image.png
+
+SAM3_ORT_GRAPH_OPT=disable SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
+"$SEG" --onnx_test_video \
+  --video /Users/pgarcia/Downloads/video_sample.mp4 \
+  --box 120,80,520,430 \
+  --max_frames 2 \
+  --device cpu \
+  --threads 4 \
+  --output /tmp/sam3_cpp_video.avi
+```
+
+## Windows Workflow
+
+Run these from PowerShell.
+
+### 1. Create the Python environment
 
 ```powershell
-.\sam3_env\Scripts\python.exe export\onnx_export.py `
+cd C:\path\to\sam3-onnx-cpp
+python -m venv sam3_env
+.\sam3_env\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install onnxruntime opencv-python PyQt5 numpy
+```
+
+For export/native comparison:
+
+```powershell
+python -m pip install torch torchvision onnx onnxscript huggingface_hub timm ftfy iopath einops setuptools
+python -m pip install -e ..\sam3
+```
+
+For ONNX Runtime CUDA:
+
+```powershell
+python -m pip uninstall -y onnxruntime
+python -m pip install onnxruntime-gpu
+```
+
+### 2. Download image ONNX files
+
+```powershell
+.\fetch_onnx_models.bat fp32
+```
+
+Optional CUDA/FP16 artifacts:
+
+```powershell
+.\fetch_onnx_models.bat fp16
+```
+
+### 3. Export video tracker modules
+
+Use a local SAM3 checkout next to this repo:
+
+```text
+C:\path\to\sam3
+C:\path\to\sam3-onnx-cpp
+```
+
+CPU/fp32 export:
+
+```powershell
+.\sam3_env\Scripts\python.exe .\export\onnx_export.py `
+  --sam3-repo "..\sam3" `
+  --load-from-hf `
+  --precisions fp32
+```
+
+CUDA machines can export both fp32 and fp16:
+
+```powershell
+.\sam3_env\Scripts\python.exe .\export\onnx_export.py `
   --sam3-repo "..\sam3" `
   --load-from-hf
 ```
 
-Or with a local checkpoint:
+### 4. Run Python image demos on Windows
 
 ```powershell
-.\sam3_env\Scripts\python.exe export\onnx_export.py `
-  --sam3-repo "..\sam3" `
-  --checkpoint "C:\path\to\sam3.pt"
+.\sam3_env\Scripts\python.exe .\python\onnx_test_image.py `
+  --prompt seed_points `
+  --safe
+
+.\sam3_env\Scripts\python.exe .\python\onnx_test_image.py `
+  --prompt bounding_box `
+  --safe
 ```
 
-By default this writes to:
-
-```text
-checkpoints/sam3/video_onnx
-```
-
-The exporter writes two internal tracker bundles:
-
-- `single`: static 2-slot memory graph for the common one-annotation path
-- `multi`: static 4-slot memory graph for multi-annotation clips
-
-It emits both `fp32` and `fp16` tracker graphs by default.
-
-## Run the Native Image Reference Demo
-
-This is useful for checking native SAM3 behavior outside ONNX:
+To avoid the file selector:
 
 ```powershell
-.\sam3_env\Scripts\python.exe python\api_test_image.py --prompt seed_points
+.\sam3_env\Scripts\python.exe .\python\onnx_test_image.py `
+  --image "C:\path\to\image.png" `
+  --prompt bounding_box `
+  --safe
 ```
 
-## Compare Native vs ONNX Video Tracking
+### 5. Run Python video demos on Windows
+
+CPU:
 
 ```powershell
-.\sam3_env\Scripts\python.exe python\compare_native_vs_onnx.py `
+$env:SAM3_ORT_ACCEL = "cpu"
+$env:SAM3_ONNX_VARIANT = "fp32"
+$env:SAM3_ORT_TRACKER_PRECISION = "fp32"
+
+.\sam3_env\Scripts\python.exe .\python\onnx_test_video.py `
+  --prompt bounding_box `
+  --max_frames 2 `
+  --safe
+```
+
+CUDA, when the CUDA provider is installed and working:
+
+```powershell
+$env:SAM3_ORT_ACCEL = "cuda"
+$env:SAM3_ONNX_VARIANT = "fp16"
+$env:SAM3_ORT_TRACKER_PRECISION = "fp16"
+
+.\sam3_env\Scripts\python.exe .\python\onnx_test_video.py `
+  --prompt bounding_box `
+  --max_frames 10
+```
+
+### 6. Build C++ on Windows
+
+Install:
+
+- Visual Studio 2022 with C++ tools
+- CMake
+- OpenCV
+- ONNX Runtime for Windows
+
+Configure and build:
+
+```powershell
+cd C:\path\to\sam3-onnx-cpp\cpp
+
+cmake -S . -B build_release -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_CONFIGURATION_TYPES=Release `
+  -DOpenCV_DIR="C:\path\to\opencv\build" `
+  -DONNXRUNTIME_DIR="C:\path\to\onnxruntime-win-x64-1.23.2"
+
+cmake --build .\build_release --config Release --target Segment -- /m:1
+```
+
+For GPU deployment, point `ONNXRUNTIME_DIR` at an ONNX Runtime GPU package and make
+sure CUDA/cuDNN runtime DLLs are available to the executable.
+
+### 7. Run C++ demos on Windows
+
+From the repo root:
+
+```powershell
+$seg = ".\cpp\build_release\bin\Release\Segment.exe"
+```
+
+Image:
+
+```powershell
+$env:SAM3_ONNX_VARIANT = "fp32"
+
+& $seg --onnx_test_image `
+  --prompt seed_points `
+  --device cpu `
+  --threads 8
+
+& $seg --onnx_test_image `
+  --prompt bounding_box `
+  --device cpu `
+  --threads 8
+```
+
+Video:
+
+```powershell
+$env:SAM3_ORT_GRAPH_OPT = "disable"
+$env:SAM3_ONNX_VARIANT = "fp32"
+$env:SAM3_ORT_TRACKER_PRECISION = "fp32"
+
+& $seg --onnx_test_video `
+  --prompt bounding_box `
+  --max_frames 2 `
+  --device cpu `
+  --threads 8
+```
+
+Noninteractive smoke tests:
+
+```powershell
+& $seg --onnx_test_image `
+  --no_gui `
+  --image "..\sam3\assets\images\truck.jpg" `
+  --box 90,55,230,185 `
+  --device cpu `
+  --threads 8 `
+  --save_overlay ".\tmp\sam3_cpp_image.png"
+
+& $seg --onnx_test_video `
   --video "C:\path\to\video.mp4" `
-  --sam3_repo "..\sam3" `
-  --checkpoint "C:\path\to\sam3.pt" `
-  --prompt seed_points
+  --box 120,80,520,430 `
+  --max_frames 2 `
+  --device cpu `
+  --threads 8 `
+  --output ".\tmp\sam3_cpp_video.avi"
 ```
 
-## Benchmark The Default ONNX Runtime
+## Runtime Variables
+
+| Variable | Values | Use |
+| --- | --- | --- |
+| `SAM3_ORT_ACCEL` | `auto`, `cpu`, `cuda`, `trt` | Python provider selection. |
+| `SAM3_ONNX_VARIANT` | `auto`, `fp32`, `fp16` | Image encoder/decoder precision. |
+| `SAM3_ORT_TRACKER_PRECISION` | `auto`, `fp32`, `fp16` | Video tracker precision. |
+| `SAM3_ORT_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++/Python graph optimization override. |
+| `SAM3_ORT_INTRA_OP_THREADS` | integer | Python ORT thread override. |
+| `SAM3_ORT_IO_BINDING` | `auto`, `0`, `1` | Python I/O binding override. |
+
+## Quality And Performance Notes
+
+- CPU inference is supported, but the SAM3 vision encoder is large.
+- Image prompting should feel interactive after the first encoder pass because decoder calls are much faster.
+- The ONNX image demo exposes a low-level prompt-head path and chooses one of three masks by predicted IoU. This is not a full production SAM3 quality comparison.
+- If the selected mask looks poor, try a different prompt or use the native SAM3 reference path for comparison.
+- On CPU video, use `--safe` in Python and `SAM3_ORT_GRAPH_OPT=disable` in C++ to avoid aggressive ORT graph rewrites on the exported tracker modules.
+- Keep live CPU video demos to `2` or `3` frames.
+
+## Native Reference Demo
+
+The native reference path uses the sibling `../sam3` checkout:
+
+```bash
+python python/api_test_image.py --prompt seed_points
+```
+
+On Windows:
 
 ```powershell
-.\sam3_env\Scripts\python.exe python\benchmark_onnx_default.py `
-  --video "C:\path\to\video.mp4" `
-  --sam3_repo "..\sam3" `
-  --checkpoint "C:\path\to\sam3.pt"
+.\sam3_env\Scripts\python.exe .\python\api_test_image.py --prompt seed_points
 ```
 
-## Summary
+## License
 
-If you only want to segment one image with ONNX:
-
-1. Create and activate `sam3_env`.
-2. Install the ONNX Runtime dependencies.
-3. Download the Hugging Face ONNX files with `fetch_onnx_models.bat`.
-4. Run:
-
-```powershell
-.\sam3_env\Scripts\python.exe python\onnx_test_image.py --image "C:\path\to\image.jpg" --prompt seed_points
-```
-
-That is the shortest path for running SAM3 ONNX on a particular image in this repo.
+See [LICENSE](LICENSE).
