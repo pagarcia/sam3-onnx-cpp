@@ -48,6 +48,27 @@ flowchart TB
     I --> H
 ```
 
+## ONNX Export Strategy
+
+SAM3 uses a hybrid export strategy in this repo. The image path starts from the
+Hugging Face/community ONNX artifacts because those already provide a working
+`vision_encoder.onnx` and `prompt_encoder_mask_decoder.onnx` pair. The local
+export script focuses on the pieces that are still needed for video tracking:
+
+- `image_decoder_*.onnx`: turns prompts and image embeddings into masks and
+  object pointers.
+- `memory_attention_*.onnx`: fuses the current frame with previous mask memory.
+- `memory_encoder_*.onnx`: converts a predicted mask back into memory for later
+  frames.
+- `video_constants_*.npz`: stores tracker constants that the runtime needs
+  alongside the ONNX graphs.
+
+The rationale is practical portability. SAM3 has more export-sensitive internals
+than SAM2, especially around tracker attention and rotary position handling, so
+the repo avoids re-exporting working image artifacts and concentrates the custom
+ONNX work on the video tracker contracts. Python and C++ then consume the same
+artifacts without depending on PyTorch at demo time.
+
 ## Repository Layout
 
 ```text
