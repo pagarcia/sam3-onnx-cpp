@@ -14,6 +14,40 @@ Important distinction:
 
 For live CPU demos, keep video very short with `--max_frames 2` or `--max_frames 3`.
 
+## How The Pieces Fit
+
+```mermaid
+flowchart LR
+    A["Hugging Face/community<br/>SAM3 image ONNX"] --> B["checkpoints/sam3/onnx"]
+    C["Local SAM3 PyTorch checkout"] --> D["export/onnx_export.py"]
+    D --> E["video tracker ONNX bundle<br/>image decoder / memory attention / memory encoder"]
+    B --> F["Python demos"]
+    E --> F
+    B --> G["C++ Segment app"]
+    E --> G
+    F --> H["ONNX Runtime providers<br/>CPU / CUDA / TensorRT / CoreML experiments"]
+    G --> H
+    H --> I["Interactive image masks<br/>and video overlays"]
+```
+
+SAM3 in this repo is intentionally split. The image ONNX pair is downloaded, and
+the video tracker modules are exported locally from a SAM3 checkout. Python and
+C++ are thin frontends over the same ONNX contracts.
+
+```mermaid
+flowchart TB
+    A["Image or video frame"] --> B["Preprocess to 1008x1008"]
+    B --> C["vision_encoder.onnx<br/>large ViT pass"]
+    C --> D["Multi-scale image embeddings"]
+    E["User prompt<br/>points or box"] --> F["prompt/image decoder<br/>fast mask pass"]
+    D --> F
+    F --> G["Mask overlay"]
+    D --> H["memory_attention_*.onnx<br/>video only"]
+    F --> I["memory_encoder_*.onnx<br/>video only"]
+    H --> F
+    I --> H
+```
+
 ## Repository Layout
 
 ```text
