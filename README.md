@@ -18,6 +18,7 @@ For live CPU demos, keep video very short with `--max_frames 10` or `--max_frame
 
 - [How The Pieces Fit](#how-the-pieces-fit)
 - [ONNX Export Strategy](#onnx-export-strategy)
+- [Why ONNX?](#why-onnx)
 - [Repository Layout](#repository-layout)
 - [Demo Controls](#demo-controls)
 - [Artifacts](#artifacts)
@@ -83,6 +84,22 @@ than SAM2, especially around tracker attention and rotary position handling, so
 the repo avoids re-exporting working image artifacts and concentrates the custom
 ONNX work on the video tracker contracts. Python and C++ then consume the same
 artifacts without depending on PyTorch at demo time.
+
+## Why ONNX?
+
+Native PyTorch or Transformers remains the best reference path for model
+development and quality comparisons. The ONNX path is useful when the goal is a
+portable runtime:
+
+- Python ONNX acts as a validation harness before the same artifacts are loaded
+  from C++.
+- Python and C++ use the same `.onnx` model contracts, reducing drift between
+  prototype and native app.
+- Demo/deployment machines do not need the full SAM3 Python stack at runtime.
+- ONNX Runtime offers a common API for CPU, CUDA, TensorRT, DirectML, and future
+  CoreML experiments.
+- Splitting the model into encoder, decoder, memory attention, and memory
+  encoder makes bottlenecks visible and easier to optimize.
 
 ## Repository Layout
 
