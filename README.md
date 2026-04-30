@@ -12,7 +12,7 @@ Important distinction:
 - Video demos use that downloaded vision encoder plus tracker modules exported by this repo.
 - The ONNX image demo is a low-level prompt-head demo, not a full production SAM3 quality comparison.
 
-For live CPU demos, keep video very short with `--max_frames 2` or `--max_frames 3`.
+For live CPU demos, keep video very short with `--max_frames 10` or `--max_frames 20`.
 
 ## Table Of Contents
 
@@ -273,7 +273,7 @@ optimizations with `--safe` and keep the frame count tiny:
 SAM3_ORT_ACCEL=cpu SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
 python python/onnx_test_video.py \
   --prompt bounding_box \
-  --max_frames 2 \
+  --max_frames 10 \
   --safe
 ```
 
@@ -284,7 +284,7 @@ SAM3_ORT_ACCEL=cpu SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
 python python/onnx_test_video.py \
   --video /Users/pgarcia/Downloads/video_sample.mp4 \
   --box 120,80,520,430 \
-  --max_frames 2 \
+  --max_frames 10 \
   --safe
 ```
 
@@ -342,7 +342,7 @@ Video:
 SAM3_ORT_GRAPH_OPT=disable SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
 "$SEG" --onnx_test_video \
   --prompt bounding_box \
-  --max_frames 2 \
+  --max_frames 10 \
   --device cpu \
   --threads 4
 ```
@@ -362,7 +362,7 @@ SAM3_ORT_GRAPH_OPT=disable SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp3
 "$SEG" --onnx_test_video \
   --video /Users/pgarcia/Downloads/video_sample.mp4 \
   --box 120,80,520,430 \
-  --max_frames 2 \
+  --max_frames 10 \
   --device cpu \
   --threads 4 \
   --output /tmp/sam3_cpp_video.avi
@@ -466,7 +466,7 @@ $env:SAM3_ORT_TRACKER_PRECISION = "fp32"
 
 .\sam3_env\Scripts\python.exe .\python\onnx_test_video.py `
   --prompt bounding_box `
-  --max_frames 2 `
+  --max_frames 10 `
   --safe
 ```
 
@@ -540,7 +540,7 @@ $env:SAM3_ORT_TRACKER_PRECISION = "fp32"
 
 & $seg --onnx_test_video `
   --prompt bounding_box `
-  --max_frames 2 `
+  --max_frames 10 `
   --device cpu `
   --threads 8
 ```
@@ -559,7 +559,7 @@ Noninteractive smoke tests:
 & $seg --onnx_test_video `
   --video "C:\path\to\video.mp4" `
   --box 120,80,520,430 `
-  --max_frames 2 `
+  --max_frames 10 `
   --device cpu `
   --threads 8 `
   --output ".\tmp\sam3_cpp_video.avi"
