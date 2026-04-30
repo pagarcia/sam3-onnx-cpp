@@ -8,6 +8,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,6 +35,28 @@ from sam3_onnx_session import (
     prepare_prompt_box,
     prepare_prompt_points,
 )
+
+
+def _resolve_video_macos() -> str:
+    if sys.platform != "darwin":
+        return ""
+
+    script = """
+try
+    POSIX path of (choose file with prompt "Select Video" of type {"public.movie"})
+on error number -128
+    return ""
+end try
+"""
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 def _parse_frame_indices_text(text: str, *, one_based: bool = False) -> list[int]:
@@ -316,6 +339,10 @@ def _interactive_collect_prompt_schedule(
 def _resolve_video(args):
     if args.video:
         return args.video
+
+    video_path = _resolve_video_macos()
+    if video_path:
+        return video_path
 
     app = QtWidgets.QApplication.instance()
     owns_app = app is None

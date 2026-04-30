@@ -8,6 +8,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import argparse
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -34,6 +35,28 @@ from onnx_test_utils import (
 )
 
 
+def _resolve_image_path_macos() -> str:
+    if sys.platform != "darwin":
+        return ""
+
+    script = """
+try
+    POSIX path of (choose file with prompt "Select an Image" of type {"public.image"})
+on error number -128
+    return ""
+end try
+"""
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
 def _resolve_image_path(arg_value: str) -> str:
     if arg_value:
         image_path = Path(arg_value).expanduser().resolve()
@@ -41,10 +64,19 @@ def _resolve_image_path(arg_value: str) -> str:
             sys.exit(f"ERROR: Image file does not exist: {image_path}")
         return str(image_path)
 
-    app = QtWidgets.QApplication(sys.argv)
+    img_path = _resolve_image_path_macos()
+    if img_path:
+        return img_path
+
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QtWidgets.QApplication(sys.argv)
     img_path, _ = QtWidgets.QFileDialog.getOpenFileName(
         None, "Select an Image", "", "Images (*.jpg *.jpeg *.png *.bmp);;All files (*)"
     )
+    if owns_app:
+        app.quit()
     if not img_path:
         sys.exit("No image selected - exiting.")
     return img_path
