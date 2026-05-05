@@ -899,6 +899,32 @@ void SAM3::resetMemory()
     m_memoryMaskTposScratch.clear();
 }
 
+bool SAM3::captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const
+{
+    if (!snapshotOut) {
+        return false;
+    }
+
+    snapshotOut->hasConditioningState = m_hasConditioningState;
+    snapshotOut->conditioningState = m_conditioningState;
+    snapshotOut->nonConditioningStates = m_nonConditioningStates;
+    snapshotOut->segmentFrameIndex = m_segmentFrameIndex;
+    return true;
+}
+
+void SAM3::restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot)
+{
+    m_hasConditioningState = snapshot.hasConditioningState;
+    m_conditioningState = snapshot.conditioningState;
+    m_nonConditioningStates = snapshot.nonConditioningStates;
+    m_segmentFrameIndex = snapshot.segmentFrameIndex;
+    m_memoryObjPtrsScratch.clear();
+    m_memoryObjTposScratch.clear();
+    m_memoryMaskFeatsScratch.clear();
+    m_memoryMaskPosScratch.clear();
+    m_memoryMaskTposScratch.clear();
+}
+
 SAM3Size SAM3::getInputSize() const
 {
     if (m_inputShapeEncoder.size() >= 4) {

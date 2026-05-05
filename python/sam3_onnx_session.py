@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import os
 import time
 from dataclasses import dataclass
@@ -315,6 +316,12 @@ class TrackerFrameState:
 
 
 @dataclass(frozen=True)
+class TrackerMemorySnapshot:
+    cond_states: dict[int, TrackerFrameState]
+    non_cond_states: dict[int, TrackerFrameState]
+
+
+@dataclass(frozen=True)
 class FrameTimings:
     prep_ms: float
     enc_ms: float
@@ -602,6 +609,22 @@ class Sam3OnnxTrackerSession:
     def reset(self) -> None:
         self.cond_states: dict[int, TrackerFrameState] = {}
         self.non_cond_states: dict[int, TrackerFrameState] = {}
+
+    def capture_memory_snapshot(self) -> TrackerMemorySnapshot:
+        return TrackerMemorySnapshot(
+            cond_states=copy.deepcopy(self.cond_states),
+            non_cond_states=copy.deepcopy(self.non_cond_states),
+        )
+
+    def restore_memory_snapshot(self, snapshot: TrackerMemorySnapshot) -> None:
+        self.cond_states = copy.deepcopy(snapshot.cond_states)
+        self.non_cond_states = copy.deepcopy(snapshot.non_cond_states)
+
+    def capture_state_snapshot(self) -> TrackerMemorySnapshot:
+        return self.capture_memory_snapshot()
+
+    def restore_state_snapshot(self, snapshot: TrackerMemorySnapshot) -> None:
+        self.restore_memory_snapshot(snapshot)
 
     def prepare_frame(self, frame_bgr: np.ndarray) -> PreparedFrame:
         t_prep = time.time()

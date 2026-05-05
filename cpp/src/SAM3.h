@@ -154,6 +154,13 @@ struct TrackerFrameState {
     bool hasEffIouScore = false;
 };
 
+struct SAM3MemorySnapshot {
+    bool hasConditioningState = false;
+    TrackerFrameState conditioningState;
+    std::deque<TrackerFrameState> nonConditioningStates;
+    int segmentFrameIndex = 0;
+};
+
 class SAM3 {
 public:
     SAM3();
@@ -186,6 +193,8 @@ public:
                                        const SAM3Prompts& prompts);
 
     void resetMemory();
+    bool captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const;
+    void restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot);
     SAM3Size getInputSize() const;
     bool modelExists(const std::string& modelPath) const;
 
