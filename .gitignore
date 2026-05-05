@@ -17,6 +17,7 @@ checkpoints/
 .Python
 build/
 /cpp/build*/
+/cpp/package/
 /cpp/.vs/
 /cpp/CMakeCache.txt
 /cpp/CMakeFiles/
