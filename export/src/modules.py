@@ -229,7 +229,15 @@ class ImageDecoder(nn.Module):
             high_res_features=[high_res_feats_0, high_res_feats_1],
             multimask_output=True,
         )
-        return obj_ptr, low_res_masks, high_res_masks, object_score_logits, iou_scores
+        return (
+            obj_ptr,
+            low_res_masks,
+            high_res_masks,
+            object_score_logits,
+            iou_scores,
+            _low_res_multimasks,
+            _high_res_multimasks,
+        )
 
 
 class MemAttention(nn.Module):

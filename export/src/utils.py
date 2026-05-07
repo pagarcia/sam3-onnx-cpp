@@ -61,7 +61,7 @@ def _convert_to_fp16(src_path: str, dst_path: str, label: str) -> None:
     model = convert_float_to_float16(
         model,
         keep_io_types=True,
-        disable_shape_infer=True,
+        disable_shape_infer=False,
     )
     onnx.save_model(model, dst_path)
     _maybe_check(dst_path, label)
@@ -80,6 +80,9 @@ def _export_model(
 ) -> None:
     export_path = dst_path
     temp_path = None
+    sidecar_path = f"{dst_path}.data"
+    if os.path.exists(sidecar_path):
+        os.remove(sidecar_path)
     if variant.precision == "fp16":
         with tempfile.NamedTemporaryFile(
             prefix="sam3_export_",
@@ -98,6 +101,8 @@ def _export_model(
             export_params=True,
             opset_version=OPSET,
             optimize=OPTIMIZE,
+            dynamo=False,
+            external_data=False,
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
@@ -109,6 +114,10 @@ def _export_model(
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+        if temp_path:
+            temp_sidecar_path = f"{temp_path}.data"
+            if os.path.exists(temp_sidecar_path):
+                os.remove(temp_sidecar_path)
 
 
 def export_image_encoder(model, outdir: str) -> None:
@@ -148,6 +157,8 @@ def export_image_decoder(model, outdir: str, variant: ExportVariant) -> None:
             "pred_mask_high_res",
             "object_score_logits",
             "iou_scores",
+            "pred_multimasks",
+            "pred_multimasks_high_res",
         ],
         dynamic_axes={
             "point_coords": {1: "num_points"},

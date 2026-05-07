@@ -30,9 +30,15 @@ from onnxruntime import InferenceSession
 
 ACCEL = os.getenv("SAM3_ORT_ACCEL", "auto").lower()  # auto|cpu|cuda|trt
 
-# Try preloading DLLs when CUDA EP exists (helps with pip-provided runtime DLLs)
+# Try preloading DLLs when CUDA EP exists (helps with pip-provided runtime DLLs).
+# Set SAM3_ORT_PRELOAD_DLLS=0 if this stalls on a machine with CUDA DLLs already on PATH.
 try:
-    if hasattr(ort, "preload_dlls") and "CUDAExecutionProvider" in ort.get_available_providers():
+    _preload_dlls = os.getenv("SAM3_ORT_PRELOAD_DLLS", "auto").strip().lower()
+    if (
+        _preload_dlls not in ("0", "false", "no", "off")
+        and hasattr(ort, "preload_dlls")
+        and "CUDAExecutionProvider" in ort.get_available_providers()
+    ):
         ort.preload_dlls()
 except Exception:
     pass

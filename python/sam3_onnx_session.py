@@ -201,14 +201,42 @@ def save_prompt_spec(path: Path, spec: dict[str, Any]) -> None:
         json.dump(spec, f, indent=2)
 
 
+def _mask_logits_candidates(mask_logits_high_res: np.ndarray) -> np.ndarray:
+    mask_logits = np.asarray(mask_logits_high_res)
+    if mask_logits.ndim == 2:
+        return np.ascontiguousarray(mask_logits[None, ...])
+    if mask_logits.ndim == 3:
+        return np.ascontiguousarray(mask_logits)
+    if mask_logits.ndim == 4:
+        if mask_logits.shape[0] == 1:
+            return np.ascontiguousarray(mask_logits[0])
+        if mask_logits.shape[1] == 1:
+            return np.ascontiguousarray(mask_logits[:, 0])
+        return np.ascontiguousarray(mask_logits.reshape((-1, mask_logits.shape[-2], mask_logits.shape[-1])))
+    if mask_logits.ndim == 5:
+        return np.ascontiguousarray(mask_logits.reshape((-1, mask_logits.shape[-2], mask_logits.shape[-1])))
+    raise ValueError(f"Expected mask logits with 2-5 dimensions, got shape {mask_logits.shape}.")
+
+
+def masks_to_uint8(mask_logits_high_res: np.ndarray, info: PrepInfo) -> np.ndarray:
+    masks = []
+    for mask_logits in _mask_logits_candidates(mask_logits_high_res):
+        mask_resized = cv2.resize(
+            mask_logits,
+            (info.orig_hw[1], info.orig_hw[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        masks.append((mask_resized > 0.0).astype(np.uint8) * 255)
+    if not masks:
+        return np.zeros((0, info.orig_hw[0], info.orig_hw[1]), dtype=np.uint8)
+    return np.stack(masks).astype(np.uint8, copy=False)
+
+
 def mask_to_uint8(mask_logits_high_res: np.ndarray, info: PrepInfo) -> np.ndarray:
-    mask_logits = mask_logits_high_res[0, 0]
-    mask_resized = cv2.resize(
-        mask_logits,
-        (info.orig_hw[1], info.orig_hw[0]),
-        interpolation=cv2.INTER_LINEAR,
-    )
-    return (mask_resized > 0.0).astype(np.uint8) * 255
+    masks = masks_to_uint8(mask_logits_high_res, info)
+    if masks.shape[0] == 0:
+        return np.zeros(info.orig_hw, dtype=np.uint8)
+    return masks[0]
 
 
 def mask_to_overlay(frame_bgr: np.ndarray, mask_logits_high_res: np.ndarray, info: PrepInfo) -> np.ndarray:
@@ -304,6 +332,15 @@ class PreparedMaskPrompt:
     prompt_points: np.ndarray
     prompt_labels: np.ndarray
     prompt_kind: str
+
+
+@dataclass(frozen=True)
+class PromptMaskCandidates:
+    selected_mask_logits_high_res: np.ndarray
+    selected_mask_uint8: np.ndarray
+    multimask_logits_high_res: np.ndarray | None = None
+    multimask_uint8: np.ndarray | None = None
+    iou_scores: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -512,6 +549,7 @@ class Sam3OnnxTrackerSession:
         self.sess_men = make_session(str(men_path), tag="video_memory_encoder", safe=safe)
         self.decoder_output_names = {output.name for output in self.sess_dec.get_outputs()}
         self.decoder_has_iou_scores = "iou_scores" in self.decoder_output_names
+        self.decoder_has_multimasks = "pred_multimasks_high_res" in self.decoder_output_names
 
         self._enc_runner = _OrtSessionRunner(self.sess_enc, "video_image_encoder")
         self._dec_runner = _OrtSessionRunner(self.sess_dec, "video_image_decoder")
@@ -603,6 +641,7 @@ class Sam3OnnxTrackerSession:
             "use_memory_selection": self.use_memory_selection,
             "mf_threshold": self.mf_threshold,
             "decoder_has_iou_scores": self.decoder_has_iou_scores,
+            "decoder_has_multimasks": self.decoder_has_multimasks,
             "max_non_cond_frames_kept": self._max_non_cond_history(),
         }
 
@@ -676,6 +715,18 @@ class Sam3OnnxTrackerSession:
         prompt_points: np.ndarray,
         prompt_labels: np.ndarray,
     ) -> np.ndarray:
+        return self.preview_prompt_candidates(
+            prepared,
+            prompt_points,
+            prompt_labels,
+        ).selected_mask_logits_high_res
+
+    def preview_prompt_candidates(
+        self,
+        prepared: PreparedFrame,
+        prompt_points: np.ndarray,
+        prompt_labels: np.ndarray,
+    ) -> PromptMaskCandidates:
         dec = self._run_decoder(
             prompt_points,
             prompt_labels,
@@ -684,7 +735,21 @@ class Sam3OnnxTrackerSession:
             prepared.encoder_outputs["high_res_features1"],
             output_device="cpu",
         )
-        return dec["pred_mask_high_res"]
+        selected_logits = _to_numpy(dec["pred_mask_high_res"])
+        selected_uint8 = mask_to_uint8(selected_logits, prepared.info)
+        multimask_logits = None
+        multimask_uint8 = None
+        if "pred_multimasks_high_res" in dec:
+            multimask_logits = _to_numpy(dec["pred_multimasks_high_res"])
+            multimask_uint8 = masks_to_uint8(multimask_logits, prepared.info)
+        iou_scores = _to_numpy(dec["iou_scores"]) if "iou_scores" in dec else None
+        return PromptMaskCandidates(
+            selected_mask_logits_high_res=selected_logits,
+            selected_mask_uint8=selected_uint8,
+            multimask_logits_high_res=multimask_logits,
+            multimask_uint8=multimask_uint8,
+            iou_scores=iou_scores,
+        )
 
     def _condition_with_mask_prompt(
         self,

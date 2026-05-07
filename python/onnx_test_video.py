@@ -114,6 +114,47 @@ def _validate_prompt_annotations(
                 )
 
 
+def _candidate_iou_scores(candidates) -> list[float]:
+    if candidates.iou_scores is None:
+        return []
+    return [float(value) for value in np.asarray(candidates.iou_scores).reshape(-1)]
+
+
+def _draw_label(image_bgr: np.ndarray, label: str) -> np.ndarray:
+    out = image_bgr.copy()
+    cv2.rectangle(out, (0, 0), (out.shape[1], 30), (0, 0, 0), -1)
+    cv2.putText(out, label, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    return out
+
+
+def _save_prompt_multimask_sheet(path: Path, frame_bgr: np.ndarray, candidates) -> None:
+    masks: list[tuple[str, np.ndarray]] = [("selected", candidates.selected_mask_uint8)]
+    scores = _candidate_iou_scores(candidates)
+    if candidates.multimask_uint8 is not None:
+        for idx, mask_uint8 in enumerate(candidates.multimask_uint8):
+            label = f"candidate {idx}"
+            if idx < len(scores):
+                label += f" iou={scores[idx]:.3f}"
+            masks.append((label, mask_uint8))
+
+    tiles = [
+        _draw_label(green_overlay(frame_bgr, mask_uint8, alpha=0.5), label)
+        for label, mask_uint8 in masks
+    ]
+    cols = min(4, max(1, len(tiles)))
+    rows = int(np.ceil(len(tiles) / cols))
+    blank = np.zeros_like(tiles[0])
+    padded_tiles = tiles + [blank] * (rows * cols - len(tiles))
+    row_images = [
+        np.concatenate(padded_tiles[row * cols : (row + 1) * cols], axis=1)
+        for row in range(rows)
+    ]
+    sheet = np.concatenate(row_images, axis=0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), sheet):
+        raise SystemExit(f"Could not write prompt multimask sheet: {path}")
+
+
 def _interactive_select_points(
     first_bgr,
     tracker: Sam3OnnxTrackerSession,
@@ -424,6 +465,11 @@ def main():
         help="Optional .npz output with frame masks and timings for benchmarking.",
     )
     parser.add_argument(
+        "--save_prompt_multimasks",
+        default="",
+        help="Optional PNG contact sheet showing the selected prompt mask and raw multimask candidates.",
+    )
+    parser.add_argument(
         "--no_output_video",
         action="store_true",
         help="Skip writing the overlay video and only run inference.",
@@ -514,7 +560,8 @@ def main():
         f"ONNX runtime caps: max_mem_frames={tracker.num_maskmem}, "
         f"max_obj_ptrs={tracker.max_obj_ptrs}, "
         f"static_mem={tracker.static_num_mem_frames}, static_obj_ptrs={tracker.static_num_obj_ptrs}, "
-        f"iobinding={'on' if tracker.uses_iobinding else 'off'}"
+        f"iobinding={'on' if tracker.uses_iobinding else 'off'}, "
+        f"multimasks={'on' if runtime.get('decoder_has_multimasks') else 'off'}"
     )
 
     if args.prompt_json:
@@ -590,6 +637,27 @@ def main():
 
     prompt_frame_indices = sorted(prompt_schedule)
     print(f"[INFO] Prompt frames: {prompt_frame_indices}")
+
+    if args.save_prompt_multimasks:
+        first_prompt_frame = prompt_frame_indices[0]
+        schedule_entry = prompt_schedule[first_prompt_frame]
+        frame_bgr = _read_frame_at(cap, first_prompt_frame, first_frame)
+        candidates = tracker.preview_prompt_candidates(
+            schedule_entry["prepared"],
+            schedule_entry["prompt_points"],
+            schedule_entry["prompt_labels"],
+        )
+        save_path = Path(args.save_prompt_multimasks).resolve()
+        _save_prompt_multimask_sheet(save_path, frame_bgr, candidates)
+        num_candidates = (
+            int(candidates.multimask_uint8.shape[0])
+            if candidates.multimask_uint8 is not None
+            else 0
+        )
+        print(
+            f"[INFO] Prompt multimasks: raw_candidates={num_candidates} "
+            f"iou={_candidate_iou_scores(candidates)} sheet={save_path}"
+        )
 
     tracker.reset()
 
