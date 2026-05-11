@@ -796,6 +796,16 @@ bool preloadCudaWindowsRuntime()
 }
 #endif
 
+std::vector<std::string> namesToStrings(const std::vector<const char*>& names)
+{
+    std::vector<std::string> out;
+    out.reserve(names.size());
+    for (const char* name : names) {
+        out.emplace_back(name ? name : "");
+    }
+    return out;
+}
+
 } // namespace
 
 SAM3::SAM3() = default;
@@ -862,6 +872,7 @@ bool SAM3::clearSessions()
         m_imageDecoderIouScoresIndex = -1;
         m_trackerDecoderObjPtrIndex = -1;
         m_trackerDecoderPredMaskHighResIndex = -1;
+        m_trackerDecoderPredMultimasksHighResIndex = -1;
         m_trackerDecoderObjectScoreIndex = -1;
         m_trackerDecoderIouScoresIndex = -1;
         m_memoryAttentionFusedFeatIndex = -1;
@@ -879,6 +890,12 @@ bool SAM3::clearSessions()
 
         resetMemory();
         m_device = "cpu";
+        m_encoderPath.clear();
+        m_imageDecoderPath.clear();
+        m_trackerDecoderPath.clear();
+        m_memoryAttentionPath.clear();
+        m_memoryEncoderPath.clear();
+        m_constantsPath.clear();
     } catch (...) {
         return false;
     }
@@ -923,6 +940,127 @@ void SAM3::restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot)
     m_memoryMaskFeatsScratch.clear();
     m_memoryMaskPosScratch.clear();
     m_memoryMaskTposScratch.clear();
+    m_lastFrameTimings = SAM3FrameTimings();
+    m_hasLastFrameTimings = false;
+    m_lastTrackerFrameState = TrackerFrameState();
+    m_hasLastTrackerFrameState = false;
+    m_lastTrackerMaskCandidates = SAM3MaskCandidates();
+    m_hasLastTrackerMaskCandidates = false;
+}
+
+void SAM3::setDiagnosticsOptions(const SAM3DiagnosticsOptions& options)
+{
+    m_diagnosticsOptions = options;
+    if (!m_diagnosticsOptions.captureTrackerCandidates) {
+        m_lastTrackerMaskCandidates = SAM3MaskCandidates();
+        m_hasLastTrackerMaskCandidates = false;
+    }
+}
+
+SAM3DiagnosticsOptions SAM3::diagnosticsOptions() const
+{
+    return m_diagnosticsOptions;
+}
+
+bool SAM3::runtimeMetadata(SAM3RuntimeMetadata* metadataOut) const
+{
+    if (!metadataOut) {
+        return false;
+    }
+
+    SAM3RuntimeMetadata metadata;
+    metadata.imageInitialized = static_cast<bool>(m_imageDecoderSession);
+    metadata.videoInitialized =
+        static_cast<bool>(m_trackerDecoderSession)
+        && static_cast<bool>(m_memoryAttentionSession)
+        && static_cast<bool>(m_memoryEncoderSession);
+    metadata.mode = metadata.videoInitialized
+        ? "video"
+        : (metadata.imageInitialized ? "image" : "uninitialized");
+    metadata.device = m_device;
+    metadata.encoderPath = m_encoderPath;
+    metadata.imageDecoderPath = m_imageDecoderPath;
+    metadata.trackerDecoderPath = m_trackerDecoderPath;
+    metadata.memoryAttentionPath = m_memoryAttentionPath;
+    metadata.memoryEncoderPath = m_memoryEncoderPath;
+    metadata.constantsPath = m_constantsPath;
+    metadata.inputSize = getInputSize();
+    metadata.hasVideoConstants = m_hasVideoConstants;
+    metadata.decoderHasIouScores = m_trackerDecoderIouScoresIndex >= 0;
+    metadata.decoderHasMultimasks = m_trackerDecoderPredMultimasksHighResIndex >= 0;
+    metadata.imageDecoderPredMasksIndex = m_imageDecoderPredMasksIndex;
+    metadata.imageDecoderIouScoresIndex = m_imageDecoderIouScoresIndex;
+    metadata.trackerDecoderObjPtrIndex = m_trackerDecoderObjPtrIndex;
+    metadata.trackerDecoderPredMaskHighResIndex = m_trackerDecoderPredMaskHighResIndex;
+    metadata.trackerDecoderPredMultimasksHighResIndex = m_trackerDecoderPredMultimasksHighResIndex;
+    metadata.trackerDecoderObjectScoreIndex = m_trackerDecoderObjectScoreIndex;
+    metadata.trackerDecoderIouScoresIndex = m_trackerDecoderIouScoresIndex;
+    metadata.memoryAttentionFusedFeatIndex = m_memoryAttentionFusedFeatIndex;
+    metadata.memoryEncoderFeaturesIndex = m_memoryEncoderFeaturesIndex;
+    metadata.memoryEncoderPosEncIndex = m_memoryEncoderPosIndex;
+    metadata.staticNumMemFrames = m_staticNumMemFrames;
+    metadata.staticNumObjPtrs = m_staticNumObjPtrs;
+    metadata.effectiveMaxMemFrames = m_constants.numMaskmem;
+    metadata.effectiveMaxObjPtrs = m_constants.maxObjPtrs;
+    metadata.maxCondFramesInAttn = m_constants.maxCondFramesInAttn;
+    metadata.keepFirstCondFrame = m_constants.keepFirstCondFrame;
+    metadata.memoryTemporalStrideForEval = m_constants.memoryTemporalStrideForEval;
+    metadata.useMemorySelection = m_constants.useMemorySelection;
+    metadata.mfThreshold = m_constants.mfThreshold;
+    metadata.exportMaxMemFrames = m_constants.exportMaxMemFrames;
+    metadata.exportMaxObjPtrs = m_constants.exportMaxObjPtrs;
+    metadata.nonConditioningFramesKept = m_nonConditioningStates.size();
+    metadata.segmentFrameIndex = m_segmentFrameIndex;
+    metadata.encoderInputNodes = m_encoderInputNodes;
+    metadata.encoderOutputNodes = m_encoderOutputNodes;
+    metadata.imageDecoderInputNodes = m_imageDecoderInputNodes;
+    metadata.imageDecoderOutputNodes = m_imageDecoderOutputNodes;
+    metadata.trackerDecoderInputNodes = m_trackerDecoderInputNodes;
+    metadata.trackerDecoderOutputNodes = m_trackerDecoderOutputNodes;
+    metadata.memoryAttentionInputNodes = m_memoryAttentionInputNodes;
+    metadata.memoryAttentionOutputNodes = m_memoryAttentionOutputNodes;
+    metadata.memoryEncoderInputNodes = m_memoryEncoderInputNodes;
+    metadata.memoryEncoderOutputNodes = m_memoryEncoderOutputNodes;
+    metadata.encoderInputNames = namesToStrings(m_encoderInputNames);
+    metadata.encoderOutputNames = namesToStrings(m_encoderOutputNames);
+    metadata.imageDecoderInputNames = namesToStrings(m_imageDecoderInputNames);
+    metadata.imageDecoderOutputNames = namesToStrings(m_imageDecoderOutputNames);
+    metadata.trackerDecoderInputNames = namesToStrings(m_trackerDecoderInputNames);
+    metadata.trackerDecoderOutputNames = namesToStrings(m_trackerDecoderOutputNames);
+    metadata.memoryAttentionInputNames = namesToStrings(m_memoryAttentionInputNames);
+    metadata.memoryAttentionOutputNames = namesToStrings(m_memoryAttentionOutputNames);
+    metadata.memoryEncoderInputNames = namesToStrings(m_memoryEncoderInputNames);
+    metadata.memoryEncoderOutputNames = namesToStrings(m_memoryEncoderOutputNames);
+
+    *metadataOut = std::move(metadata);
+    return true;
+}
+
+bool SAM3::lastFrameTimings(SAM3FrameTimings* timingsOut) const
+{
+    if (!timingsOut || !m_hasLastFrameTimings) {
+        return false;
+    }
+    *timingsOut = m_lastFrameTimings;
+    return true;
+}
+
+bool SAM3::lastTrackerFrameState(TrackerFrameState* stateOut) const
+{
+    if (!stateOut || !m_hasLastTrackerFrameState) {
+        return false;
+    }
+    *stateOut = m_lastTrackerFrameState;
+    return true;
+}
+
+bool SAM3::lastTrackerMaskCandidates(SAM3MaskCandidates* candidatesOut) const
+{
+    if (!candidatesOut || !m_hasLastTrackerMaskCandidates) {
+        return false;
+    }
+    *candidatesOut = m_lastTrackerMaskCandidates;
+    return true;
 }
 
 SAM3Size SAM3::getInputSize() const
@@ -1129,6 +1267,8 @@ bool SAM3::initializeImage(const std::string& encoderPath,
 {
     clearSessions();
     m_device = device;
+    m_encoderPath = encoderPath;
+    m_imageDecoderPath = decoderPath;
 
     if (!modelExists(encoderPath) || !modelExists(decoderPath)) {
         std::cerr << "[ERROR] Model file not found.\n";
@@ -1289,6 +1429,11 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
 {
     clearSessions();
     m_device = device;
+    m_encoderPath = encoderPath;
+    m_trackerDecoderPath = decoderPath;
+    m_memoryAttentionPath = memoryAttentionPath;
+    m_memoryEncoderPath = memoryEncoderPath;
+    m_constantsPath = constantsPath;
 
     if (!modelExists(encoderPath)
         || !modelExists(decoderPath)
@@ -1399,6 +1544,8 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
 
     m_trackerDecoderObjPtrIndex = findNodeIndex(m_trackerDecoderOutputNodes, "obj_ptr");
     m_trackerDecoderPredMaskHighResIndex = findNodeIndex(m_trackerDecoderOutputNodes, "pred_mask_high_res");
+    m_trackerDecoderPredMultimasksHighResIndex =
+        findNodeIndex(m_trackerDecoderOutputNodes, "pred_multimasks_high_res");
     m_trackerDecoderObjectScoreIndex = findNodeIndex(m_trackerDecoderOutputNodes, "object_score_logits");
     m_trackerDecoderIouScoresIndex = findNodeIndex(m_trackerDecoderOutputNodes, "iou_scores");
     if (m_trackerDecoderObjPtrIndex < 0

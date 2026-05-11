@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <iostream>
 #include <map>
@@ -542,6 +543,137 @@ void printRuntimeSelection(const char* label,
     }
 }
 
+std::string shapeString(const std::vector<int64_t>& shape)
+{
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+            oss << "x";
+        }
+        oss << shape[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void printNodeList(const char* label, const std::vector<SAM3Node>& nodes);
+
+void printRuntimeMetadata(const char* label, const SAM3RuntimeMetadata& metadata)
+{
+    std::cout << "[DIAG] " << label << '\n'
+              << "       mode=" << metadata.mode
+              << " device=" << metadata.device
+              << " input=" << metadata.inputSize.width << "x" << metadata.inputSize.height << '\n'
+              << "       videoInitialized=" << (metadata.videoInitialized ? "yes" : "no")
+              << " imageInitialized=" << (metadata.imageInitialized ? "yes" : "no")
+              << " hasConstants=" << (metadata.hasVideoConstants ? "yes" : "no") << '\n'
+              << "       decoderHasMultimasks=" << (metadata.decoderHasMultimasks ? "yes" : "no")
+              << " decoderHasIouScores=" << (metadata.decoderHasIouScores ? "yes" : "no") << '\n'
+              << "       trackerIndices={objPtr:" << metadata.trackerDecoderObjPtrIndex
+              << ",maskHighRes:" << metadata.trackerDecoderPredMaskHighResIndex
+              << ",multimaskHighRes:" << metadata.trackerDecoderPredMultimasksHighResIndex
+              << ",objectScore:" << metadata.trackerDecoderObjectScoreIndex
+              << ",iou:" << metadata.trackerDecoderIouScoresIndex << "}\n"
+              << "       memoryIndices={attnFusedFeat:" << metadata.memoryAttentionFusedFeatIndex
+              << ",memFeatures:" << metadata.memoryEncoderFeaturesIndex
+              << ",memPosEnc:" << metadata.memoryEncoderPosEncIndex << "}\n"
+              << "       staticMemFrames=" << metadata.staticNumMemFrames
+              << " staticObjPtrs=" << metadata.staticNumObjPtrs
+              << " effectiveMemFrames=" << metadata.effectiveMaxMemFrames
+              << " effectiveObjPtrs=" << metadata.effectiveMaxObjPtrs << '\n'
+              << "       maxCondFrames=" << metadata.maxCondFramesInAttn
+              << " keepFirstCond=" << (metadata.keepFirstCondFrame ? "yes" : "no")
+              << " temporalStride=" << metadata.memoryTemporalStrideForEval
+              << " useMemorySelection=" << (metadata.useMemorySelection ? "yes" : "no")
+              << " mfThreshold=" << metadata.mfThreshold << '\n'
+              << "       outputs=";
+    for (size_t i = 0; i < metadata.trackerDecoderOutputNames.size(); ++i) {
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << metadata.trackerDecoderOutputNames[i];
+    }
+    std::cout << '\n';
+
+    printNodeList("encoder inputs", metadata.encoderInputNodes);
+    printNodeList("encoder outputs", metadata.encoderOutputNodes);
+    printNodeList("tracker decoder inputs", metadata.trackerDecoderInputNodes);
+    printNodeList("tracker decoder outputs", metadata.trackerDecoderOutputNodes);
+    printNodeList("memory attention inputs", metadata.memoryAttentionInputNodes);
+    printNodeList("memory attention outputs", metadata.memoryAttentionOutputNodes);
+    printNodeList("memory encoder inputs", metadata.memoryEncoderInputNodes);
+    printNodeList("memory encoder outputs", metadata.memoryEncoderOutputNodes);
+    if (!metadata.imageDecoderInputNodes.empty() || !metadata.imageDecoderOutputNodes.empty()) {
+        printNodeList("image decoder inputs", metadata.imageDecoderInputNodes);
+        printNodeList("image decoder outputs", metadata.imageDecoderOutputNodes);
+    }
+}
+
+void printNodeList(const char* label, const std::vector<SAM3Node>& nodes)
+{
+    std::cout << "[DIAG] " << label << " nodes=" << nodes.size() << '\n';
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        std::cout << "       [" << i << "] " << nodes[i].name
+                  << " shape=" << shapeString(nodes[i].dim) << '\n';
+    }
+}
+
+void printCandidateSummary(const char* label, const SAM3MaskCandidates& candidates)
+{
+    std::cout << "[DIAG] " << label
+              << " candidates=" << candidates.masks.size()
+              << " selected=" << candidates.selectedIndex
+              << " selectedMask="
+              << candidates.selectedMask.getWidth() << "x"
+              << candidates.selectedMask.getHeight()
+              << " scores=[";
+    for (size_t i = 0; i < candidates.scores.size(); ++i) {
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << candidates.scores[i];
+    }
+    std::cout << "]";
+    if (candidates.hasSelectedLogits()) {
+        std::cout << " selectedLogits=" << shapeString(candidates.selectedMaskLogitsHighRes.shape);
+    }
+    if (candidates.hasMultimaskLogits()) {
+        std::cout << " multimaskLogits=" << shapeString(candidates.multimaskLogitsHighRes.shape);
+    }
+    std::cout << '\n';
+}
+
+void printFrameDiagnostics(int frameIndex, const SAM3& sam)
+{
+    SAM3FrameTimings timings;
+    if (sam.lastFrameTimings(&timings)) {
+        std::cout << "[DIAG] frame=" << frameIndex
+                  << " trackerFrame=" << timings.frameIndex
+                  << " conditioning=" << (timings.conditioningFrame ? "yes" : "no")
+                  << " timingsMs={enc:" << timings.encMs
+                  << ",attn:" << timings.attnMs
+                  << ",dec:" << timings.decMs
+                  << ",mem:" << timings.memMs
+                  << ",total:" << timings.totalMs << "}\n";
+    }
+
+    TrackerFrameState state;
+    if (sam.lastTrackerFrameState(&state)) {
+        const double objectProb = 1.0 / (1.0 + std::exp(-static_cast<double>(state.objectScoreLogit)));
+        std::cout << "[DIAG] frame=" << frameIndex
+                  << " objectLogit=" << state.objectScoreLogit
+                  << " objectProb=" << objectProb
+                  << " effIou=" << (state.hasEffIouScore ? state.effIouScore : 0.0f)
+                  << " hasEffIou=" << (state.hasEffIouScore ? "yes" : "no") << '\n';
+    }
+
+    SAM3MaskCandidates candidates;
+    if (sam.lastTrackerMaskCandidates(&candidates)) {
+        printCandidateSummary(("frame=" + std::to_string(frameIndex)).c_str(), candidates);
+    }
+}
+
 } // namespace
 
 int runOnnxTestVideo(int argc, char** argv)
@@ -564,6 +696,8 @@ int runOnnxTestVideo(int argc, char** argv)
     int threads = hardwareThreads;
     bool threadsExplicit = false;
     int maxFrames = 0;
+    bool diagnostics = false;
+    bool metadataOnly = false;
     PromptMode promptMode = PromptMode::SeedPoints;
     SAM3MaskPromptStrategy maskPromptStrategy = SAM3MaskPromptStrategy::Box;
 
@@ -611,6 +745,11 @@ int runOnnxTestVideo(int argc, char** argv)
             }
         } else if (arg == "--output" && index + 1 < argc) {
             outputPath = argv[++index];
+        } else if (arg == "--diagnostics") {
+            diagnostics = true;
+        } else if (arg == "--metadata_only") {
+            metadataOnly = true;
+            diagnostics = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "Usage: Segment --onnx_test_video [options]\n\n"
@@ -628,7 +767,9 @@ int runOnnxTestVideo(int argc, char** argv)
                 << "  --mask path                 noninteractive dense mask prompt image for frame 0\n"
                 << "  --mask_prompt_strategy box|point\n"
                 << "  --max_frames N              frame limit\n"
-                << "  --output path               output overlay video path\n";
+                << "  --output path               output overlay video path\n"
+                << "  --diagnostics               print runtime/candidate/timing diagnostics\n"
+                << "  --metadata_only             initialize tracker and print metadata, no video needed\n";
             return 0;
         }
     }
@@ -638,10 +779,12 @@ int runOnnxTestVideo(int argc, char** argv)
         return 1;
     }
 
-    videoPath = resolveVideoPath(videoPath);
-    if (videoPath.empty()) {
-        std::cerr << "[ERROR] No video selected.\n";
-        return 1;
+    if (!metadataOnly) {
+        videoPath = resolveVideoPath(videoPath);
+        if (videoPath.empty()) {
+            std::cerr << "[ERROR] No video selected.\n";
+            return 1;
+        }
     }
 
     const bool deviceExplicit = !requestedDevice.empty();
@@ -713,6 +856,16 @@ int runOnnxTestVideo(int argc, char** argv)
             return 1;
         }
     }
+    if (diagnostics) {
+        previewSam.setDiagnosticsOptions(SAM3DiagnosticsOptions{true, true});
+        SAM3RuntimeMetadata metadata;
+        if (previewSam.runtimeMetadata(&metadata)) {
+            printRuntimeMetadata("Preview runtime metadata", metadata);
+        }
+    }
+    if (metadataOnly) {
+        return 0;
+    }
 
     std::map<int, SAM3Prompts> anchors;
     std::map<int, CachedEncoderOutputs> anchorCaches;
@@ -756,6 +909,13 @@ int runOnnxTestVideo(int argc, char** argv)
             prompts.rects.push_back(rect);
         }
         anchors[0] = prompts;
+        if (diagnostics) {
+            const SAM3MaskCandidates candidates =
+                previewSam.previewConditioningFrameCandidates(
+                    SAM3Size(firstFrame.cols, firstFrame.rows),
+                    prompts);
+            printCandidateSummary("preview frame=0", candidates);
+        }
 
         CachedEncoderOutputs cachedOutputs;
         if (previewSam.captureCachedEncoderOutputs(&cachedOutputs)) {
@@ -830,6 +990,13 @@ int runOnnxTestVideo(int argc, char** argv)
             return 1;
         }
     }
+    if (diagnostics) {
+        runtimeSam.setDiagnosticsOptions(SAM3DiagnosticsOptions{true, true});
+        SAM3RuntimeMetadata metadata;
+        if (runtimeSam.runtimeMetadata(&metadata)) {
+            printRuntimeMetadata("Tracking runtime metadata", metadata);
+        }
+    }
 
     cv::VideoCapture capture(videoPath);
     if (!capture.isOpened()) {
@@ -900,6 +1067,9 @@ int runOnnxTestVideo(int argc, char** argv)
             }
         } else {
             mask = runtimeSam.inferMultiFrame(normalizeSam3Image(frame), emptyPrompts);
+        }
+        if (diagnostics) {
+            printFrameDiagnostics(frameIndex, runtimeSam);
         }
 
         writer << overlayMask(frame, CVHelpers::imageToCvMatWithType(mask, CV_8UC1, 255.0));
