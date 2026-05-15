@@ -517,9 +517,21 @@ int envInt(const char* name, int fallback, int minValue = 1)
 GraphOptimizationLevel resolveGraphOptimizationLevel(const std::string& device,
                                                      GraphOptimizationLevel fallback)
 {
+    auto platformDefault = [&]() {
+#ifdef __APPLE__
+        if (device == "cpu") {
+            // ONNX Runtime 1.26's macOS CPU optimizer can throw while
+            // loading the SAM3 video decoder. Allow SAM3_ORT_GRAPH_OPT to
+            // opt back in once the runtime catches up.
+            return GraphOptimizationLevel::ORT_DISABLE_ALL;
+        }
+#endif
+        return fallback;
+    };
+
     const char* value = std::getenv("SAM3_ORT_GRAPH_OPT");
     if (!value || !*value) {
-        return fallback;
+        return platformDefault();
     }
 
     const std::string lowered = lowerAsciiCopy(value);
@@ -538,7 +550,7 @@ GraphOptimizationLevel resolveGraphOptimizationLevel(const std::string& device,
     if (device.rfind("dml", 0) == 0 || device.rfind("directml", 0) == 0) {
         return GraphOptimizationLevel::ORT_DISABLE_ALL;
     }
-    return device == "cpu" ? GraphOptimizationLevel::ORT_ENABLE_ALL : fallback;
+    return platformDefault();
 }
 
 std::vector<int64_t> concreteEncoderInputShape(const std::vector<int64_t>& modelShape)
