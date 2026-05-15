@@ -29,7 +29,6 @@ from onnx_test_utils import (
 )
 from quantize_image_models import (
     default_onnx_dir,
-    external_data_path,
     quantize_model,
 )
 
@@ -88,7 +87,7 @@ def parse_threads_spec(value: str) -> list[int]:
             resolved.append(max(1, cpu_count - 1))
         else:
             try:
-                resolved.append(max(1, int(part)))
+                resolved.append(max(0, int(part)))
             except ValueError as exc:
                 raise SystemExit(f"Invalid thread count {part!r}") from exc
     deduped: list[int] = []

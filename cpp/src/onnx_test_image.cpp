@@ -404,7 +404,7 @@ int runOnnxTestImage(int argc, char** argv)
                 << "  --mask_prompt_strategy box|point\n"
                 << "  --save_overlay path         write the overlay image\n"
                 << "  --no_gui                    do not open an OpenCV window\n"
-                << "  --threads N                 ORT intra-op threads\n";
+                << "  --threads N                 ORT intra-op threads; 0 keeps ORT default\n";
             return 0;
         }
     }

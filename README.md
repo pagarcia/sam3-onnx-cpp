@@ -170,6 +170,17 @@ prompt_encoder_mask_decoder_fp16.onnx
 prompt_encoder_mask_decoder_fp16.onnx_data
 ```
 
+Optional CPU INT8 encoder file:
+
+```text
+vision_encoder.int8.onnx
+vision_encoder.int8.onnx.data
+```
+
+When this file exists, the C++ CPU resolver prefers it for the image/video
+encoder and keeps the decoder/tracker modules at fp32 unless explicitly
+overridden.
+
 Exported video tracker files live in:
 
 ```text
@@ -221,6 +232,13 @@ Optional CUDA/FP16 artifacts:
 
 ```bash
 ./fetch_onnx_models.sh fp16
+```
+
+Optional CPU INT8 encoder artifact:
+
+```bash
+python -m pip install onnx sympy
+python python/quantize_image_models.py --model encoder --preprocess
 ```
 
 ### 3. Export video tracker modules
@@ -425,6 +443,13 @@ Optional CUDA/FP16 artifacts:
 .\fetch_onnx_models.bat fp16
 ```
 
+Optional CPU INT8 encoder artifact:
+
+```powershell
+python -m pip install onnx sympy
+python .\python\quantize_image_models.py --model encoder --preprocess
+```
+
 ### 3. Export video tracker modules
 
 Use a local SAM3 checkout next to this repo:
@@ -587,15 +612,37 @@ Noninteractive smoke tests:
 | Variable | Values | Use |
 | --- | --- | --- |
 | `SAM3_ORT_ACCEL` | `auto`, `cpu`, `cuda`, `trt` | Python provider selection. |
-| `SAM3_ONNX_VARIANT` | `auto`, `fp32`, `fp16` | Image encoder/decoder precision. |
+| `SAM3_ONNX_VARIANT` | `auto`, `int8`, `fp32`, `fp16` | C++ image encoder/decoder precision fallback. |
+| `SAM3_ORT_ENCODER_VARIANT` | `auto`, `int8`, `fp32`, `fp16` | C++ image/video encoder precision override. |
+| `SAM3_ORT_DECODER_VARIANT` | `auto`, `int8`, `fp32`, `fp16` | C++ image prompt decoder precision override. |
 | `SAM3_ORT_TRACKER_PRECISION` | `auto`, `fp32`, `fp16` | Video tracker precision. |
 | `SAM3_ORT_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++/Python graph optimization override. |
-| `SAM3_ORT_INTRA_OP_THREADS` | integer | Python ORT thread override. |
+| `SAM3_ORT_CPU_THREADS` | integer, including `0` | C++ CPU thread override; `0` leaves ORT intra-op threads at its default. |
+| `SAM3_ORT_INTRA_OP_THREADS` | integer, including `0` | Python ORT thread override, and C++ fallback when `SAM3_ORT_CPU_THREADS` is unset. |
 | `SAM3_ORT_IO_BINDING` | `auto`, `0`, `1` | Python I/O binding override. |
+
+## C++ Tensor Input
+
+Downstream C++ callers that already produce the SAM3 encoder input tensor can bypass the wrapper image resize/planar conversion step:
+
+```cpp
+const SAM3Size modelInput = sam.getInputSize();
+std::vector<float> nchw(1 * 3 * modelInput.height * modelInput.width);
+
+Image<float> mask = sam.inferMultiFrameTensor(
+    nchw,
+    SAM3Size{originalWidth, originalHeight},
+    prompts);
+```
+
+The tensor must match the encoder input shape exactly, normally `1 x 3 x H x W`, and use the same normalized RGB layout as the demo preprocessing.
 
 ## Quality And Performance Notes
 
 - CPU inference is supported, but the SAM3 vision encoder is large.
+- For CPU C++, generate `vision_encoder.int8.onnx` to reduce encoder latency.
+  Validate mask quality on your target prompts before shipping it; dynamic INT8
+  quantization can change candidate scores and mask selection.
 - Image prompting should feel interactive after the first encoder pass because decoder calls are much faster.
 - The ONNX image demo exposes a low-level prompt-head path and chooses one of three masks by predicted IoU. This is not a full production SAM3 quality comparison.
 - If the selected mask looks poor, try a different prompt or use the native SAM3 reference path for comparison.

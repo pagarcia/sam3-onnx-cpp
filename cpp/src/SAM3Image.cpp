@@ -348,3 +348,25 @@ Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
         return Image<float>();
     }
 }
+
+Image<float> SAM3::inferSingleFrameTensor(const float* encoderInputData,
+                                          size_t elementCount,
+                                          const SAM3Size& originalImageSize,
+                                          const SAM3Prompts& prompts)
+{
+    if (!preprocessImageTensor(encoderInputData, elementCount)) {
+        return Image<float>();
+    }
+    return inferSingleFrame(originalImageSize, prompts);
+}
+
+Image<float> SAM3::inferSingleFrameTensor(const std::vector<float>& encoderInputData,
+                                          const SAM3Size& originalImageSize,
+                                          const SAM3Prompts& prompts)
+{
+    return inferSingleFrameTensor(
+        encoderInputData.data(),
+        encoderInputData.size(),
+        originalImageSize,
+        prompts);
+}

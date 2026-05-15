@@ -268,17 +268,33 @@ public:
                          const std::string& device = "cpu");
 
     bool preprocessImage(const Image<float>& originalImage);
+    bool preprocessImageTensor(const float* encoderInputData, size_t elementCount);
+    bool preprocessImageTensor(const std::vector<float>& encoderInputData);
     bool captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const;
     bool restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs);
 
     Image<float> inferSingleFrame(const SAM3Size& originalImageSize,
                                   const SAM3Prompts& prompts);
+    Image<float> inferSingleFrameTensor(const float* encoderInputData,
+                                        size_t elementCount,
+                                        const SAM3Size& originalImageSize,
+                                        const SAM3Prompts& prompts);
+    Image<float> inferSingleFrameTensor(const std::vector<float>& encoderInputData,
+                                        const SAM3Size& originalImageSize,
+                                        const SAM3Prompts& prompts);
     Image<float> previewConditioningFrame(const SAM3Size& originalImageSize,
                                           const SAM3Prompts& prompts);
     SAM3MaskCandidates previewConditioningFrameCandidates(const SAM3Size& originalImageSize,
                                                           const SAM3Prompts& prompts);
     Image<float> inferMultiFrame(const Image<float>& originalImage,
                                  const SAM3Prompts& prompts);
+    Image<float> inferMultiFrameTensor(const float* encoderInputData,
+                                       size_t elementCount,
+                                       const SAM3Size& originalImageSize,
+                                       const SAM3Prompts& prompts);
+    Image<float> inferMultiFrameTensor(const std::vector<float>& encoderInputData,
+                                       const SAM3Size& originalImageSize,
+                                       const SAM3Prompts& prompts);
     Image<float> inferMultiFrameCached(const SAM3Size& originalImageSize,
                                        const SAM3Prompts& prompts);
 
@@ -326,7 +342,9 @@ private:
         const std::vector<Ort::Value>& inputTensors,
         const std::string& debugName);
 
-    std::vector<float> buildNoMemoryImageEmbedding(const Ort::Value& currentVisionFeat);
+    const std::vector<float>& buildNoMemoryImageEmbedding(
+        const Ort::Value& currentVisionFeat,
+        const std::vector<int64_t>& currentVisionShape);
     void buildImagePromptInputs(const SAM3Prompts& prompts,
                                 const SAM3Size& originalImageSize,
                                 std::vector<float>* pointsOut,

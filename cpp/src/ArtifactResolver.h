@@ -87,7 +87,7 @@ inline int preferredRuntimeThreads(int fallback, const std::string& device)
     const char* explicitThreads = std::getenv("SAM3_ORT_CPU_THREADS");
     if (explicitThreads && *explicitThreads) {
         try {
-            return std::max(1, std::stoi(explicitThreads));
+            return std::max(0, std::stoi(explicitThreads));
         } catch (...) {
         }
     }
@@ -95,7 +95,7 @@ inline int preferredRuntimeThreads(int fallback, const std::string& device)
     const char* intraOpThreads = std::getenv("SAM3_ORT_INTRA_OP_THREADS");
     if (intraOpThreads && *intraOpThreads) {
         try {
-            return std::max(1, std::stoi(intraOpThreads));
+            return std::max(0, std::stoi(intraOpThreads));
         } catch (...) {
         }
     }
@@ -215,8 +215,8 @@ inline bool hasUsableImageArtifact(const std::filesystem::path& path,
     }
 
     // Downloaded fp32/fp16 Hugging Face image models are split across
-    // .onnx + .onnx_data, while our CPU int8 quantized models are emitted
-    // as a single embedded .onnx file.
+    // .onnx + .onnx_data. Quantized artifacts may be embedded or may carry
+    // their own external-data reference, so let ONNX Runtime validate them.
     if (variant == "int8") {
         return true;
     }
@@ -288,7 +288,7 @@ inline std::vector<std::string> preferredImageDecoderVariants(const std::string&
         return {"fp16", "fp32", "int8"};
     }
     return device == "cpu"
-        ? std::vector<std::string>{"int8", "fp32", "fp16"}
+        ? std::vector<std::string>{"fp32", "int8", "fp16"}
         : std::vector<std::string>{"fp16", "fp32", "int8"};
 }
 
@@ -424,9 +424,26 @@ inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string& encoder
                                                       const std::string& device,
                                                       size_t annotationCount)
 {
-    const auto imageSelection = resolveImageRuntimePaths(encoderPath, "", device);
+    const auto imageOnnxDir = defaultImageOnnxDir();
     const auto videoDir = defaultVideoOnnxDir();
     const std::string preferredGraphProfile = graphProfileForAnnotationCount(annotationCount);
+
+    std::filesystem::path resolvedEncoderCandidate;
+    if (encoderPath.empty()) {
+        for (const auto& variant : preferredImageEncoderVariants(device)) {
+            for (const auto& candidate : imageEncoderPathsForVariant(imageOnnxDir, variant)) {
+                if (hasUsableImageArtifact(candidate, variant)) {
+                    resolvedEncoderCandidate = candidate;
+                    break;
+                }
+            }
+            if (!resolvedEncoderCandidate.empty()) {
+                break;
+            }
+        }
+    } else {
+        resolvedEncoderCandidate = candidatePath(encoderPath);
+    }
 
     std::vector<std::string> graphProfiles = {preferredGraphProfile};
     if (preferredGraphProfile != "single") {
@@ -445,12 +462,15 @@ inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string& encoder
             if (!pathExists(decoderCandidate)
                 || !pathExists(memoryAttentionCandidate)
                 || !pathExists(memoryEncoderCandidate)
-                || !pathExists(constantsCandidate)) {
+                || !pathExists(constantsCandidate)
+                || resolvedEncoderCandidate.empty()) {
                 continue;
             }
 
             VideoRuntimeSelection selection;
-            selection.encoderPath = imageSelection.encoderPath;
+            selection.encoderPath = preferDirectMLArtifactPath(
+                normalizePath(resolvedEncoderCandidate),
+                device).string();
             selection.decoderPath = preferDirectMLArtifactPath(
                 normalizePath(decoderCandidate),
                 device).string();
@@ -498,7 +518,11 @@ inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string& encoder
     }
 
     VideoRuntimeSelection fallback;
-    fallback.encoderPath = imageSelection.encoderPath;
+    fallback.encoderPath = resolvedEncoderCandidate.empty()
+        ? std::string()
+        : preferDirectMLArtifactPath(
+            normalizePath(resolvedEncoderCandidate),
+            device).string();
     fallback.decoderPath = preferDirectMLArtifactPath(
         normalizePath(candidatePath(decoderPath)),
         device).string();

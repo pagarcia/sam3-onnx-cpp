@@ -390,14 +390,13 @@ SAM3MaskCandidates SAM3::previewConditioningFrameCandidates(const SAM3Size& orig
 
         const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabels.size()), 2};
         const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabels.size())};
-        std::vector<int64_t> currentVisionShape;
-        std::vector<float> currentVisionValues;
-        extractTensorData(
+        const std::vector<int64_t> currentVisionShape =
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)]
+                .GetTensorTypeAndShapeInfo()
+                .GetShape();
+        const std::vector<float>& imageEmbed = buildNoMemoryImageEmbedding(
             m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)],
-            currentVisionValues,
             currentVisionShape);
-        const std::vector<float> imageEmbed = buildNoMemoryImageEmbedding(
-            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)]);
 
         std::vector<Ort::Value> inputs;
         inputs.reserve(m_trackerDecoderInputNodes.size());
@@ -452,6 +451,31 @@ Image<float> SAM3::inferMultiFrame(const Image<float>& originalImage,
     return inferMultiFrameWithEncoderOutputs(m_cachedEncoderOutputs, originalSize, prompts, encTimeMs);
 }
 
+Image<float> SAM3::inferMultiFrameTensor(const float* encoderInputData,
+                                         size_t elementCount,
+                                         const SAM3Size& originalImageSize,
+                                         const SAM3Prompts& prompts)
+{
+    const auto start = std::chrono::steady_clock::now();
+    if (!preprocessImageTensor(encoderInputData, elementCount)) {
+        return Image<float>();
+    }
+    const double encTimeMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    return inferMultiFrameWithEncoderOutputs(m_cachedEncoderOutputs, originalImageSize, prompts, encTimeMs);
+}
+
+Image<float> SAM3::inferMultiFrameTensor(const std::vector<float>& encoderInputData,
+                                         const SAM3Size& originalImageSize,
+                                         const SAM3Prompts& prompts)
+{
+    return inferMultiFrameTensor(
+        encoderInputData.data(),
+        encoderInputData.size(),
+        originalImageSize,
+        prompts);
+}
+
 Image<float> SAM3::inferMultiFrameCached(const SAM3Size& originalImageSize,
                                          const SAM3Prompts& prompts)
 {
@@ -497,16 +521,14 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         const Ort::Value& highRes0 = encoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)];
         const Ort::Value& highRes1 = encoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)];
         const Ort::Value& currentVisionFeat = encoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)];
-        std::vector<int64_t> currentVisionShape;
-        std::vector<float> currentVisionValues;
-        extractTensorData(currentVisionFeat, currentVisionValues, currentVisionShape);
+        const std::vector<int64_t> currentVisionShape =
+            currentVisionFeat.GetTensorTypeAndShapeInfo().GetShape();
 
         std::vector<Ort::Value> decoderInputs;
         double attnTimeMs = 0.0;
         bool isMaskFromPoints = conditioningFrame;
         std::vector<float> pointCoordsStorage;
         std::vector<int32_t> pointLabelsStorage;
-        std::vector<float> imageEmbedStorage;
         std::vector<Ort::Value> memoryAttentionOutputs;
 
         if (conditioningFrame) {
@@ -520,12 +542,14 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 return Image<float>(originalImageSize.width, originalImageSize.height, 1);
             }
 
-            imageEmbedStorage = buildNoMemoryImageEmbedding(currentVisionFeat);
+            const std::vector<float>& imageEmbed = buildNoMemoryImageEmbedding(
+                currentVisionFeat,
+                currentVisionShape);
             const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabelsStorage.size()), 2};
             const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabelsStorage.size())};
             decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, pointCoordsShape));
             decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, pointLabelsShape));
-            decoderInputs.push_back(createTensor<float>(m_memoryInfo, imageEmbedStorage, currentVisionShape));
+            decoderInputs.push_back(createTensor<float>(m_memoryInfo, imageEmbed, currentVisionShape));
         } else {
             buildMemoryInputBuffers(m_segmentFrameIndex);
             const auto attnStart = std::chrono::steady_clock::now();

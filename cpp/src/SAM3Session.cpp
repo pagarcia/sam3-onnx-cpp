@@ -1078,11 +1078,12 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
                                GraphOptimizationLevel optLevel,
                                const std::string& device)
 {
-    const int safeThreads = std::max(1, threadsNumber);
     const int safeInterOpThreads = envInt("SAM3_ORT_INTER_OP_THREADS", 1, 1);
     const bool enableCpuArena = envBool("SAM3_ORT_CPU_ARENA", true);
     const bool enableMemPattern = envBool("SAM3_ORT_MEM_PATTERN", true);
-    options.SetIntraOpNumThreads(safeThreads);
+    if (threadsNumber > 0) {
+        options.SetIntraOpNumThreads(threadsNumber);
+    }
     options.SetInterOpNumThreads(safeInterOpThreads);
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
     options.SetGraphOptimizationLevel(resolveGraphOptimizationLevel(device, optLevel));
@@ -1644,7 +1645,51 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
             originalImage,
             targetSize.width,
             targetSize.height);
-        Ort::Value inputTensor = createTensor<float>(m_memoryInfo, encoderData, m_inputShapeEncoder);
+        return preprocessImageTensor(encoderData);
+    } catch (const std::exception& error) {
+        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
+        m_cachedEncoderOutputs.clear();
+        m_cachedEncoderHostCopy = CachedEncoderOutputs();
+        m_hasCachedEncoderHostCopy = false;
+        return false;
+    }
+}
+
+bool SAM3::preprocessImageTensor(const std::vector<float>& encoderInputData)
+{
+    return preprocessImageTensor(encoderInputData.data(), encoderInputData.size());
+}
+
+bool SAM3::preprocessImageTensor(const float* encoderInputData, size_t elementCount)
+{
+    try {
+        if (!encoderInputData || elementCount == 0) {
+            std::cerr << "[ERROR] preprocessImageTensor => encoder input is empty.\n";
+            m_cachedEncoderOutputs.clear();
+            m_cachedEncoderHostCopy = CachedEncoderOutputs();
+            m_hasCachedEncoderHostCopy = false;
+            return false;
+        }
+        const size_t expectedElements = computeElementCount(m_inputShapeEncoder);
+        if (m_inputShapeEncoder.size() < 4 || expectedElements == 0 || elementCount != expectedElements) {
+            std::cerr
+                << "[ERROR] preprocessImageTensor => expected "
+                << expectedElements
+                << " floats for encoder input, got "
+                << elementCount
+                << ".\n";
+            m_cachedEncoderOutputs.clear();
+            m_cachedEncoderHostCopy = CachedEncoderOutputs();
+            m_hasCachedEncoderHostCopy = false;
+            return false;
+        }
+
+        Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
+            m_memoryInfo,
+            const_cast<float*>(encoderInputData),
+            elementCount,
+            m_inputShapeEncoder.data(),
+            m_inputShapeEncoder.size());
         std::vector<Ort::Value> inputs;
         inputs.push_back(std::move(inputTensor));
 
@@ -1656,6 +1701,9 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
             "encoder");
         if (result.index() == 1) {
             std::cerr << std::get<std::string>(result) << '\n';
+            m_cachedEncoderOutputs.clear();
+            m_cachedEncoderHostCopy = CachedEncoderOutputs();
+            m_hasCachedEncoderHostCopy = false;
             return false;
         }
 
@@ -1664,7 +1712,7 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
         m_hasCachedEncoderHostCopy = false;
         return true;
     } catch (const std::exception& error) {
-        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
+        std::cerr << "[ERROR] preprocessImageTensor => " << error.what() << '\n';
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
@@ -1672,15 +1720,16 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
     }
 }
 
-std::vector<float> SAM3::buildNoMemoryImageEmbedding(const Ort::Value& currentVisionFeat)
+const std::vector<float>& SAM3::buildNoMemoryImageEmbedding(
+    const Ort::Value& currentVisionFeat,
+    const std::vector<int64_t>& currentVisionShape)
 {
-    std::vector<float> currentVisionValues;
-    std::vector<int64_t> currentVisionShape;
-    extractTensorData(currentVisionFeat, currentVisionValues, currentVisionShape);
+    const float* currentVisionValues = currentVisionFeat.GetTensorData<float>();
+    const size_t currentVisionCount = computeElementCount(currentVisionShape);
 
-    m_noMemoryImageEmbedScratch.resize(currentVisionValues.size());
-    if (currentVisionValues.size() == m_constants.noMemEmbed.size()) {
-        for (size_t index = 0; index < currentVisionValues.size(); ++index) {
+    m_noMemoryImageEmbedScratch.resize(currentVisionCount);
+    if (currentVisionCount == m_constants.noMemEmbed.size()) {
+        for (size_t index = 0; index < currentVisionCount; ++index) {
             m_noMemoryImageEmbedScratch[index] = currentVisionValues[index] + m_constants.noMemEmbed[index];
         }
         return m_noMemoryImageEmbedScratch;
@@ -1705,7 +1754,7 @@ std::vector<float> SAM3::buildNoMemoryImageEmbedding(const Ort::Value& currentVi
     }
 
     std::vector<size_t> coords(currentVisionShape.size(), 0);
-    for (size_t currentIndex = 0; currentIndex < currentVisionValues.size(); ++currentIndex) {
+    for (size_t currentIndex = 0; currentIndex < currentVisionCount; ++currentIndex) {
         size_t remaining = currentIndex;
         for (size_t dim = currentVisionShape.size(); dim-- > 0;) {
             const size_t extent = static_cast<size_t>(currentVisionShape[dim]);

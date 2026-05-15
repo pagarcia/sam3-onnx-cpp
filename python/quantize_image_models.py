@@ -38,8 +38,11 @@ def default_op_types(model: str) -> list[str]:
     raise ValueError(f"Unsupported model kind: {model}")
 
 
-def external_data_path(model_path: Path) -> Path:
-    return model_path.with_name(model_path.name + "_data")
+def external_data_candidates(model_path: Path) -> tuple[Path, Path]:
+    return (
+        model_path.with_name(model_path.name + "_data"),
+        model_path.with_name(model_path.name + ".data"),
+    )
 
 
 def remove_path(path: Path) -> None:
@@ -52,7 +55,7 @@ def remove_path(path: Path) -> None:
 
 
 def remove_artifact_pair(model_path: Path) -> None:
-    for candidate in (model_path, external_data_path(model_path)):
+    for candidate in (model_path, *external_data_candidates(model_path)):
         if candidate.exists():
             remove_path(candidate)
 
@@ -61,14 +64,26 @@ def ensure_input_ready(model_path: Path) -> None:
     if not model_path.exists():
         raise SystemExit(f"Missing {model_path}")
 
-    sidecar = external_data_path(model_path)
-    if sidecar.exists():
+    if any(sidecar.exists() for sidecar in external_data_candidates(model_path)):
         return
 
     print(
-        f"[WARN] {sidecar.name} is missing next to {model_path.name}. "
+        f"[WARN] External data sidecar is missing next to {model_path.name}. "
         "This is only okay if the model is fully embedded."
     )
+
+
+def stage_model_with_external_data(input_path: Path, workdir: Path) -> Path:
+    """Copy an ONNX model and its external data sidecar to a private temp dir."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    staged_model = workdir / input_path.name
+    shutil.copy2(input_path, staged_model)
+
+    for sidecar in external_data_candidates(input_path):
+        if sidecar.exists():
+            shutil.copy2(sidecar, workdir / sidecar.name)
+
+    return staged_model
 
 
 def preprocess_model(input_path: Path, workdir: Path) -> Path:
@@ -102,11 +117,12 @@ def quantize_model(input_path: Path,
 
     with tempfile.TemporaryDirectory(prefix=f"sam3_quant_{input_path.stem}_") as tmp:
         workdir = Path(tmp)
+        staged_input = stage_model_with_external_data(input_path, workdir / "input")
         preprocess_used = False
-        model_for_quant = input_path
+        model_for_quant = staged_input
         if do_preprocess:
             try:
-                model_for_quant = preprocess_model(input_path, workdir)
+                model_for_quant = preprocess_model(staged_input, workdir)
                 preprocess_used = True
             except Exception as exc:
                 if not allow_preprocess_fallback:
@@ -195,10 +211,10 @@ def main() -> None:
             op_types=op_types,
         )
 
-        sidecar = external_data_path(output_path)
         print(f"[OK] Wrote {output_path}")
-        if sidecar.exists():
-            print(f"[OK] Wrote {sidecar}")
+        for sidecar in external_data_candidates(output_path):
+            if sidecar.exists():
+                print(f"[OK] Wrote {sidecar}")
         if result["preprocess_requested"]:
             print(
                 "[INFO] preprocess_used="

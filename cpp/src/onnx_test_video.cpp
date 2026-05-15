@@ -769,7 +769,8 @@ int runOnnxTestVideo(int argc, char** argv)
                 << "  --max_frames N              frame limit\n"
                 << "  --output path               output overlay video path\n"
                 << "  --diagnostics               print runtime/candidate/timing diagnostics\n"
-                << "  --metadata_only             initialize tracker and print metadata, no video needed\n";
+                << "  --metadata_only             initialize tracker and print metadata, no video needed\n"
+                << "  --threads N                 ORT intra-op threads; 0 keeps ORT default\n";
             return 0;
         }
     }
