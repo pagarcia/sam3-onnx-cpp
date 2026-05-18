@@ -7,6 +7,8 @@
 #include <coreml_provider_factory.h>
 #endif
 
+#include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <fstream>
 #include <initializer_list>
@@ -117,9 +119,30 @@ struct SAM3Size {
     SAM3Size(int widthValue, int heightValue) : width(widthValue), height(heightValue) {}
 };
 
+enum class CachedTensorElementType : std::uint8_t {
+    Float32,
+    Float16
+};
+
 struct CachedTensorData {
     std::vector<float> values;
+    std::vector<std::uint16_t> halfValues;
     std::vector<int64_t> shape;
+    CachedTensorElementType elementType = CachedTensorElementType::Float32;
+
+    bool empty() const noexcept
+    {
+        return elementType == CachedTensorElementType::Float16
+            ? halfValues.empty()
+            : values.empty();
+    }
+
+    std::size_t storedBytes() const noexcept
+    {
+        return values.size() * sizeof(float)
+            + halfValues.size() * sizeof(std::uint16_t)
+            + shape.size() * sizeof(int64_t);
+    }
 };
 
 struct CachedEncoderOutputs {

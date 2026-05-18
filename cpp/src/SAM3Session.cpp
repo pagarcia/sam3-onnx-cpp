@@ -100,6 +100,135 @@ std::string trimCopy(const std::string& value)
     return std::string(first, last);
 }
 
+std::uint16_t floatToHalfBits(float value)
+{
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+
+    const std::uint32_t sign = (bits >> 16) & 0x8000u;
+    const std::uint32_t exponentBits = (bits >> 23) & 0xffu;
+    std::uint32_t mantissa = bits & 0x7fffffu;
+
+    if (exponentBits == 0xffu) {
+        if (mantissa != 0u) {
+            return static_cast<std::uint16_t>(
+                sign | 0x7c00u | (mantissa >> 13) | 0x0001u);
+        }
+        return static_cast<std::uint16_t>(sign | 0x7c00u);
+    }
+
+    int exponent = static_cast<int>(exponentBits) - 127 + 15;
+    if (exponent <= 0) {
+        if (exponent < -10) {
+            return static_cast<std::uint16_t>(sign);
+        }
+
+        mantissa = (mantissa | 0x800000u) >> (1 - exponent);
+        if ((mantissa & 0x1000u) != 0u) {
+            mantissa += 0x2000u;
+        }
+        return static_cast<std::uint16_t>(sign | (mantissa >> 13));
+    }
+
+    if ((mantissa & 0x1000u) != 0u) {
+        mantissa += 0x2000u;
+        if ((mantissa & 0x800000u) != 0u) {
+            mantissa = 0u;
+            ++exponent;
+        }
+    }
+
+    if (exponent >= 31) {
+        return static_cast<std::uint16_t>(sign | 0x7c00u);
+    }
+
+    return static_cast<std::uint16_t>(
+        sign | (static_cast<std::uint32_t>(exponent) << 10) | (mantissa >> 13));
+}
+
+float halfBitsToFloat(std::uint16_t value)
+{
+    const std::uint32_t sign = (static_cast<std::uint32_t>(value & 0x8000u) << 16);
+    std::uint32_t exponent = (value >> 10) & 0x1fu;
+    std::uint32_t mantissa = value & 0x03ffu;
+    std::uint32_t bits = 0;
+
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            bits = sign;
+        } else {
+            int normalizedExponent = -14;
+            while ((mantissa & 0x0400u) == 0u) {
+                mantissa <<= 1;
+                --normalizedExponent;
+            }
+            mantissa &= 0x03ffu;
+            bits = sign
+                | (static_cast<std::uint32_t>(normalizedExponent + 127) << 23)
+                | (mantissa << 13);
+        }
+    } else if (exponent == 0x1fu) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        exponent = exponent + (127 - 15);
+        bits = sign | (exponent << 23) | (mantissa << 13);
+    }
+
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+bool captureTensorAsHalf(const Ort::Value& tensor, CachedTensorData* target)
+{
+    if (!target) {
+        return false;
+    }
+
+    const float* tensorData = tensor.GetTensorData<float>();
+    const auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
+    const std::size_t count = computeElementCount(shape);
+
+    target->values.clear();
+    target->halfValues.resize(count);
+    target->shape.assign(shape.begin(), shape.end());
+    target->elementType = CachedTensorElementType::Float16;
+    for (std::size_t i = 0; i < count; ++i) {
+        target->halfValues[i] = floatToHalfBits(tensorData[i]);
+    }
+    return !target->halfValues.empty();
+}
+
+bool expandTensorToFloat(const CachedTensorData& source, CachedTensorData* target)
+{
+    if (!target || source.empty()) {
+        return false;
+    }
+
+    const std::size_t expectedCount = computeElementCount(source.shape);
+    target->shape = source.shape;
+    target->halfValues.clear();
+    target->elementType = CachedTensorElementType::Float32;
+
+    if (source.elementType == CachedTensorElementType::Float16
+        || !source.halfValues.empty()) {
+        if (source.halfValues.size() != expectedCount) {
+            return false;
+        }
+        target->values.resize(source.halfValues.size());
+        for (std::size_t i = 0; i < source.halfValues.size(); ++i) {
+            target->values[i] = halfBitsToFloat(source.halfValues[i]);
+        }
+    } else {
+        if (source.values.size() != expectedCount) {
+            return false;
+        }
+        target->values = source.values;
+    }
+
+    return !target->values.empty();
+}
+
 uint16_t readUInt16LE(const std::vector<uint8_t>& bytes, size_t offset)
 {
     return static_cast<uint16_t>(bytes[offset])
@@ -1614,19 +1743,23 @@ bool SAM3::captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const
         return false;
     }
 
-    extractTensorData(m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)], outputs->imageEmb0.values, outputs->imageEmb0.shape);
-    extractTensorData(m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)], outputs->imageEmb1.values, outputs->imageEmb1.shape);
-    extractTensorData(m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)], outputs->imageEmb2.values, outputs->imageEmb2.shape);
-    return !outputs->imageEmb0.values.empty()
-        && !outputs->imageEmb1.values.empty()
-        && !outputs->imageEmb2.values.empty();
+    *outputs = CachedEncoderOutputs();
+    return captureTensorAsHalf(
+               m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)],
+               &outputs->imageEmb0)
+        && captureTensorAsHalf(
+               m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)],
+               &outputs->imageEmb1)
+        && captureTensorAsHalf(
+               m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)],
+               &outputs->imageEmb2);
 }
 
 bool SAM3::restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs)
 {
-    if (outputs.imageEmb0.values.empty()
-        || outputs.imageEmb1.values.empty()
-        || outputs.imageEmb2.values.empty()) {
+    if (outputs.imageEmb0.empty()
+        || outputs.imageEmb1.empty()
+        || outputs.imageEmb2.empty()) {
         return false;
     }
 
@@ -1635,17 +1768,34 @@ bool SAM3::restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs)
         return false;
     }
 
+    CachedEncoderOutputs restoredHostCopy;
+    if (!expandTensorToFloat(outputs.imageEmb0, &restoredHostCopy.imageEmb0)
+        || !expandTensorToFloat(outputs.imageEmb1, &restoredHostCopy.imageEmb1)
+        || !expandTensorToFloat(outputs.imageEmb2, &restoredHostCopy.imageEmb2)) {
+        return false;
+    }
+
+    m_cachedEncoderHostCopy = std::move(restoredHostCopy);
+    m_hasCachedEncoderHostCopy = true;
+
     std::vector<Ort::Value> restored(static_cast<size_t>(requiredMaxIndex + 1));
     restored[static_cast<size_t>(m_encoderImageEmb0Index)] =
-        createTensor<float>(m_memoryInfo, outputs.imageEmb0.values, outputs.imageEmb0.shape);
+        createTensor<float>(
+            m_memoryInfo,
+            m_cachedEncoderHostCopy.imageEmb0.values,
+            m_cachedEncoderHostCopy.imageEmb0.shape);
     restored[static_cast<size_t>(m_encoderImageEmb1Index)] =
-        createTensor<float>(m_memoryInfo, outputs.imageEmb1.values, outputs.imageEmb1.shape);
+        createTensor<float>(
+            m_memoryInfo,
+            m_cachedEncoderHostCopy.imageEmb1.values,
+            m_cachedEncoderHostCopy.imageEmb1.shape);
     restored[static_cast<size_t>(m_encoderImageEmb2Index)] =
-        createTensor<float>(m_memoryInfo, outputs.imageEmb2.values, outputs.imageEmb2.shape);
+        createTensor<float>(
+            m_memoryInfo,
+            m_cachedEncoderHostCopy.imageEmb2.values,
+            m_cachedEncoderHostCopy.imageEmb2.shape);
 
     m_cachedEncoderOutputs = std::move(restored);
-    m_cachedEncoderHostCopy = outputs;
-    m_hasCachedEncoderHostCopy = true;
     return true;
 }
 
