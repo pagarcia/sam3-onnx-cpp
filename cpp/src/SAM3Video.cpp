@@ -18,6 +18,12 @@ size_t safeMinCount(size_t a, size_t b)
     return std::min(a, b);
 }
 
+double frameElapsedMs(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
 int bestScoreIndex(const std::vector<float>& scores, size_t candidateCount)
 {
     if (candidateCount == 0) {
@@ -492,6 +498,16 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                                                      double encTimeMs)
 {
     const auto totalStart = std::chrono::steady_clock::now();
+    SAM3FrameTimings timings;
+    timings.frameIndex = m_segmentFrameIndex;
+    timings.encMs = encTimeMs;
+    m_lastFrameTimings = SAM3FrameTimings();
+    m_hasLastFrameTimings = false;
+    m_lastTrackerFrameState = TrackerFrameState();
+    m_hasLastTrackerFrameState = false;
+    m_lastTrackerMaskCandidates = SAM3MaskCandidates();
+    m_hasLastTrackerMaskCandidates = false;
+
     if (!m_trackerDecoderSession || !m_memoryAttentionSession || !m_memoryEncoderSession || !m_hasVideoConstants) {
         std::cerr << "[ERROR] inferMultiFrame => tracker sessions are not initialized.\n";
         return Image<float>();
@@ -504,6 +520,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
     }
 
     const bool conditioningFrame = !promptsEmpty(prompts) || !m_hasConditioningState;
+    timings.conditioningFrame = conditioningFrame;
     if (conditioningFrame && promptsEmpty(prompts) && !m_hasConditioningState) {
         std::cerr << "[WARN] inferMultiFrame => first tracker frame requires prompts.\n";
         return Image<float>(originalImageSize.width, originalImageSize.height, 1);
@@ -512,10 +529,16 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
 
     try {
         const bool denseMaskConditioning = conditioningFrame && hasMaskPrompt(prompts);
+        timings.denseMaskConditioning = denseMaskConditioning;
         PreparedSAM3MaskPrompt preparedMask;
-        if (denseMaskConditioning
-            && !prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
-            return Image<float>(originalImageSize.width, originalImageSize.height, 1);
+        if (denseMaskConditioning) {
+            const auto maskPrepStart = std::chrono::steady_clock::now();
+            const bool maskPrepared =
+                prepareMaskPrompt(prompts, originalImageSize, &preparedMask);
+            timings.maskPrepMs += frameElapsedMs(maskPrepStart);
+            if (!maskPrepared) {
+                return Image<float>(originalImageSize.width, originalImageSize.height, 1);
+            }
         }
 
         const Ort::Value& highRes0 = encoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)];
@@ -532,27 +555,31 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         std::vector<Ort::Value> memoryAttentionOutputs;
 
         if (conditioningFrame) {
+            const auto promptStart = std::chrono::steady_clock::now();
             buildTrackerPromptInputs(prompts, originalImageSize, &pointCoordsStorage, &pointLabelsStorage);
             if (pointLabelsStorage.empty() && denseMaskConditioning) {
                 pointCoordsStorage = preparedMask.fallbackPointCoords;
                 pointLabelsStorage = preparedMask.fallbackPointLabels;
             }
+            timings.promptBuildMs += frameElapsedMs(promptStart);
             if (pointLabelsStorage.empty()) {
                 std::cerr << "[WARN] inferMultiFrame => conditioning frame has no prompt tensors.\n";
                 return Image<float>(originalImageSize.width, originalImageSize.height, 1);
             }
 
+            const auto embedStart = std::chrono::steady_clock::now();
             const std::vector<float>& imageEmbed = buildNoMemoryImageEmbedding(
                 currentVisionFeat,
                 currentVisionShape);
+            timings.noMemoryEmbedMs += frameElapsedMs(embedStart);
             const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabelsStorage.size()), 2};
             const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabelsStorage.size())};
             decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, pointCoordsShape));
             decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, pointLabelsShape));
             decoderInputs.push_back(createTensor<float>(m_memoryInfo, imageEmbed, currentVisionShape));
         } else {
+            const auto memoryBuildStart = std::chrono::steady_clock::now();
             buildMemoryInputBuffers(m_segmentFrameIndex);
-            const auto attnStart = std::chrono::steady_clock::now();
             std::vector<Ort::Value> memoryInputs;
             memoryInputs.push_back(createTensorView<float>(
                 m_memoryInfo,
@@ -582,7 +609,9 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 m_memoryInfo,
                 m_memoryMaskTposScratch,
                 {static_cast<int64_t>(m_staticNumMemFrames)}));
+            timings.memoryBuildMs += frameElapsedMs(memoryBuildStart);
 
+            const auto attnStart = std::chrono::steady_clock::now();
             auto memoryAttentionResult = runSession(
                 m_memoryAttentionSession.get(),
                 m_memoryAttentionInputNames,
@@ -591,6 +620,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 "memoryAttention");
             attnTimeMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - attnStart).count();
+            timings.attnMs = attnTimeMs;
             if (memoryAttentionResult.index() == 1) {
                 std::cerr << std::get<std::string>(memoryAttentionResult) << '\n';
                 return Image<float>();
@@ -633,6 +663,8 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             conditioningFrame ? "trackerConditioningDecoder" : "trackerPropagationDecoder");
         const double decoderTimeMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - decoderStart).count();
+        timings.decMs = decoderTimeMs;
+        timings.decoderMs = decoderTimeMs;
         if (decoderResult.index() == 1) {
             std::cerr << std::get<std::string>(decoderResult) << '\n';
             return Image<float>();
@@ -645,11 +677,15 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         }
         SAM3MaskCandidates trackerMaskCandidates;
         if (m_diagnosticsOptions.captureTrackerCandidates) {
+            const auto candidateStart = std::chrono::steady_clock::now();
             trackerMaskCandidates =
                 collectTrackerMaskCandidates(
                     decoderOutputs,
                     originalImageSize,
                     m_diagnosticsOptions.captureRawTrackerLogits);
+            timings.candidateMs += frameElapsedMs(candidateStart);
+            timings.candidateCount =
+                static_cast<int>(trackerMaskCandidates.masks.size());
         }
 
         const auto memoryEncoderStart = std::chrono::steady_clock::now();
@@ -696,16 +732,20 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             conditioningFrame ? "conditioningMemoryEncoder" : "propagationMemoryEncoder");
         const double memoryEncoderTimeMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - memoryEncoderStart).count();
+        timings.memMs = memoryEncoderTimeMs;
         if (memoryEncoderResult.index() == 1) {
             std::cerr << std::get<std::string>(memoryEncoderResult) << '\n';
             return Image<float>();
         }
 
         auto memoryEncoderOutputs = std::move(std::get<0>(memoryEncoderResult));
+        const auto captureStateStart = std::chrono::steady_clock::now();
         TrackerFrameState frameState = captureTrackerState(
             decoderOutputs,
             memoryEncoderOutputs,
             frameIndex);
+        timings.captureStateMs += frameElapsedMs(captureStateStart);
+        const auto stateUpdateStart = std::chrono::steady_clock::now();
         m_lastTrackerFrameState = frameState;
         m_hasLastTrackerFrameState = true;
         if (conditioningFrame) {
@@ -731,20 +771,10 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         }
         ++m_segmentFrameIndex;
 
-        m_lastFrameTimings.frameIndex = frameIndex;
-        m_lastFrameTimings.conditioningFrame = conditioningFrame;
-        m_lastFrameTimings.encMs = encTimeMs;
-        m_lastFrameTimings.attnMs = attnTimeMs;
-        m_lastFrameTimings.decMs = decoderTimeMs;
-        m_lastFrameTimings.memMs = memoryEncoderTimeMs;
-        m_lastFrameTimings.totalMs = encTimeMs + std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - totalStart).count();
+        timings.stateUpdateMs += frameElapsedMs(stateUpdateStart);
+        timings.totalMs = encTimeMs + frameElapsedMs(totalStart);
+        m_lastFrameTimings = timings;
         m_hasLastFrameTimings = true;
-
-        std::cout << "[INFO] Frame times => Enc: " << encTimeMs
-                  << " ms, Attn: " << attnTimeMs
-                  << " ms, Dec: " << decoderTimeMs
-                  << " ms, MemEnc: " << memoryEncoderTimeMs << " ms\n";
         return mask;
     } catch (const std::exception& error) {
         std::cerr << "[ERROR] inferMultiFrame => " << error.what() << '\n';

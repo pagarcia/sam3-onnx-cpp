@@ -654,6 +654,9 @@ void printFrameDiagnostics(int frameIndex, const SAM3& sam)
                   << " timingsMs={enc:" << timings.encMs
                   << ",attn:" << timings.attnMs
                   << ",dec:" << timings.decMs
+                  << ",candidate:" << timings.candidateMs
+                  << ",capture:" << timings.captureStateMs
+                  << ",state:" << timings.stateUpdateMs
                   << ",mem:" << timings.memMs
                   << ",total:" << timings.totalMs << "}\n";
     }

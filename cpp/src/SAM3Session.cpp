@@ -1055,6 +1055,12 @@ void SAM3::resetMemory()
     m_memoryMaskFeatsScratch.clear();
     m_memoryMaskPosScratch.clear();
     m_memoryMaskTposScratch.clear();
+    m_lastFrameTimings = SAM3FrameTimings();
+    m_hasLastFrameTimings = false;
+    m_lastTrackerFrameState = TrackerFrameState();
+    m_hasLastTrackerFrameState = false;
+    m_lastTrackerMaskCandidates = SAM3MaskCandidates();
+    m_hasLastTrackerMaskCandidates = false;
 }
 
 bool SAM3::captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const

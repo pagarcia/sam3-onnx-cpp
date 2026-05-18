@@ -205,10 +205,23 @@ struct SAM3MemorySnapshot {
 struct SAM3FrameTimings {
     int frameIndex = -1;
     bool conditioningFrame = false;
+    bool denseMaskConditioning = false;
+    bool usedSelectionCallback = false;
+    int candidateCount = 0;
     double encMs = 0.0;
     double attnMs = 0.0;
     double decMs = 0.0;
+    double decoderMs = 0.0;
     double memMs = 0.0;
+    double maskPrepMs = 0.0;
+    double promptBuildMs = 0.0;
+    double noMemoryEmbedMs = 0.0;
+    double memoryBuildMs = 0.0;
+    double candidateMs = 0.0;
+    double selectionMs = 0.0;
+    double selectionLogitsMs = 0.0;
+    double captureStateMs = 0.0;
+    double stateUpdateMs = 0.0;
     double totalMs = 0.0;
 };
 
