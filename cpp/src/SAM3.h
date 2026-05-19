@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <string>
@@ -18,6 +19,8 @@
 #include <vector>
 
 #include "Image.h"
+
+namespace smseg_sam3 {
 
 inline size_t computeElementCount(const std::vector<int64_t>& shape)
 {
@@ -99,6 +102,30 @@ struct SAM3Prompts {
     SAM3MaskPromptStrategy maskPromptStrategy = SAM3MaskPromptStrategy::Box;
 };
 
+struct SAM3MaskCandidates {
+    Image<float> selectedMask;
+    std::vector<Image<float>> masks;
+    std::vector<float> scores;
+    int selectedIndex = -1;
+
+    bool hasCandidates() const { return !masks.empty(); }
+};
+
+struct SAM3MaskSelection {
+    int candidateIndex = -1;
+    Image<float> overrideMask;
+
+    bool hasOverrideMask() const
+    {
+        return overrideMask.getWidth() > 0
+            && overrideMask.getHeight() > 0
+            && overrideMask.getChannels() == 1;
+    }
+};
+
+using TrackerMaskSelectionCallback =
+    std::function<SAM3MaskSelection(const SAM3MaskCandidates&)>;
+
 struct PreparedSAM3MaskPrompt {
     std::vector<float> maskLogitsHighRes;
     std::vector<int64_t> maskLogitsShape;
@@ -151,24 +178,6 @@ struct CachedEncoderOutputs {
     CachedTensorData imageEmb2;
 };
 
-struct SAM3MaskCandidates {
-    Image<float> selectedMask;
-    std::vector<Image<float>> masks;
-    std::vector<float> scores;
-    int selectedIndex = -1;
-    CachedTensorData selectedMaskLogitsHighRes;
-    CachedTensorData multimaskLogitsHighRes;
-
-    bool hasCandidates() const { return !masks.empty(); }
-    bool hasSelectedLogits() const { return !selectedMaskLogitsHighRes.values.empty(); }
-    bool hasMultimaskLogits() const { return !multimaskLogitsHighRes.values.empty(); }
-};
-
-struct SAM3DiagnosticsOptions {
-    bool captureTrackerCandidates = false;
-    bool captureRawTrackerLogits = false;
-};
-
 struct SAM3Constants {
     std::vector<float> noMemEmbed;
     std::vector<int64_t> noMemEmbedShape;
@@ -199,6 +208,8 @@ struct SAM3MemorySnapshot {
     bool hasConditioningState = false;
     TrackerFrameState conditioningState;
     std::deque<TrackerFrameState> nonConditioningStates;
+    TrackerFrameState lastTrackerFrameState;
+    bool hasLastTrackerFrameState = false;
     int segmentFrameIndex = 0;
 };
 
@@ -208,81 +219,20 @@ struct SAM3FrameTimings {
     bool denseMaskConditioning = false;
     bool usedSelectionCallback = false;
     int candidateCount = 0;
+    double totalMs = 0.0;
     double encMs = 0.0;
-    double attnMs = 0.0;
-    double decMs = 0.0;
-    double decoderMs = 0.0;
-    double memMs = 0.0;
     double maskPrepMs = 0.0;
     double promptBuildMs = 0.0;
     double noMemoryEmbedMs = 0.0;
     double memoryBuildMs = 0.0;
+    double attnMs = 0.0;
+    double decoderMs = 0.0;
     double candidateMs = 0.0;
     double selectionMs = 0.0;
     double selectionLogitsMs = 0.0;
+    double memMs = 0.0;
     double captureStateMs = 0.0;
     double stateUpdateMs = 0.0;
-    double totalMs = 0.0;
-};
-
-struct SAM3RuntimeMetadata {
-    std::string mode;
-    std::string device;
-    std::string encoderPath;
-    std::string imageDecoderPath;
-    std::string trackerDecoderPath;
-    std::string memoryAttentionPath;
-    std::string memoryEncoderPath;
-    std::string constantsPath;
-    SAM3Size inputSize;
-    bool imageInitialized = false;
-    bool videoInitialized = false;
-    bool hasVideoConstants = false;
-    bool decoderHasIouScores = false;
-    bool decoderHasMultimasks = false;
-    int imageDecoderPredMasksIndex = -1;
-    int imageDecoderIouScoresIndex = -1;
-    int trackerDecoderObjPtrIndex = -1;
-    int trackerDecoderPredMaskHighResIndex = -1;
-    int trackerDecoderPredMultimasksHighResIndex = -1;
-    int trackerDecoderObjectScoreIndex = -1;
-    int trackerDecoderIouScoresIndex = -1;
-    int memoryAttentionFusedFeatIndex = -1;
-    int memoryEncoderFeaturesIndex = -1;
-    int memoryEncoderPosEncIndex = -1;
-    int staticNumMemFrames = 0;
-    int staticNumObjPtrs = 0;
-    int effectiveMaxMemFrames = 0;
-    int effectiveMaxObjPtrs = 0;
-    int maxCondFramesInAttn = 0;
-    bool keepFirstCondFrame = false;
-    int memoryTemporalStrideForEval = 0;
-    bool useMemorySelection = false;
-    float mfThreshold = 0.0f;
-    int exportMaxMemFrames = 0;
-    int exportMaxObjPtrs = 0;
-    size_t nonConditioningFramesKept = 0;
-    int segmentFrameIndex = 0;
-    std::vector<SAM3Node> encoderInputNodes;
-    std::vector<SAM3Node> encoderOutputNodes;
-    std::vector<SAM3Node> imageDecoderInputNodes;
-    std::vector<SAM3Node> imageDecoderOutputNodes;
-    std::vector<SAM3Node> trackerDecoderInputNodes;
-    std::vector<SAM3Node> trackerDecoderOutputNodes;
-    std::vector<SAM3Node> memoryAttentionInputNodes;
-    std::vector<SAM3Node> memoryAttentionOutputNodes;
-    std::vector<SAM3Node> memoryEncoderInputNodes;
-    std::vector<SAM3Node> memoryEncoderOutputNodes;
-    std::vector<std::string> encoderInputNames;
-    std::vector<std::string> encoderOutputNames;
-    std::vector<std::string> imageDecoderInputNames;
-    std::vector<std::string> imageDecoderOutputNames;
-    std::vector<std::string> trackerDecoderInputNames;
-    std::vector<std::string> trackerDecoderOutputNames;
-    std::vector<std::string> memoryAttentionInputNames;
-    std::vector<std::string> memoryAttentionOutputNames;
-    std::vector<std::string> memoryEncoderInputNames;
-    std::vector<std::string> memoryEncoderOutputNames;
 };
 
 class SAM3 {
@@ -304,45 +254,27 @@ public:
                          const std::string& device = "cpu");
 
     bool preprocessImage(const Image<float>& originalImage);
-    bool preprocessImageTensor(const float* encoderInputData, size_t elementCount);
-    bool preprocessImageTensor(const std::vector<float>& encoderInputData);
     bool captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const;
     bool restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs);
 
     Image<float> inferSingleFrame(const SAM3Size& originalImageSize,
                                   const SAM3Prompts& prompts);
-    Image<float> inferSingleFrameTensor(const float* encoderInputData,
-                                        size_t elementCount,
-                                        const SAM3Size& originalImageSize,
-                                        const SAM3Prompts& prompts);
-    Image<float> inferSingleFrameTensor(const std::vector<float>& encoderInputData,
-                                        const SAM3Size& originalImageSize,
-                                        const SAM3Prompts& prompts);
     Image<float> previewConditioningFrame(const SAM3Size& originalImageSize,
                                           const SAM3Prompts& prompts);
     SAM3MaskCandidates previewConditioningFrameCandidates(const SAM3Size& originalImageSize,
                                                           const SAM3Prompts& prompts);
     Image<float> inferMultiFrame(const Image<float>& originalImage,
                                  const SAM3Prompts& prompts);
-    Image<float> inferMultiFrameTensor(const float* encoderInputData,
-                                       size_t elementCount,
-                                       const SAM3Size& originalImageSize,
-                                       const SAM3Prompts& prompts);
-    Image<float> inferMultiFrameTensor(const std::vector<float>& encoderInputData,
-                                       const SAM3Size& originalImageSize,
-                                       const SAM3Prompts& prompts);
     Image<float> inferMultiFrameCached(const SAM3Size& originalImageSize,
                                        const SAM3Prompts& prompts);
 
-    void setDiagnosticsOptions(const SAM3DiagnosticsOptions& options);
-    SAM3DiagnosticsOptions diagnosticsOptions() const;
-    bool runtimeMetadata(SAM3RuntimeMetadata* metadataOut) const;
+    void setTrackerMaskSelectionCallback(TrackerMaskSelectionCallback callback);
     bool lastFrameTimings(SAM3FrameTimings* timingsOut) const;
     bool lastTrackerFrameState(TrackerFrameState* stateOut) const;
     bool lastTrackerMaskCandidates(SAM3MaskCandidates* candidatesOut) const;
-    void resetMemory();
     bool captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const;
     void restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot);
+    void resetMemory();
     SAM3Size getInputSize() const;
     bool modelExists(const std::string& modelPath) const;
 
@@ -402,8 +334,7 @@ private:
                            const SAM3Size& originalImageSize,
                            PreparedSAM3MaskPrompt* preparedOut) const;
     SAM3MaskCandidates collectTrackerMaskCandidates(const std::vector<Ort::Value>& decoderOutputs,
-                                                    const SAM3Size& originalImageSize,
-                                                    bool includeRawLogits) const;
+                                                    const SAM3Size& originalImageSize) const;
 
     Image<float> inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& encoderOutputs,
                                                    const SAM3Size& originalImageSize,
@@ -476,14 +407,14 @@ private:
     bool m_hasConditioningState = false;
     TrackerFrameState m_conditioningState;
     std::deque<TrackerFrameState> m_nonConditioningStates;
-    int m_segmentFrameIndex = 0;
-    SAM3DiagnosticsOptions m_diagnosticsOptions;
-    SAM3FrameTimings m_lastFrameTimings;
-    bool m_hasLastFrameTimings = false;
     TrackerFrameState m_lastTrackerFrameState;
     bool m_hasLastTrackerFrameState = false;
     SAM3MaskCandidates m_lastTrackerMaskCandidates;
     bool m_hasLastTrackerMaskCandidates = false;
+    SAM3FrameTimings m_lastFrameTimings;
+    bool m_hasLastFrameTimings = false;
+    TrackerMaskSelectionCallback m_trackerMaskSelectionCallback;
+    int m_segmentFrameIndex = 0;
 
     std::vector<float> m_noMemoryImageEmbedScratch;
     std::vector<float> m_memoryObjPtrsScratch;
@@ -492,20 +423,16 @@ private:
     std::vector<float> m_memoryMaskPosScratch;
     std::vector<int64_t> m_memoryMaskTposScratch;
 
-    Ort::Env m_encoderEnv{ORT_LOGGING_LEVEL_WARNING, "sam3_encoder"};
-    Ort::Env m_imageDecoderEnv{ORT_LOGGING_LEVEL_WARNING, "sam3_image_decoder"};
-    Ort::Env m_trackerDecoderEnv{ORT_LOGGING_LEVEL_WARNING, "sam3_tracker_decoder"};
-    Ort::Env m_memoryAttentionEnv{ORT_LOGGING_LEVEL_WARNING, "sam3_memory_attention"};
-    Ort::Env m_memoryEncoderEnv{ORT_LOGGING_LEVEL_WARNING, "sam3_memory_encoder"};
+    Ort::Env m_encoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_encoder"};
+    Ort::Env m_imageDecoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_image_decoder"};
+    Ort::Env m_trackerDecoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_tracker_decoder"};
+    Ort::Env m_memoryAttentionEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_memory_attention"};
+    Ort::Env m_memoryEncoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_memory_encoder"};
 
     Ort::MemoryInfo m_memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::string m_device = "cpu";
-    std::string m_encoderPath;
-    std::string m_imageDecoderPath;
-    std::string m_trackerDecoderPath;
-    std::string m_memoryAttentionPath;
-    std::string m_memoryEncoderPath;
-    std::string m_constantsPath;
 };
+
+} // namespace smseg_sam3
 
 #endif // SAM3CPP__SAM3_H_

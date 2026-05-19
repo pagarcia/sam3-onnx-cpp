@@ -3,13 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iostream>
-#include <iterator>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
-
-#include "CVHelpers.h"
 
 namespace {
 
@@ -24,19 +25,108 @@ double frameElapsedMs(std::chrono::steady_clock::time_point start)
         std::chrono::steady_clock::now() - start).count();
 }
 
-int bestScoreIndex(const std::vector<float>& scores, size_t candidateCount)
+double trackerStateObjectProbability(const smseg_sam3::TrackerFrameState& state)
 {
-    if (candidateCount == 0) {
-        return -1;
+    return 1.0 / (1.0 + std::exp(-double(state.objectScoreLogit)));
+}
+
+double trackerStateMemoryQuality(const smseg_sam3::TrackerFrameState& state)
+{
+    const double objectProb = trackerStateObjectProbability(state);
+    const double effIou =
+        state.hasEffIouScore
+            ? std::clamp((double(state.effIouScore) + 1.0) * 0.5, 0.0, 1.0)
+            : objectProb;
+    return 0.65 * objectProb + 0.35 * effIou;
+}
+
+std::vector<std::size_t> selectMemoryStateIndices(
+    const std::deque<smseg_sam3::TrackerFrameState>& states,
+    std::size_t limit,
+    int currentFrameIndex)
+{
+    std::vector<std::size_t> selected;
+    if (states.empty() || limit == 0) {
+        return selected;
     }
-    const size_t scoreCount = std::min(scores.size(), candidateCount);
-    if (scoreCount == 0) {
-        return 0;
+
+    selected.reserve(std::min(limit, states.size()));
+    if (states.size() <= limit) {
+        for (std::size_t i = states.size(); i > 0; --i) {
+            selected.push_back(i - 1u);
+        }
+        return selected;
     }
-    return static_cast<int>(
-        std::distance(
-            scores.begin(),
-            std::max_element(scores.begin(), scores.begin() + scoreCount)));
+
+    std::vector<std::uint8_t> used(states.size(), std::uint8_t(0));
+    const std::size_t recentKeep =
+        std::min<std::size_t>(std::min<std::size_t>(2u, limit), states.size());
+    for (std::size_t k = 0; k < recentKeep; ++k) {
+        const std::size_t idx = states.size() - 1u - k;
+        selected.push_back(idx);
+        used[idx] = std::uint8_t(1);
+    }
+
+    while (selected.size() < limit && selected.size() < states.size()) {
+        double bestScore = -1.0e30;
+        std::size_t bestIndex = states.size();
+        for (std::size_t i = 0; i < states.size(); ++i) {
+            if (used[i]) {
+                continue;
+            }
+
+            const smseg_sam3::TrackerFrameState& state = states[i];
+            int minFrameDistance = std::numeric_limits<int>::max();
+            for (const std::size_t selectedIndex : selected) {
+                minFrameDistance =
+                    std::min(minFrameDistance,
+                             std::abs(state.frameIndex - states[selectedIndex].frameIndex));
+            }
+            if (minFrameDistance == std::numeric_limits<int>::max()) {
+                minFrameDistance = 0;
+            }
+
+            const int age = std::max(0, currentFrameIndex - state.frameIndex);
+            const double quality = trackerStateMemoryQuality(state);
+            const double diversityBonus =
+                0.020 * double(std::min(minFrameDistance, 12));
+            const double longMemoryBonus =
+                0.006 * double(std::min(age, 24));
+            const double score = quality + diversityBonus + longMemoryBonus;
+            if (score > bestScore) {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+
+        if (bestIndex >= states.size()) {
+            break;
+        }
+        selected.push_back(bestIndex);
+        used[bestIndex] = std::uint8_t(1);
+    }
+
+    return selected;
+}
+
+Image<float> resizeAndThresholdMask(const float* maskData,
+                                    int maskWidth,
+                                    int maskHeight,
+                                    int targetWidth,
+                                    int targetHeight,
+                                    float threshold)
+{
+    if (!maskData || maskWidth <= 0 || maskHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+        return Image<float>();
+    }
+
+    Image<float> lowRes(maskWidth, maskHeight, 1);
+    std::copy(maskData, maskData + static_cast<std::size_t>(maskWidth) * maskHeight, lowRes.getData().begin());
+    Image<float> resized = lowRes.resize(targetWidth, targetHeight);
+    for (float& value : resized.getData()) {
+        value = value > threshold ? 1.0f : 0.0f;
+    }
+    return resized;
 }
 
 std::vector<Image<float>> resizeAndThresholdMaskPlanes(const Ort::Value& tensor,
@@ -55,43 +145,176 @@ std::vector<Image<float>> resizeAndThresholdMaskPlanes(const Ort::Value& tensor,
         return {};
     }
 
-    size_t planes = 1;
-    for (size_t i = 0; i + 2 < shape.size(); ++i) {
+    std::size_t planes = 1;
+    for (std::size_t i = 0; i + 2 < shape.size(); ++i) {
         if (shape[i] <= 0) {
             return {};
         }
-        planes *= static_cast<size_t>(shape[i]);
+        planes *= static_cast<std::size_t>(shape[i]);
     }
 
     const int maskWidth = static_cast<int>(maskWidth64);
     const int maskHeight = static_cast<int>(maskHeight64);
-    const size_t planeSize = static_cast<size_t>(maskWidth) * static_cast<size_t>(maskHeight);
-    const float* values = tensor.GetTensorData<float>();
-    if (!values) {
+    const std::size_t planeSize =
+        static_cast<std::size_t>(maskWidth) * static_cast<std::size_t>(maskHeight);
+    const float* maskData = tensor.GetTensorData<float>();
+    if (!maskData || planeSize == 0 || planes == 0) {
         return {};
     }
 
-    std::vector<Image<float>> out;
-    out.reserve(planes);
-    for (size_t plane = 0; plane < planes; ++plane) {
-        try {
-            out.push_back(
-                CVHelpers::resizeAndThresholdMask(
-                    values + plane * planeSize,
-                    maskWidth,
-                    maskHeight,
-                    targetWidth,
-                    targetHeight,
-                    threshold));
-        } catch (...) {
-            out.clear();
-            return out;
+    std::vector<Image<float>> masks;
+    masks.reserve(planes);
+    for (std::size_t i = 0; i < planes; ++i) {
+        masks.push_back(resizeAndThresholdMask(
+            maskData + i * planeSize,
+            maskWidth,
+            maskHeight,
+            targetWidth,
+            targetHeight,
+            threshold));
+    }
+    return masks;
+}
+
+std::vector<float> tensorFloatValues(const Ort::Value& tensor)
+{
+    const auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
+    std::size_t count = 1;
+    for (const int64_t dim : shape) {
+        if (dim <= 0) {
+            return {};
         }
+        count *= static_cast<std::size_t>(dim);
+    }
+
+    const float* values = tensor.GetTensorData<float>();
+    if (!values || count == 0) {
+        return {};
+    }
+    return std::vector<float>(values, values + count);
+}
+
+int bestScoreIndex(const std::vector<float>& scores, std::size_t maskCount)
+{
+    const std::size_t count = std::min(scores.size(), maskCount);
+    if (count == 0) {
+        return -1;
+    }
+
+    int best = 0;
+    for (std::size_t i = 1; i < count; ++i) {
+        if (scores[i] > scores[static_cast<std::size_t>(best)]) {
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+bool copyMaskPlaneTensor(const Ort::Value& tensor,
+                         int planeIndex,
+                         std::vector<float>* logitsOut,
+                         std::vector<int64_t>* shapeOut)
+{
+    if (!logitsOut || !shapeOut || planeIndex < 0) {
+        return false;
+    }
+    logitsOut->clear();
+    shapeOut->clear();
+
+    const auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
+    if (shape.size() < 3) {
+        return false;
+    }
+
+    const int64_t maskHeight64 = shape[shape.size() - 2];
+    const int64_t maskWidth64 = shape[shape.size() - 1];
+    if (maskWidth64 <= 0 || maskHeight64 <= 0) {
+        return false;
+    }
+
+    std::size_t planes = 1;
+    for (std::size_t i = 0; i + 2 < shape.size(); ++i) {
+        if (shape[i] <= 0) {
+            return false;
+        }
+        planes *= static_cast<std::size_t>(shape[i]);
+    }
+    if (static_cast<std::size_t>(planeIndex) >= planes) {
+        return false;
+    }
+
+    const std::size_t planeSize =
+        static_cast<std::size_t>(maskWidth64) * static_cast<std::size_t>(maskHeight64);
+    const float* tensorData = tensor.GetTensorData<float>();
+    if (!tensorData || planeSize == 0) {
+        return false;
+    }
+
+    const float* plane = tensorData + static_cast<std::size_t>(planeIndex) * planeSize;
+    logitsOut->assign(plane, plane + planeSize);
+    *shapeOut = {
+        1,
+        1,
+        maskHeight64,
+        maskWidth64,
+    };
+    return true;
+}
+
+bool maskToBinaryHighResLogits(const Image<float>& mask,
+                               const smseg_sam3::SAM3Size& inputSize,
+                               std::vector<float>* logitsOut,
+                               std::vector<int64_t>* shapeOut)
+{
+    if (!logitsOut || !shapeOut
+        || mask.getWidth() <= 0 || mask.getHeight() <= 0
+        || inputSize.width <= 0 || inputSize.height <= 0) {
+        return false;
+    }
+
+    Image<float> resized =
+        (mask.getWidth() == inputSize.width && mask.getHeight() == inputSize.height)
+            ? mask
+            : mask.resize(inputSize.width, inputSize.height);
+    logitsOut->assign(
+        static_cast<std::size_t>(inputSize.width) * static_cast<std::size_t>(inputSize.height),
+        -20.0f);
+    const auto& data = resized.getData();
+    const std::size_t n = std::min(logitsOut->size(), data.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        if (data[i] > 0.5f) {
+            (*logitsOut)[i] = 20.0f;
+        }
+    }
+    *shapeOut = {
+        1,
+        1,
+        static_cast<int64_t>(inputSize.height),
+        static_cast<int64_t>(inputSize.width),
+    };
+    return true;
+}
+
+Image<float> normalizeBinaryMaskToSize(const Image<float>& mask,
+                                       const smseg_sam3::SAM3Size& size)
+{
+    if (mask.getWidth() <= 0 || mask.getHeight() <= 0
+        || size.width <= 0 || size.height <= 0) {
+        return Image<float>();
+    }
+    Image<float> out =
+        (mask.getWidth() == size.width && mask.getHeight() == size.height)
+            ? mask
+            : mask.resize(size.width, size.height);
+    for (float& value : out.getData()) {
+        value = value > 0.5f ? 1.0f : 0.0f;
     }
     return out;
 }
 
 } // namespace
+
+namespace smseg_sam3 {
 
 void SAM3::buildTrackerPromptInputs(const SAM3Prompts& prompts,
                                     const SAM3Size& originalImageSize,
@@ -141,7 +364,7 @@ Image<float> SAM3::createTrackerMaskFromHighRes(const Ort::Value& predMaskHighRe
     }
 
     const float* maskData = predMaskHighRes.GetTensorData<float>();
-    return CVHelpers::resizeAndThresholdMask(
+    return resizeAndThresholdMask(
         maskData,
         static_cast<int>(shape[3]),
         static_cast<int>(shape[2]),
@@ -152,63 +375,32 @@ Image<float> SAM3::createTrackerMaskFromHighRes(const Ort::Value& predMaskHighRe
 
 SAM3MaskCandidates SAM3::collectTrackerMaskCandidates(
     const std::vector<Ort::Value>& decoderOutputs,
-    const SAM3Size& originalImageSize,
-    bool includeRawLogits) const
+    const SAM3Size& originalImageSize) const
 {
     SAM3MaskCandidates result;
-
-    if (m_trackerDecoderPredMaskHighResIndex >= 0
-        && decoderOutputs.size() > static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)) {
-        const Ort::Value& selectedTensor =
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)];
-        result.selectedMask = createTrackerMaskFromHighRes(selectedTensor, originalImageSize);
-        if (includeRawLogits) {
-            extractTensorData(
-                selectedTensor,
-                result.selectedMaskLogitsHighRes.values,
-                result.selectedMaskLogitsHighRes.shape);
-        }
+    if (m_trackerDecoderPredMaskHighResIndex < 0
+        || decoderOutputs.size() <= static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)) {
+        return result;
     }
+
+    result.selectedMask = createTrackerMaskFromHighRes(
+        decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)],
+        originalImageSize);
 
     if (m_trackerDecoderPredMultimasksHighResIndex >= 0
         && decoderOutputs.size() > static_cast<size_t>(m_trackerDecoderPredMultimasksHighResIndex)) {
-        const Ort::Value& multimaskTensor =
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMultimasksHighResIndex)];
-        result.masks =
-            resizeAndThresholdMaskPlanes(
-                multimaskTensor,
-                originalImageSize.width,
-                originalImageSize.height,
-                0.0f);
-        if (includeRawLogits) {
-            extractTensorData(
-                multimaskTensor,
-                result.multimaskLogitsHighRes.values,
-                result.multimaskLogitsHighRes.shape);
-        }
+        result.masks = resizeAndThresholdMaskPlanes(
+            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMultimasksHighResIndex)],
+            originalImageSize.width,
+            originalImageSize.height,
+            0.0f);
     }
-
     if (m_trackerDecoderIouScoresIndex >= 0
         && decoderOutputs.size() > static_cast<size_t>(m_trackerDecoderIouScoresIndex)) {
-        std::vector<int64_t> scratchShape;
-        extractTensorData(
-            decoderOutputs[static_cast<size_t>(m_trackerDecoderIouScoresIndex)],
-            result.scores,
-            scratchShape);
-    }
-
-    if (result.masks.empty()
-        && result.selectedMask.getWidth() > 0
-        && result.selectedMask.getHeight() > 0) {
-        result.masks.push_back(result.selectedMask);
+        result.scores = tensorFloatValues(
+            decoderOutputs[static_cast<size_t>(m_trackerDecoderIouScoresIndex)]);
     }
     result.selectedIndex = bestScoreIndex(result.scores, result.masks.size());
-    if (result.selectedMask.getWidth() <= 0
-        && result.selectedIndex >= 0
-        && static_cast<size_t>(result.selectedIndex) < result.masks.size()) {
-        result.selectedMask = result.masks[static_cast<size_t>(result.selectedIndex)];
-    }
-
     return result;
 }
 
@@ -301,22 +493,37 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
         ++memoryRow;
     }
 
+    const std::size_t nonConditioningMemorySlots =
+        memoryRow < memorySlotCount ? memorySlotCount - memoryRow : 0u;
+    const std::vector<std::size_t> memoryIndices =
+        selectMemoryStateIndices(m_nonConditioningStates,
+                                 nonConditioningMemorySlots,
+                                 frameIndex);
     int relativeMemoryIndex = 0;
-    for (auto it = m_nonConditioningStates.rbegin();
-         it != m_nonConditioningStates.rend() && memoryRow < memorySlotCount;
-         ++it, ++relativeMemoryIndex) {
-        const size_t copyCount = safeMinCount(featurePlaneSize, it->maskmemFeatures.size());
-        const size_t posCopyCount = safeMinCount(featurePlaneSize, it->maskmemPosEnc.size());
+    for (const std::size_t stateIndex : memoryIndices) {
+        if (stateIndex >= m_nonConditioningStates.size() || memoryRow >= memorySlotCount) {
+            continue;
+        }
+        const TrackerFrameState& state = m_nonConditioningStates[stateIndex];
+        const size_t copyCount = safeMinCount(featurePlaneSize, state.maskmemFeatures.size());
+        const size_t posCopyCount = safeMinCount(featurePlaneSize, state.maskmemPosEnc.size());
         std::copy_n(
-            it->maskmemFeatures.begin(),
+            state.maskmemFeatures.begin(),
             copyCount,
             m_memoryMaskFeatsScratch.begin() + static_cast<ptrdiff_t>(memoryRow * featurePlaneSize));
         std::copy_n(
-            it->maskmemPosEnc.begin(),
+            state.maskmemPosEnc.begin(),
             posCopyCount,
             m_memoryMaskPosScratch.begin() + static_cast<ptrdiff_t>(memoryRow * featurePlaneSize));
-        m_memoryMaskTposScratch[memoryRow] = relativeMemoryIndex;
+        const int temporalAge =
+            std::max(0, frameIndex - state.frameIndex - 1);
+        m_memoryMaskTposScratch[memoryRow] =
+            std::clamp(temporalAge,
+                       relativeMemoryIndex,
+                       std::max(relativeMemoryIndex,
+                                std::max(0, m_constants.numMaskmem - 2)));
         ++memoryRow;
+        ++relativeMemoryIndex;
     }
 
     size_t objRow = 0;
@@ -331,17 +538,28 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
         ++objRow;
     }
 
+    const std::size_t nonConditioningObjSlots =
+        objRow < objSlotCount ? objSlotCount - objRow : 0u;
+    const std::vector<std::size_t> objIndices =
+        selectMemoryStateIndices(m_nonConditioningStates,
+                                 nonConditioningObjSlots,
+                                 frameIndex);
     int relativePointerIndex = 1;
-    for (auto it = m_nonConditioningStates.rbegin();
-         it != m_nonConditioningStates.rend() && objRow < objSlotCount;
-         ++it, ++relativePointerIndex) {
-        const size_t copyCount = safeMinCount(objPtrSize, it->objPtr.size());
+    for (const std::size_t stateIndex : objIndices) {
+        if (stateIndex >= m_nonConditioningStates.size() || objRow >= objSlotCount) {
+            continue;
+        }
+        const TrackerFrameState& state = m_nonConditioningStates[stateIndex];
+        const size_t copyCount = safeMinCount(objPtrSize, state.objPtr.size());
         std::copy_n(
-            it->objPtr.begin(),
+            state.objPtr.begin(),
             copyCount,
             m_memoryObjPtrsScratch.begin() + static_cast<ptrdiff_t>(objRow * objPtrSize));
-        m_memoryObjTposScratch[objRow] = static_cast<float>(relativePointerIndex);
+        const int temporalAge =
+            std::max(relativePointerIndex, frameIndex - state.frameIndex);
+        m_memoryObjTposScratch[objRow] = static_cast<float>(temporalAge);
         ++objRow;
+        ++relativePointerIndex;
     }
 }
 
@@ -354,18 +572,19 @@ Image<float> SAM3::previewConditioningFrame(const SAM3Size& originalImageSize,
 SAM3MaskCandidates SAM3::previewConditioningFrameCandidates(const SAM3Size& originalImageSize,
                                                             const SAM3Prompts& prompts)
 {
+    SAM3MaskCandidates result;
+
     if (!m_trackerDecoderSession || !m_hasVideoConstants) {
         std::cerr << "[ERROR] previewConditioningFrame => tracker sessions are not initialized.\n";
-        return SAM3MaskCandidates();
+        return result;
     }
 
     const int requiredMaxIndex = std::max({m_encoderImageEmb0Index, m_encoderImageEmb1Index, m_encoderImageEmb2Index});
     if (requiredMaxIndex < 0 || m_cachedEncoderOutputs.size() <= static_cast<size_t>(requiredMaxIndex)) {
         std::cerr << "[ERROR] previewConditioningFrame => encoder outputs are not cached.\n";
-        return SAM3MaskCandidates();
+        return result;
     }
 
-    SAM3MaskCandidates result;
     if (promptsEmpty(prompts)) {
         result.selectedMask = Image<float>(originalImageSize.width, originalImageSize.height, 1);
         return result;
@@ -375,10 +594,6 @@ SAM3MaskCandidates SAM3::previewConditioningFrameCandidates(const SAM3Size& orig
         PreparedSAM3MaskPrompt preparedMask;
         if (prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
             result.selectedMask = preparedMask.originalMask;
-            if (m_diagnosticsOptions.captureRawTrackerLogits) {
-                result.selectedMaskLogitsHighRes.values = preparedMask.maskLogitsHighRes;
-                result.selectedMaskLogitsHighRes.shape = preparedMask.maskLogitsShape;
-            }
             return result;
         }
         result.selectedMask = Image<float>(originalImageSize.width, originalImageSize.height, 1);
@@ -426,21 +641,19 @@ SAM3MaskCandidates SAM3::previewConditioningFrameCandidates(const SAM3Size& orig
             "trackerPreview");
         if (sessionResult.index() == 1) {
             std::cerr << std::get<std::string>(sessionResult) << '\n';
-            return SAM3MaskCandidates();
+            return SAM3MaskCandidates{};
         }
 
         auto outputs = std::move(std::get<0>(sessionResult));
         if (outputs.size() <= static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)) {
             std::cerr << "[ERROR] previewConditioningFrame => decoder did not return pred_mask_high_res.\n";
-            return SAM3MaskCandidates();
+            return SAM3MaskCandidates{};
         }
-        return collectTrackerMaskCandidates(
-            outputs,
-            originalImageSize,
-            m_diagnosticsOptions.captureRawTrackerLogits);
+        result = collectTrackerMaskCandidates(outputs, originalImageSize);
+        return result;
     } catch (const std::exception& error) {
         std::cerr << "[ERROR] previewConditioningFrame => " << error.what() << '\n';
-        return SAM3MaskCandidates();
+        return SAM3MaskCandidates{};
     }
 }
 
@@ -457,31 +670,6 @@ Image<float> SAM3::inferMultiFrame(const Image<float>& originalImage,
     return inferMultiFrameWithEncoderOutputs(m_cachedEncoderOutputs, originalSize, prompts, encTimeMs);
 }
 
-Image<float> SAM3::inferMultiFrameTensor(const float* encoderInputData,
-                                         size_t elementCount,
-                                         const SAM3Size& originalImageSize,
-                                         const SAM3Prompts& prompts)
-{
-    const auto start = std::chrono::steady_clock::now();
-    if (!preprocessImageTensor(encoderInputData, elementCount)) {
-        return Image<float>();
-    }
-    const double encTimeMs = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - start).count();
-    return inferMultiFrameWithEncoderOutputs(m_cachedEncoderOutputs, originalImageSize, prompts, encTimeMs);
-}
-
-Image<float> SAM3::inferMultiFrameTensor(const std::vector<float>& encoderInputData,
-                                         const SAM3Size& originalImageSize,
-                                         const SAM3Prompts& prompts)
-{
-    return inferMultiFrameTensor(
-        encoderInputData.data(),
-        encoderInputData.size(),
-        originalImageSize,
-        prompts);
-}
-
 Image<float> SAM3::inferMultiFrameCached(const SAM3Size& originalImageSize,
                                          const SAM3Prompts& prompts)
 {
@@ -490,6 +678,29 @@ Image<float> SAM3::inferMultiFrameCached(const SAM3Size& originalImageSize,
         return Image<float>();
     }
     return inferMultiFrameWithEncoderOutputs(m_cachedEncoderOutputs, originalImageSize, prompts, 0.0);
+}
+
+bool SAM3::lastTrackerFrameState(TrackerFrameState* stateOut) const
+{
+    if (!stateOut || !m_hasLastTrackerFrameState) {
+        return false;
+    }
+    *stateOut = m_lastTrackerFrameState;
+    return true;
+}
+
+void SAM3::setTrackerMaskSelectionCallback(TrackerMaskSelectionCallback callback)
+{
+    m_trackerMaskSelectionCallback = std::move(callback);
+}
+
+bool SAM3::lastTrackerMaskCandidates(SAM3MaskCandidates* candidatesOut) const
+{
+    if (!candidatesOut || !m_hasLastTrackerMaskCandidates) {
+        return false;
+    }
+    *candidatesOut = m_lastTrackerMaskCandidates;
+    return true;
 }
 
 Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& encoderOutputs,
@@ -501,12 +712,12 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
     SAM3FrameTimings timings;
     timings.frameIndex = m_segmentFrameIndex;
     timings.encMs = encTimeMs;
-    m_lastFrameTimings = SAM3FrameTimings();
-    m_hasLastFrameTimings = false;
-    m_lastTrackerFrameState = TrackerFrameState();
+
     m_hasLastTrackerFrameState = false;
     m_lastTrackerMaskCandidates = SAM3MaskCandidates();
     m_hasLastTrackerMaskCandidates = false;
+    m_lastFrameTimings = SAM3FrameTimings();
+    m_hasLastFrameTimings = false;
 
     if (!m_trackerDecoderSession || !m_memoryAttentionSession || !m_memoryEncoderSession || !m_hasVideoConstants) {
         std::cerr << "[ERROR] inferMultiFrame => tracker sessions are not initialized.\n";
@@ -525,7 +736,6 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         std::cerr << "[WARN] inferMultiFrame => first tracker frame requires prompts.\n";
         return Image<float>(originalImageSize.width, originalImageSize.height, 1);
     }
-    const int frameIndex = m_segmentFrameIndex;
 
     try {
         const bool denseMaskConditioning = conditioningFrame && hasMaskPrompt(prompts);
@@ -552,6 +762,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         bool isMaskFromPoints = conditioningFrame;
         std::vector<float> pointCoordsStorage;
         std::vector<int32_t> pointLabelsStorage;
+        const std::vector<float>* imageEmbedStorage = nullptr;
         std::vector<Ort::Value> memoryAttentionOutputs;
 
         if (conditioningFrame) {
@@ -568,15 +779,14 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             }
 
             const auto embedStart = std::chrono::steady_clock::now();
-            const std::vector<float>& imageEmbed = buildNoMemoryImageEmbedding(
-                currentVisionFeat,
-                currentVisionShape);
+            imageEmbedStorage =
+                &buildNoMemoryImageEmbedding(currentVisionFeat, currentVisionShape);
             timings.noMemoryEmbedMs += frameElapsedMs(embedStart);
             const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabelsStorage.size()), 2};
             const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabelsStorage.size())};
             decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, pointCoordsShape));
             decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, pointLabelsShape));
-            decoderInputs.push_back(createTensor<float>(m_memoryInfo, imageEmbed, currentVisionShape));
+            decoderInputs.push_back(createTensor<float>(m_memoryInfo, *imageEmbedStorage, currentVisionShape));
         } else {
             const auto memoryBuildStart = std::chrono::steady_clock::now();
             buildMemoryInputBuffers(m_segmentFrameIndex);
@@ -663,7 +873,6 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             conditioningFrame ? "trackerConditioningDecoder" : "trackerPropagationDecoder");
         const double decoderTimeMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - decoderStart).count();
-        timings.decMs = decoderTimeMs;
         timings.decoderMs = decoderTimeMs;
         if (decoderResult.index() == 1) {
             std::cerr << std::get<std::string>(decoderResult) << '\n';
@@ -675,17 +884,59 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             std::cerr << "[ERROR] inferMultiFrame => tracker decoder returned insufficient outputs.\n";
             return Image<float>();
         }
-        SAM3MaskCandidates trackerMaskCandidates;
-        if (m_diagnosticsOptions.captureTrackerCandidates) {
-            const auto candidateStart = std::chrono::steady_clock::now();
-            trackerMaskCandidates =
-                collectTrackerMaskCandidates(
-                    decoderOutputs,
-                    originalImageSize,
-                    m_diagnosticsOptions.captureRawTrackerLogits);
-            timings.candidateMs += frameElapsedMs(candidateStart);
-            timings.candidateCount =
-                static_cast<int>(trackerMaskCandidates.masks.size());
+        const auto candidateStart = std::chrono::steady_clock::now();
+        SAM3MaskCandidates trackerMaskCandidates =
+            collectTrackerMaskCandidates(decoderOutputs, originalImageSize);
+        timings.candidateMs += frameElapsedMs(candidateStart);
+        timings.candidateCount =
+            static_cast<int>(trackerMaskCandidates.masks.size());
+        Image<float> selectedTrackerMask = trackerMaskCandidates.selectedMask;
+        int selectedTrackerMaskIndex = trackerMaskCandidates.selectedIndex;
+        std::vector<float> selectedTrackerMaskLogitsHighRes;
+        std::vector<int64_t> selectedTrackerMaskLogitsShape;
+        if (!denseMaskConditioning
+            && trackerMaskCandidates.hasCandidates()
+            && m_trackerMaskSelectionCallback) {
+            timings.usedSelectionCallback = true;
+            const auto selectionStart = std::chrono::steady_clock::now();
+            const SAM3MaskSelection selection =
+                m_trackerMaskSelectionCallback(trackerMaskCandidates);
+            timings.selectionMs += frameElapsedMs(selectionStart);
+            if (selection.hasOverrideMask()) {
+                selectedTrackerMask =
+                    normalizeBinaryMaskToSize(selection.overrideMask, originalImageSize);
+                selectedTrackerMaskIndex = selection.candidateIndex;
+                const auto logitsStart = std::chrono::steady_clock::now();
+                (void)maskToBinaryHighResLogits(
+                    selectedTrackerMask,
+                    getInputSize(),
+                    &selectedTrackerMaskLogitsHighRes,
+                    &selectedTrackerMaskLogitsShape);
+                timings.selectionLogitsMs += frameElapsedMs(logitsStart);
+            } else if (selection.candidateIndex >= 0
+                       && static_cast<std::size_t>(selection.candidateIndex)
+                              < trackerMaskCandidates.masks.size()) {
+                selectedTrackerMaskIndex = selection.candidateIndex;
+                selectedTrackerMask =
+                    trackerMaskCandidates.masks[static_cast<std::size_t>(selection.candidateIndex)];
+                const auto logitsStart = std::chrono::steady_clock::now();
+                if (m_trackerDecoderPredMultimasksHighResIndex < 0
+                    || decoderOutputs.size()
+                           <= static_cast<std::size_t>(m_trackerDecoderPredMultimasksHighResIndex)
+                    || !copyMaskPlaneTensor(
+                           decoderOutputs[static_cast<std::size_t>(
+                               m_trackerDecoderPredMultimasksHighResIndex)],
+                           selection.candidateIndex,
+                           &selectedTrackerMaskLogitsHighRes,
+                           &selectedTrackerMaskLogitsShape)) {
+                    (void)maskToBinaryHighResLogits(
+                        selectedTrackerMask,
+                        getInputSize(),
+                        &selectedTrackerMaskLogitsHighRes,
+                        &selectedTrackerMaskLogitsShape);
+                }
+                timings.selectionLogitsMs += frameElapsedMs(logitsStart);
+            }
         }
 
         const auto memoryEncoderStart = std::chrono::steady_clock::now();
@@ -695,6 +946,12 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 m_memoryInfo,
                 preparedMask.maskLogitsHighRes,
                 preparedMask.maskLogitsShape));
+        } else if (!selectedTrackerMaskLogitsHighRes.empty()
+                   && !selectedTrackerMaskLogitsShape.empty()) {
+            memoryEncoderInputs.push_back(createTensor<float>(
+                m_memoryInfo,
+                selectedTrackerMaskLogitsHighRes,
+                selectedTrackerMaskLogitsShape));
         } else {
             memoryEncoderInputs.push_back(createTensorView<float>(
                 m_memoryInfo,
@@ -743,7 +1000,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         TrackerFrameState frameState = captureTrackerState(
             decoderOutputs,
             memoryEncoderOutputs,
-            frameIndex);
+            m_segmentFrameIndex);
         timings.captureStateMs += frameElapsedMs(captureStateStart);
         const auto stateUpdateStart = std::chrono::steady_clock::now();
         m_lastTrackerFrameState = frameState;
@@ -756,21 +1013,14 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             appendNonConditioningState(frameState);
         }
 
-        const Image<float> mask = denseMaskConditioning
+        Image<float> mask = denseMaskConditioning
             ? preparedMask.originalMask
-            : createTrackerMaskFromHighRes(
-                decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)],
-                originalImageSize);
-        if (m_diagnosticsOptions.captureTrackerCandidates) {
-            trackerMaskCandidates.selectedMask = mask;
-            m_lastTrackerMaskCandidates = std::move(trackerMaskCandidates);
-            m_hasLastTrackerMaskCandidates = m_lastTrackerMaskCandidates.hasCandidates();
-        } else {
-            m_lastTrackerMaskCandidates = SAM3MaskCandidates();
-            m_hasLastTrackerMaskCandidates = false;
-        }
+            : selectedTrackerMask;
+        trackerMaskCandidates.selectedIndex = selectedTrackerMaskIndex;
+        trackerMaskCandidates.selectedMask = mask;
+        m_lastTrackerMaskCandidates = std::move(trackerMaskCandidates);
+        m_hasLastTrackerMaskCandidates = m_lastTrackerMaskCandidates.hasCandidates();
         ++m_segmentFrameIndex;
-
         timings.stateUpdateMs += frameElapsedMs(stateUpdateStart);
         timings.totalMs = encTimeMs + frameElapsedMs(totalStart);
         m_lastFrameTimings = timings;
@@ -781,3 +1031,5 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         return Image<float>();
     }
 }
+
+} // namespace smseg_sam3

@@ -1,5 +1,4 @@
 #include "SAM3.h"
-#include "CVHelpers.h"
 
 #include <algorithm>
 #include <array>
@@ -20,7 +19,16 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 static std::wstring strToWstr(const std::string& value)
 {
@@ -65,6 +73,8 @@ AppendDmlProviderFn loadDmlProviderAppendFn()
 #ifdef __linux__
 #include <dlfcn.h>
 #endif
+
+using smseg_sam3::SAM3Node;
 
 namespace {
 
@@ -179,7 +189,8 @@ float halfBitsToFloat(std::uint16_t value)
     return result;
 }
 
-bool captureTensorAsHalf(const Ort::Value& tensor, CachedTensorData* target)
+bool captureTensorAsHalf(const Ort::Value& tensor,
+                         smseg_sam3::CachedTensorData* target)
 {
     if (!target) {
         return false;
@@ -187,30 +198,31 @@ bool captureTensorAsHalf(const Ort::Value& tensor, CachedTensorData* target)
 
     const float* tensorData = tensor.GetTensorData<float>();
     const auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
-    const std::size_t count = computeElementCount(shape);
+    const std::size_t count = smseg_sam3::computeElementCount(shape);
 
     target->values.clear();
     target->halfValues.resize(count);
     target->shape.assign(shape.begin(), shape.end());
-    target->elementType = CachedTensorElementType::Float16;
+    target->elementType = smseg_sam3::CachedTensorElementType::Float16;
     for (std::size_t i = 0; i < count; ++i) {
         target->halfValues[i] = floatToHalfBits(tensorData[i]);
     }
     return !target->halfValues.empty();
 }
 
-bool expandTensorToFloat(const CachedTensorData& source, CachedTensorData* target)
+bool expandTensorToFloat(const smseg_sam3::CachedTensorData& source,
+                         smseg_sam3::CachedTensorData* target)
 {
     if (!target || source.empty()) {
         return false;
     }
 
-    const std::size_t expectedCount = computeElementCount(source.shape);
+    const std::size_t expectedCount = smseg_sam3::computeElementCount(source.shape);
     target->shape = source.shape;
     target->halfValues.clear();
-    target->elementType = CachedTensorElementType::Float32;
+    target->elementType = smseg_sam3::CachedTensorElementType::Float32;
 
-    if (source.elementType == CachedTensorElementType::Float16
+    if (source.elementType == smseg_sam3::CachedTensorElementType::Float16
         || !source.halfValues.empty()) {
         if (source.halfValues.size() != expectedCount) {
             return false;
@@ -937,17 +949,9 @@ bool preloadCudaWindowsRuntime()
 }
 #endif
 
-std::vector<std::string> namesToStrings(const std::vector<const char*>& names)
-{
-    std::vector<std::string> out;
-    out.reserve(names.size());
-    for (const char* name : names) {
-        out.emplace_back(name ? name : "");
-    }
-    return out;
-}
-
 } // namespace
+
+namespace smseg_sam3 {
 
 SAM3::SAM3() = default;
 
@@ -1031,12 +1035,6 @@ bool SAM3::clearSessions()
 
         resetMemory();
         m_device = "cpu";
-        m_encoderPath.clear();
-        m_imageDecoderPath.clear();
-        m_trackerDecoderPath.clear();
-        m_memoryAttentionPath.clear();
-        m_memoryEncoderPath.clear();
-        m_constantsPath.clear();
     } catch (...) {
         return false;
     }
@@ -1049,138 +1047,18 @@ void SAM3::resetMemory()
     m_hasConditioningState = false;
     m_conditioningState = TrackerFrameState();
     m_nonConditioningStates.clear();
+    m_lastTrackerFrameState = TrackerFrameState();
+    m_hasLastTrackerFrameState = false;
+    m_lastTrackerMaskCandidates = SAM3MaskCandidates();
+    m_hasLastTrackerMaskCandidates = false;
+    m_lastFrameTimings = SAM3FrameTimings();
+    m_hasLastFrameTimings = false;
     m_segmentFrameIndex = 0;
     m_memoryObjPtrsScratch.clear();
     m_memoryObjTposScratch.clear();
     m_memoryMaskFeatsScratch.clear();
     m_memoryMaskPosScratch.clear();
     m_memoryMaskTposScratch.clear();
-    m_lastFrameTimings = SAM3FrameTimings();
-    m_hasLastFrameTimings = false;
-    m_lastTrackerFrameState = TrackerFrameState();
-    m_hasLastTrackerFrameState = false;
-    m_lastTrackerMaskCandidates = SAM3MaskCandidates();
-    m_hasLastTrackerMaskCandidates = false;
-}
-
-bool SAM3::captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const
-{
-    if (!snapshotOut) {
-        return false;
-    }
-
-    snapshotOut->hasConditioningState = m_hasConditioningState;
-    snapshotOut->conditioningState = m_conditioningState;
-    snapshotOut->nonConditioningStates = m_nonConditioningStates;
-    snapshotOut->segmentFrameIndex = m_segmentFrameIndex;
-    return true;
-}
-
-void SAM3::restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot)
-{
-    m_hasConditioningState = snapshot.hasConditioningState;
-    m_conditioningState = snapshot.conditioningState;
-    m_nonConditioningStates = snapshot.nonConditioningStates;
-    m_segmentFrameIndex = snapshot.segmentFrameIndex;
-    m_memoryObjPtrsScratch.clear();
-    m_memoryObjTposScratch.clear();
-    m_memoryMaskFeatsScratch.clear();
-    m_memoryMaskPosScratch.clear();
-    m_memoryMaskTposScratch.clear();
-    m_lastFrameTimings = SAM3FrameTimings();
-    m_hasLastFrameTimings = false;
-    m_lastTrackerFrameState = TrackerFrameState();
-    m_hasLastTrackerFrameState = false;
-    m_lastTrackerMaskCandidates = SAM3MaskCandidates();
-    m_hasLastTrackerMaskCandidates = false;
-}
-
-void SAM3::setDiagnosticsOptions(const SAM3DiagnosticsOptions& options)
-{
-    m_diagnosticsOptions = options;
-    if (!m_diagnosticsOptions.captureTrackerCandidates) {
-        m_lastTrackerMaskCandidates = SAM3MaskCandidates();
-        m_hasLastTrackerMaskCandidates = false;
-    }
-}
-
-SAM3DiagnosticsOptions SAM3::diagnosticsOptions() const
-{
-    return m_diagnosticsOptions;
-}
-
-bool SAM3::runtimeMetadata(SAM3RuntimeMetadata* metadataOut) const
-{
-    if (!metadataOut) {
-        return false;
-    }
-
-    SAM3RuntimeMetadata metadata;
-    metadata.imageInitialized = static_cast<bool>(m_imageDecoderSession);
-    metadata.videoInitialized =
-        static_cast<bool>(m_trackerDecoderSession)
-        && static_cast<bool>(m_memoryAttentionSession)
-        && static_cast<bool>(m_memoryEncoderSession);
-    metadata.mode = metadata.videoInitialized
-        ? "video"
-        : (metadata.imageInitialized ? "image" : "uninitialized");
-    metadata.device = m_device;
-    metadata.encoderPath = m_encoderPath;
-    metadata.imageDecoderPath = m_imageDecoderPath;
-    metadata.trackerDecoderPath = m_trackerDecoderPath;
-    metadata.memoryAttentionPath = m_memoryAttentionPath;
-    metadata.memoryEncoderPath = m_memoryEncoderPath;
-    metadata.constantsPath = m_constantsPath;
-    metadata.inputSize = getInputSize();
-    metadata.hasVideoConstants = m_hasVideoConstants;
-    metadata.decoderHasIouScores = m_trackerDecoderIouScoresIndex >= 0;
-    metadata.decoderHasMultimasks = m_trackerDecoderPredMultimasksHighResIndex >= 0;
-    metadata.imageDecoderPredMasksIndex = m_imageDecoderPredMasksIndex;
-    metadata.imageDecoderIouScoresIndex = m_imageDecoderIouScoresIndex;
-    metadata.trackerDecoderObjPtrIndex = m_trackerDecoderObjPtrIndex;
-    metadata.trackerDecoderPredMaskHighResIndex = m_trackerDecoderPredMaskHighResIndex;
-    metadata.trackerDecoderPredMultimasksHighResIndex = m_trackerDecoderPredMultimasksHighResIndex;
-    metadata.trackerDecoderObjectScoreIndex = m_trackerDecoderObjectScoreIndex;
-    metadata.trackerDecoderIouScoresIndex = m_trackerDecoderIouScoresIndex;
-    metadata.memoryAttentionFusedFeatIndex = m_memoryAttentionFusedFeatIndex;
-    metadata.memoryEncoderFeaturesIndex = m_memoryEncoderFeaturesIndex;
-    metadata.memoryEncoderPosEncIndex = m_memoryEncoderPosIndex;
-    metadata.staticNumMemFrames = m_staticNumMemFrames;
-    metadata.staticNumObjPtrs = m_staticNumObjPtrs;
-    metadata.effectiveMaxMemFrames = m_constants.numMaskmem;
-    metadata.effectiveMaxObjPtrs = m_constants.maxObjPtrs;
-    metadata.maxCondFramesInAttn = m_constants.maxCondFramesInAttn;
-    metadata.keepFirstCondFrame = m_constants.keepFirstCondFrame;
-    metadata.memoryTemporalStrideForEval = m_constants.memoryTemporalStrideForEval;
-    metadata.useMemorySelection = m_constants.useMemorySelection;
-    metadata.mfThreshold = m_constants.mfThreshold;
-    metadata.exportMaxMemFrames = m_constants.exportMaxMemFrames;
-    metadata.exportMaxObjPtrs = m_constants.exportMaxObjPtrs;
-    metadata.nonConditioningFramesKept = m_nonConditioningStates.size();
-    metadata.segmentFrameIndex = m_segmentFrameIndex;
-    metadata.encoderInputNodes = m_encoderInputNodes;
-    metadata.encoderOutputNodes = m_encoderOutputNodes;
-    metadata.imageDecoderInputNodes = m_imageDecoderInputNodes;
-    metadata.imageDecoderOutputNodes = m_imageDecoderOutputNodes;
-    metadata.trackerDecoderInputNodes = m_trackerDecoderInputNodes;
-    metadata.trackerDecoderOutputNodes = m_trackerDecoderOutputNodes;
-    metadata.memoryAttentionInputNodes = m_memoryAttentionInputNodes;
-    metadata.memoryAttentionOutputNodes = m_memoryAttentionOutputNodes;
-    metadata.memoryEncoderInputNodes = m_memoryEncoderInputNodes;
-    metadata.memoryEncoderOutputNodes = m_memoryEncoderOutputNodes;
-    metadata.encoderInputNames = namesToStrings(m_encoderInputNames);
-    metadata.encoderOutputNames = namesToStrings(m_encoderOutputNames);
-    metadata.imageDecoderInputNames = namesToStrings(m_imageDecoderInputNames);
-    metadata.imageDecoderOutputNames = namesToStrings(m_imageDecoderOutputNames);
-    metadata.trackerDecoderInputNames = namesToStrings(m_trackerDecoderInputNames);
-    metadata.trackerDecoderOutputNames = namesToStrings(m_trackerDecoderOutputNames);
-    metadata.memoryAttentionInputNames = namesToStrings(m_memoryAttentionInputNames);
-    metadata.memoryAttentionOutputNames = namesToStrings(m_memoryAttentionOutputNames);
-    metadata.memoryEncoderInputNames = namesToStrings(m_memoryEncoderInputNames);
-    metadata.memoryEncoderOutputNames = namesToStrings(m_memoryEncoderOutputNames);
-
-    *metadataOut = std::move(metadata);
-    return true;
 }
 
 bool SAM3::lastFrameTimings(SAM3FrameTimings* timingsOut) const
@@ -1192,22 +1070,33 @@ bool SAM3::lastFrameTimings(SAM3FrameTimings* timingsOut) const
     return true;
 }
 
-bool SAM3::lastTrackerFrameState(TrackerFrameState* stateOut) const
+bool SAM3::captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const
 {
-    if (!stateOut || !m_hasLastTrackerFrameState) {
+    if (!snapshotOut)
         return false;
-    }
-    *stateOut = m_lastTrackerFrameState;
+
+    snapshotOut->hasConditioningState = m_hasConditioningState;
+    snapshotOut->conditioningState = m_conditioningState;
+    snapshotOut->nonConditioningStates = m_nonConditioningStates;
+    snapshotOut->lastTrackerFrameState = m_lastTrackerFrameState;
+    snapshotOut->hasLastTrackerFrameState = m_hasLastTrackerFrameState;
+    snapshotOut->segmentFrameIndex = m_segmentFrameIndex;
     return true;
 }
 
-bool SAM3::lastTrackerMaskCandidates(SAM3MaskCandidates* candidatesOut) const
+void SAM3::restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot)
 {
-    if (!candidatesOut || !m_hasLastTrackerMaskCandidates) {
-        return false;
-    }
-    *candidatesOut = m_lastTrackerMaskCandidates;
-    return true;
+    m_hasConditioningState = snapshot.hasConditioningState;
+    m_conditioningState = snapshot.conditioningState;
+    m_nonConditioningStates = snapshot.nonConditioningStates;
+    m_lastTrackerFrameState = snapshot.lastTrackerFrameState;
+    m_hasLastTrackerFrameState = snapshot.hasLastTrackerFrameState;
+    m_segmentFrameIndex = snapshot.segmentFrameIndex;
+    m_memoryObjPtrsScratch.clear();
+    m_memoryObjTposScratch.clear();
+    m_memoryMaskFeatsScratch.clear();
+    m_memoryMaskPosScratch.clear();
+    m_memoryMaskTposScratch.clear();
 }
 
 SAM3Size SAM3::getInputSize() const
@@ -1225,12 +1114,11 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
                                GraphOptimizationLevel optLevel,
                                const std::string& device)
 {
+    const int safeThreads = std::max(1, threadsNumber);
     const int safeInterOpThreads = envInt("SAM3_ORT_INTER_OP_THREADS", 1, 1);
     const bool enableCpuArena = envBool("SAM3_ORT_CPU_ARENA", true);
     const bool enableMemPattern = envBool("SAM3_ORT_MEM_PATTERN", true);
-    if (threadsNumber > 0) {
-        options.SetIntraOpNumThreads(threadsNumber);
-    }
+    options.SetIntraOpNumThreads(safeThreads);
     options.SetInterOpNumThreads(safeInterOpThreads);
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
     options.SetGraphOptimizationLevel(resolveGraphOptimizationLevel(device, optLevel));
@@ -1251,7 +1139,7 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
         if (!preloadCudaWindowsRuntime()) {
             std::cerr
                 << "[WARN] Could not preload the CUDA/cuDNN runtime from PATH or the default install locations. "
-                << "If CUDA session initialization fails, add the CUDA/cuDNN bin folders to PATH or SAM3_CUDA_DLL_DIRS.\n";
+                << "If CUDA session initialization fails, add the CUDA/cuDNN bin folders to PATH or the configured DLL search paths.\n";
         }
 #endif
         OrtCUDAProviderOptions cudaOptions{};
@@ -1378,7 +1266,7 @@ bool SAM3::initializeNamedSession(std::unique_ptr<Ort::Session>* sessionOut,
         *sessionOut = std::move(session);
         return true;
     } catch (const std::exception& error) {
-        std::cerr << "[ERROR] Failed to load session " << modelPath << " => " << error.what() << '\n';
+        std::cerr << "[ERROR] Failed to load Engine 3 session => " << error.what() << '\n';
         return false;
     }
 }
@@ -1415,8 +1303,6 @@ bool SAM3::initializeImage(const std::string& encoderPath,
 {
     clearSessions();
     m_device = device;
-    m_encoderPath = encoderPath;
-    m_imageDecoderPath = decoderPath;
 
     if (!modelExists(encoderPath) || !modelExists(decoderPath)) {
         std::cerr << "[ERROR] Model file not found.\n";
@@ -1549,7 +1435,7 @@ bool SAM3::loadVideoConstants(const std::string& constantsPath)
             "current_vision_pos_embed",
             &m_constants.currentVisionPosEmbed,
             &m_constants.currentVisionPosEmbedShape)) {
-        std::cerr << "[ERROR] Failed to read required SAM3 tracker constants from " << constantsPath << '\n';
+        std::cerr << "[ERROR] Failed to read required Engine 3 tracker constants.\n";
         return false;
     }
 
@@ -1577,11 +1463,6 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
 {
     clearSessions();
     m_device = device;
-    m_encoderPath = encoderPath;
-    m_trackerDecoderPath = decoderPath;
-    m_memoryAttentionPath = memoryAttentionPath;
-    m_memoryEncoderPath = memoryEncoderPath;
-    m_constantsPath = constantsPath;
 
     if (!modelExists(encoderPath)
         || !modelExists(decoderPath)
@@ -1743,22 +1624,22 @@ bool SAM3::captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const
     if (!outputs) {
         return false;
     }
+    *outputs = CachedEncoderOutputs();
 
     const int requiredMaxIndex = std::max({m_encoderImageEmb0Index, m_encoderImageEmb1Index, m_encoderImageEmb2Index});
     if (requiredMaxIndex < 0 || m_cachedEncoderOutputs.size() <= static_cast<size_t>(requiredMaxIndex)) {
         return false;
     }
 
-    *outputs = CachedEncoderOutputs();
     return captureTensorAsHalf(
-               m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)],
-               &outputs->imageEmb0)
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)],
+            &outputs->imageEmb0)
         && captureTensorAsHalf(
-               m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)],
-               &outputs->imageEmb1)
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)],
+            &outputs->imageEmb1)
         && captureTensorAsHalf(
-               m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)],
-               &outputs->imageEmb2);
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)],
+            &outputs->imageEmb2);
 }
 
 bool SAM3::restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs)
@@ -1809,55 +1690,12 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
 {
     try {
         const SAM3Size targetSize = getInputSize();
-        const std::vector<float> encoderData = CVHelpers::resizeImageToPlanarTensor(
-            originalImage,
-            targetSize.width,
-            targetSize.height);
-        return preprocessImageTensor(encoderData);
-    } catch (const std::exception& error) {
-        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
-        m_cachedEncoderOutputs.clear();
-        m_cachedEncoderHostCopy = CachedEncoderOutputs();
-        m_hasCachedEncoderHostCopy = false;
-        return false;
-    }
-}
-
-bool SAM3::preprocessImageTensor(const std::vector<float>& encoderInputData)
-{
-    return preprocessImageTensor(encoderInputData.data(), encoderInputData.size());
-}
-
-bool SAM3::preprocessImageTensor(const float* encoderInputData, size_t elementCount)
-{
-    try {
-        if (!encoderInputData || elementCount == 0) {
-            std::cerr << "[ERROR] preprocessImageTensor => encoder input is empty.\n";
-            m_cachedEncoderOutputs.clear();
-            m_cachedEncoderHostCopy = CachedEncoderOutputs();
-            m_hasCachedEncoderHostCopy = false;
-            return false;
-        }
-        const size_t expectedElements = computeElementCount(m_inputShapeEncoder);
-        if (m_inputShapeEncoder.size() < 4 || expectedElements == 0 || elementCount != expectedElements) {
-            std::cerr
-                << "[ERROR] preprocessImageTensor => expected "
-                << expectedElements
-                << " floats for encoder input, got "
-                << elementCount
-                << ".\n";
-            m_cachedEncoderOutputs.clear();
-            m_cachedEncoderHostCopy = CachedEncoderOutputs();
-            m_hasCachedEncoderHostCopy = false;
-            return false;
-        }
-
-        Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
-            m_memoryInfo,
-            const_cast<float*>(encoderInputData),
-            elementCount,
-            m_inputShapeEncoder.data(),
-            m_inputShapeEncoder.size());
+        const Image<float> encoderImage =
+            originalImage.getWidth() == targetSize.width && originalImage.getHeight() == targetSize.height
+                ? originalImage
+                : originalImage.resize(targetSize.width, targetSize.height);
+        const std::vector<float> encoderData = encoderImage.getDataPlanarFormat();
+        Ort::Value inputTensor = createTensor<float>(m_memoryInfo, encoderData, m_inputShapeEncoder);
         std::vector<Ort::Value> inputs;
         inputs.push_back(std::move(inputTensor));
 
@@ -1869,9 +1707,6 @@ bool SAM3::preprocessImageTensor(const float* encoderInputData, size_t elementCo
             "encoder");
         if (result.index() == 1) {
             std::cerr << std::get<std::string>(result) << '\n';
-            m_cachedEncoderOutputs.clear();
-            m_cachedEncoderHostCopy = CachedEncoderOutputs();
-            m_hasCachedEncoderHostCopy = false;
             return false;
         }
 
@@ -1880,7 +1715,7 @@ bool SAM3::preprocessImageTensor(const float* encoderInputData, size_t elementCo
         m_hasCachedEncoderHostCopy = false;
         return true;
     } catch (const std::exception& error) {
-        std::cerr << "[ERROR] preprocessImageTensor => " << error.what() << '\n';
+        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
@@ -1894,6 +1729,9 @@ const std::vector<float>& SAM3::buildNoMemoryImageEmbedding(
 {
     const float* currentVisionValues = currentVisionFeat.GetTensorData<float>();
     const size_t currentVisionCount = computeElementCount(currentVisionShape);
+    if (!currentVisionValues) {
+        throw std::runtime_error("current_vision_feat tensor has no float data.");
+    }
 
     m_noMemoryImageEmbedScratch.resize(currentVisionCount);
     if (currentVisionCount == m_constants.noMemEmbed.size()) {
@@ -2005,3 +1843,5 @@ bool SAM3::hasDirectMLProvider()
     return false;
 #endif
 }
+
+} // namespace smseg_sam3

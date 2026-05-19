@@ -1,39 +1,26 @@
-#ifndef SAM3CPP__ARTIFACT_RESOLVER_H_
-#define SAM3CPP__ARTIFACT_RESOLVER_H_
+#ifndef ARTIFACTRESOLVER_H
+#define ARTIFACTRESOLVER_H
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
-#include <vector>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 namespace ArtifactResolver {
 
-struct ImageRuntimeSelection {
-    std::string encoderPath;
-    std::string decoderPath;
-    std::string precision;
+struct ImageDecoderSelection {
+    std::string path;
     std::string mode;
 };
 
 struct VideoRuntimeSelection {
-    std::string encoderPath;
-    std::string decoderPath;
+    std::string decoderInitPath;
+    std::string decoderPropagatePath;
     std::string memoryAttentionPath;
     std::string memoryEncoderPath;
-    std::string constantsPath;
-    std::string precision;
-    std::string graphProfile;
     std::string mode;
 };
-
-inline bool pathExists(const std::filesystem::path& path);
-inline std::filesystem::path normalizePath(const std::filesystem::path& path);
 
 inline std::string lowerCopy(std::string value)
 {
@@ -45,10 +32,36 @@ inline std::string lowerCopy(std::string value)
     return value;
 }
 
+inline std::filesystem::path candidatePath(const std::string &path)
+{
+    std::filesystem::path candidate(path);
+    if (candidate.has_parent_path()) {
+        return candidate;
+    }
+    return std::filesystem::current_path() / candidate;
+}
+
+inline std::string normalizePath(const std::filesystem::path &path)
+{
+    try {
+        if (std::filesystem::exists(path)) {
+            return std::filesystem::absolute(path).lexically_normal().string();
+        }
+    } catch (...) {
+    }
+    return path.lexically_normal().string();
+}
+
+inline std::string preferredRuntimeProfile();
+inline bool isLowCostCpuProfile();
+
 inline std::string preferredRuntimeProfile()
 {
-    const char* value = std::getenv("SAM3_ORT_RUNTIME_PROFILE");
-    return value ? lowerCopy(value) : std::string();
+    const char *value = std::getenv("SAM2_ORT_RUNTIME_PROFILE");
+    if (!value) {
+        return "";
+    }
+    return lowerCopy(value);
 }
 
 inline bool isLowCostCpuProfile()
@@ -60,72 +73,59 @@ inline bool isLowCostCpuProfile()
         || profile == "low-cost-cpu";
 }
 
-inline bool isDirectMLDevice(const std::string& device)
+inline int preferredRuntimeThreads(int fallback, const std::string &device)
 {
-    const std::string lowered = lowerCopy(device);
-    return lowered.rfind("dml", 0) == 0 || lowered.rfind("directml", 0) == 0;
-}
-
-inline std::filesystem::path preferDirectMLArtifactPath(const std::filesystem::path& path,
-                                                        const std::string& device)
-{
-    if (!isDirectMLDevice(device) || path.empty() || lowerCopy(path.extension().string()) != ".onnx") {
-        return path;
-    }
-
-    const std::filesystem::path dmlPath =
-        path.parent_path() / (path.stem().string() + ".dml.onnx");
-    if (pathExists(dmlPath)) {
-        return normalizePath(dmlPath);
-    }
-
-    return path;
-}
-
-inline int preferredRuntimeThreads(int fallback, const std::string& device)
-{
-    const char* explicitThreads = std::getenv("SAM3_ORT_CPU_THREADS");
-    if (explicitThreads && *explicitThreads) {
+    const char *value = std::getenv("SAM2_ORT_CPU_THREADS");
+    if (value && *value) {
         try {
-            return std::max(0, std::stoi(explicitThreads));
+            return std::max(1, std::stoi(value));
         } catch (...) {
         }
     }
 
-    const char* intraOpThreads = std::getenv("SAM3_ORT_INTRA_OP_THREADS");
-    if (intraOpThreads && *intraOpThreads) {
-        try {
-            return std::max(0, std::stoi(intraOpThreads));
-        } catch (...) {
-        }
-    }
-
-    if (isLowCostCpuProfile()) {
+    if (isLowCostCpuProfile() || device == "cpu") {
         return std::max(1, std::min(fallback, 4));
-    }
-    if (device == "cpu") {
-        return std::max(1, fallback > 1 ? fallback - 1 : fallback);
     }
     return std::max(1, fallback);
 }
 
-inline std::filesystem::path executablePath()
+inline std::string preferredEncoderVariant()
 {
-#ifdef _WIN32
-    std::wstring buffer(MAX_PATH, L'\0');
-    DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-    while (length >= buffer.size()) {
-        buffer.resize(buffer.size() * 2);
-        length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    const char *value = std::getenv("SAM2_ORT_ENCODER_VARIANT");
+    if (!value) {
+        return "auto";
     }
-    buffer.resize(length);
-    return std::filesystem::path(buffer);
-#else
-    return std::filesystem::current_path();
-#endif
+    const std::string lowered = lowerCopy(value);
+    if (lowered == "int8" || lowered == "fp32" || lowered == "auto") {
+        return lowered;
+    }
+    return "auto";
 }
 
-inline bool pathExists(const std::filesystem::path& path)
+inline std::string preferredVideoModuleVariant()
+{
+    const char *value = std::getenv("SAM2_ORT_VIDEO_MODULE_VARIANT");
+    if (!value) {
+        return "fp32";
+    }
+    const std::string lowered = lowerCopy(value);
+    if (lowered == "int8" || lowered == "fp32" || lowered == "auto") {
+        return lowered;
+    }
+    return "auto";
+}
+
+inline bool useExperimentalVideoInitDecoder()
+{
+    const char *value = std::getenv("SAM2_ORT_EXPERIMENTAL_VIDEO_INIT_DECODER");
+    if (!value) {
+        return false;
+    }
+    const std::string lowered = lowerCopy(value);
+    return lowered == "1" || lowered == "true" || lowered == "yes";
+}
+
+inline bool pathExists(const std::filesystem::path &path)
 {
     try {
         return std::filesystem::exists(path);
@@ -134,411 +134,244 @@ inline bool pathExists(const std::filesystem::path& path)
     }
 }
 
-inline std::filesystem::path normalizePath(const std::filesystem::path& path)
+inline bool isBasename(const std::string &path, const std::string &name)
 {
-    try {
-        if (std::filesystem::exists(path)) {
-            return std::filesystem::absolute(path).lexically_normal();
-        }
-    } catch (...) {
-    }
-    return path.lexically_normal();
+    return lowerCopy(candidatePath(path).filename().string()) == lowerCopy(name);
 }
 
-inline std::filesystem::path candidatePath(const std::string& path)
+inline std::string preferQuantizedEncoderPath(const std::string &encoderPath,
+                                              const std::string &device)
 {
-    if (path.empty()) {
-        return std::filesystem::path();
-    }
-    std::filesystem::path candidate(path);
-    if (candidate.is_absolute()) {
-        return candidate;
-    }
-    return std::filesystem::current_path() / candidate;
-}
-
-inline std::vector<std::filesystem::path> repoSearchSeeds()
-{
-    std::vector<std::filesystem::path> seeds;
-    seeds.push_back(std::filesystem::current_path());
-
-    const std::filesystem::path exePath = executablePath();
-    if (!exePath.empty()) {
-        seeds.push_back(exePath.parent_path());
+    if (!isBasename(encoderPath, "image_encoder.onnx")) {
+        return encoderPath;
     }
 
-    seeds.push_back(std::filesystem::path(__FILE__).parent_path().parent_path().parent_path());
-    return seeds;
-}
+    const std::filesystem::path current = candidatePath(encoderPath);
+    const std::filesystem::path quantized = current.parent_path() / "image_encoder.int8.onnx";
+    const std::string variant = preferredEncoderVariant();
 
-inline std::filesystem::path findRepoRoot()
-{
-    for (const auto& seed : repoSearchSeeds()) {
-        std::filesystem::path current = normalizePath(seed);
-        while (!current.empty()) {
-            if (pathExists(current / "checkpoints" / "sam3")) {
-                return current;
-            }
-
-            const auto parent = current.parent_path();
-            if (parent == current) {
-                break;
-            }
-            current = parent;
-        }
-    }
-    return std::filesystem::path();
-}
-
-inline std::filesystem::path defaultImageOnnxDir()
-{
-    const auto repoRoot = findRepoRoot();
-    return repoRoot.empty() ? std::filesystem::path() : repoRoot / "checkpoints" / "sam3" / "onnx";
-}
-
-inline std::filesystem::path defaultVideoOnnxDir()
-{
-    const auto repoRoot = findRepoRoot();
-    return repoRoot.empty() ? std::filesystem::path() : repoRoot / "checkpoints" / "sam3" / "video_onnx";
-}
-
-inline bool hasExternalDataSidecar(const std::filesystem::path& path)
-{
-    return pathExists(path) && pathExists(path.string() + "_data");
-}
-
-inline bool hasUsableImageArtifact(const std::filesystem::path& path,
-                                   const std::string& variant)
-{
-    if (!pathExists(path)) {
-        return false;
+    if (variant == "fp32") {
+        return encoderPath;
     }
 
-    // Downloaded fp32/fp16 Hugging Face image models are split across
-    // .onnx + .onnx_data. Quantized artifacts may be embedded or may carry
-    // their own external-data reference, so let ONNX Runtime validate them.
     if (variant == "int8") {
-        return true;
-    }
-
-    return pathExists(path.string() + "_data");
-}
-
-inline std::string preferredEncoderVariant()
-{
-    const char* value = std::getenv("SAM3_ORT_ENCODER_VARIANT");
-    if (!value || !*value) {
-        value = std::getenv("SAM3_ONNX_VARIANT");
-    }
-    if (!value || !*value) {
-        return "auto";
-    }
-
-    const std::string requested = lowerCopy(value);
-    if (requested == "int8" || requested == "fp32" || requested == "fp16" || requested == "auto") {
-        return requested;
-    }
-    return "auto";
-}
-
-inline std::string preferredDecoderVariant()
-{
-    const char* value = std::getenv("SAM3_ORT_DECODER_VARIANT");
-    if (!value || !*value) {
-        value = std::getenv("SAM3_ONNX_VARIANT");
-    }
-    if (!value || !*value) {
-        return "auto";
-    }
-
-    const std::string requested = lowerCopy(value);
-    if (requested == "int8" || requested == "fp32" || requested == "fp16" || requested == "auto") {
-        return requested;
-    }
-    return "auto";
-}
-
-inline std::vector<std::string> preferredImageEncoderVariants(const std::string& device)
-{
-    const std::string requested = preferredEncoderVariant();
-    if (requested == "int8") {
-        return {"int8", "fp32", "fp16"};
-    }
-    if (requested == "fp32") {
-        return {"fp32", "int8", "fp16"};
-    }
-    if (requested == "fp16") {
-        return {"fp16", "fp32", "int8"};
-    }
-    return device == "cpu"
-        ? std::vector<std::string>{"int8", "fp32", "fp16"}
-        : std::vector<std::string>{"fp16", "fp32", "int8"};
-}
-
-inline std::vector<std::string> preferredImageDecoderVariants(const std::string& device)
-{
-    const std::string requested = preferredDecoderVariant();
-    if (requested == "int8") {
-        return {"int8", "fp32", "fp16"};
-    }
-    if (requested == "fp32") {
-        return {"fp32", "int8", "fp16"};
-    }
-    if (requested == "fp16") {
-        return {"fp16", "fp32", "int8"};
-    }
-    return device == "cpu"
-        ? std::vector<std::string>{"fp32", "int8", "fp16"}
-        : std::vector<std::string>{"fp16", "fp32", "int8"};
-}
-
-inline std::vector<std::filesystem::path> imageEncoderPathsForVariant(const std::filesystem::path& onnxDir,
-                                                                      const std::string& variant)
-{
-    if (variant == "int8") {
-        return {
-            onnxDir / "vision_encoder.int8.onnx",
-            onnxDir / "bench_cpu" / "vision_encoder.int8.matmul_gather.onnx",
-            onnxDir / "bench_cpu" / "vision_encoder.int8.matmul_gather_pre.onnx",
-            onnxDir / "bench_cpu" / "vision_encoder.int8.matmul.onnx",
-        };
-    }
-    if (variant == "fp16") {
-        return {onnxDir / "vision_encoder_fp16.onnx"};
-    }
-    return {onnxDir / "vision_encoder.onnx"};
-}
-
-inline std::vector<std::filesystem::path> imageDecoderPathsForVariant(const std::filesystem::path& onnxDir,
-                                                                      const std::string& variant)
-{
-    if (variant == "int8") {
-        return {
-            onnxDir / "prompt_encoder_mask_decoder.int8.onnx",
-            onnxDir / "bench_cpu" / "prompt_encoder_mask_decoder.int8.matmul_gemm.onnx",
-        };
-    }
-    if (variant == "fp16") {
-        return {onnxDir / "prompt_encoder_mask_decoder_fp16.onnx"};
-    }
-    return {onnxDir / "prompt_encoder_mask_decoder.onnx"};
-}
-
-inline std::vector<std::string> preferredTrackerPrecisions(const std::string& device)
-{
-    const std::string requested = lowerCopy(
-        std::getenv("SAM3_ORT_TRACKER_PRECISION")
-            ? std::getenv("SAM3_ORT_TRACKER_PRECISION")
-            : "auto");
-    if (requested == "fp16") {
-        return {"fp16", "fp32"};
-    }
-    if (requested == "fp32") {
-        return {"fp32", "fp16"};
-    }
-    return device == "cpu"
-        ? std::vector<std::string>{"fp32", "fp16"}
-        : std::vector<std::string>{"fp16", "fp32"};
-}
-
-inline ImageRuntimeSelection resolveImageRuntimePaths(const std::string& encoderPath,
-                                                      const std::string& decoderPath,
-                                                      const std::string& device)
-{
-    const auto onnxDir = defaultImageOnnxDir();
-
-    ImageRuntimeSelection fallback;
-    fallback.encoderPath = encoderPath.empty() ? std::string() : normalizePath(candidatePath(encoderPath)).string();
-    fallback.decoderPath = decoderPath.empty() ? std::string() : normalizePath(candidatePath(decoderPath)).string();
-    fallback.precision = "manual";
-    fallback.mode = "manual";
-
-    std::filesystem::path resolvedEncoderCandidate;
-    std::string resolvedEncoderVariant = "manual";
-    if (encoderPath.empty()) {
-        for (const auto& variant : preferredImageEncoderVariants(device)) {
-            for (const auto& candidate : imageEncoderPathsForVariant(onnxDir, variant)) {
-                if (hasUsableImageArtifact(candidate, variant)) {
-                    resolvedEncoderCandidate = candidate;
-                    resolvedEncoderVariant = variant;
-                    break;
-                }
-            }
-            if (!resolvedEncoderCandidate.empty()) {
-                break;
-            }
+        if (pathExists(quantized)) {
+            return normalizePath(quantized);
         }
-    } else {
-        resolvedEncoderCandidate = candidatePath(encoderPath);
+        return encoderPath;
     }
 
-    std::filesystem::path resolvedDecoderCandidate;
-    std::string resolvedDecoderVariant = "manual";
-    if (decoderPath.empty()) {
-        for (const auto& variant : preferredImageDecoderVariants(device)) {
-            for (const auto& candidate : imageDecoderPathsForVariant(onnxDir, variant)) {
-                if (hasUsableImageArtifact(candidate, variant)) {
-                    resolvedDecoderCandidate = candidate;
-                    resolvedDecoderVariant = variant;
-                    break;
-                }
-            }
-            if (!resolvedDecoderCandidate.empty()) {
-                break;
-            }
+    if (device != "cpu") {
+        return encoderPath;
+    }
+
+    if (pathExists(quantized)) {
+        return normalizePath(quantized);
+    }
+
+    return encoderPath;
+}
+
+inline std::string preferQuantizedRuntimeArtifactPath(const std::string &path,
+                                                      const std::string &device,
+                                                      const std::string &variant)
+{
+    const std::filesystem::path current = candidatePath(path);
+    if (lowerCopy(current.extension().string()) != ".onnx") {
+        return path;
+    }
+
+    const std::filesystem::path quantized =
+        current.parent_path() / (current.stem().string() + ".int8.onnx");
+
+    if (variant == "fp32") {
+        return path;
+    }
+
+    if (variant == "int8") {
+        if (pathExists(quantized)) {
+            return normalizePath(quantized);
         }
-    } else {
-        resolvedDecoderCandidate = candidatePath(decoderPath);
+        return path;
     }
 
-    if (!resolvedEncoderCandidate.empty() && !resolvedDecoderCandidate.empty()) {
-        ImageRuntimeSelection selection;
-        selection.encoderPath = preferDirectMLArtifactPath(
-            normalizePath(resolvedEncoderCandidate),
-            device).string();
-        selection.decoderPath = preferDirectMLArtifactPath(
-            normalizePath(resolvedDecoderCandidate),
-            device).string();
-        selection.precision = resolvedEncoderVariant == resolvedDecoderVariant
-            ? resolvedEncoderVariant
-            : ("enc=" + resolvedEncoderVariant + ",dec=" + resolvedDecoderVariant);
-        selection.mode = (!encoderPath.empty() && !decoderPath.empty())
-            ? "manual"
-            : (!encoderPath.empty() ? "manual-encoder" : (!decoderPath.empty() ? "manual-decoder" : "resolved"));
+    if (device != "cpu") {
+        return path;
+    }
+
+    if (pathExists(quantized)) {
+        return normalizePath(quantized);
+    }
+
+    return path;
+}
+
+inline ImageDecoderSelection resolveImageDecoderPath(const std::string &decoderPath,
+                                                     const std::string &promptMode,
+                                                     bool experimentalImagePointDecoder = false)
+{
+    if (!isBasename(decoderPath, "image_decoder.onnx")) {
+        return {decoderPath, "manual"};
+    }
+
+    const std::filesystem::path current = candidatePath(decoderPath);
+    const std::filesystem::path directory = current.parent_path();
+
+    if (promptMode == "bounding_box") {
+        const std::filesystem::path specialized = directory / "image_decoder_box.onnx";
+        if (pathExists(specialized)) {
+            return {normalizePath(specialized), "specialized"};
+        }
+        return {decoderPath, "legacy"};
+    }
+
+    if (promptMode == "seed_points") {
+        const std::filesystem::path specialized = directory / "image_decoder_points.onnx";
+        if (experimentalImagePointDecoder && pathExists(specialized)) {
+            return {normalizePath(specialized), "specialized"};
+        }
+        return {decoderPath, experimentalImagePointDecoder ? "legacy-missing-specialized" : "legacy-safe-seed-points"};
+    }
+
+    return {decoderPath, "legacy"};
+}
+
+inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string &decoderPath,
+                                                      const std::string &memoryAttentionPath,
+                                                      const std::string &memoryEncoderPath,
+                                                      bool experimentalOneFrameAttention = false,
+                                                      const std::string &device = "cpu")
+{
+    const std::filesystem::path decoderCandidate = candidatePath(decoderPath);
+    const std::filesystem::path decoderDirectory = decoderCandidate.parent_path();
+    const std::filesystem::path manualDecoderInit = decoderDirectory / "video_decoder_init.onnx";
+    const std::filesystem::path manualDecoderPropagate = decoderDirectory / "video_decoder_propagate.onnx";
+    const std::string videoModuleVariant = preferredVideoModuleVariant();
+
+    const auto applyVideoModuleVariants = [&](VideoRuntimeSelection selection) -> VideoRuntimeSelection {
+        selection.decoderPropagatePath = preferQuantizedRuntimeArtifactPath(
+            selection.decoderPropagatePath,
+            device,
+            videoModuleVariant);
+        selection.memoryAttentionPath = preferQuantizedRuntimeArtifactPath(
+            selection.memoryAttentionPath,
+            device,
+            videoModuleVariant);
+        selection.memoryEncoderPath = preferQuantizedRuntimeArtifactPath(
+            selection.memoryEncoderPath,
+            device,
+            videoModuleVariant);
         return selection;
+    };
+
+    if ((isBasename(decoderPath, "video_decoder_init.onnx")
+         || isBasename(decoderPath, "video_decoder_propagate.onnx"))
+        && (isBasename(memoryAttentionPath, "memory_attention_objptr.onnx")
+            || isBasename(memoryAttentionPath, "memory_attention_no_objptr.onnx")
+            || isBasename(memoryAttentionPath, "memory_attention_no_objptr_1frame.onnx"))
+        && (isBasename(memoryEncoderPath, "memory_encoder.onnx")
+            || isBasename(memoryEncoderPath, "memory_encoder_lite.onnx"))) {
+        const std::string mode = (isBasename(memoryEncoderPath, "memory_encoder.onnx")
+                                      ? "manual-specialized-temporal"
+                                      : "manual-specialized-lite");
+        return applyVideoModuleVariants({
+            normalizePath(isBasename(decoderPath, "video_decoder_init.onnx") ? decoderCandidate : manualDecoderInit),
+            normalizePath(isBasename(decoderPath, "video_decoder_propagate.onnx") ? decoderCandidate : manualDecoderPropagate),
+            normalizePath(candidatePath(memoryAttentionPath)),
+            normalizePath(candidatePath(memoryEncoderPath)),
+            mode,
+        });
     }
 
-    return fallback;
-}
+    if (!isBasename(decoderPath, "image_decoder.onnx")
+        || !isBasename(memoryAttentionPath, "memory_attention.onnx")
+        || !isBasename(memoryEncoderPath, "memory_encoder.onnx")) {
+        return applyVideoModuleVariants({decoderPath, decoderPath, memoryAttentionPath, memoryEncoderPath, "manual"});
+    }
 
-inline std::string graphProfileForAnnotationCount(size_t annotationCount)
-{
-    return annotationCount > 1 ? "multi" : "single";
-}
+    const std::filesystem::path directory = decoderDirectory;
 
-inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string& encoderPath,
-                                                      const std::string& decoderPath,
-                                                      const std::string& memoryAttentionPath,
-                                                      const std::string& memoryEncoderPath,
-                                                      const std::string& constantsPath,
-                                                      const std::string& device,
-                                                      size_t annotationCount)
-{
-    const auto imageOnnxDir = defaultImageOnnxDir();
-    const auto videoDir = defaultVideoOnnxDir();
-    const std::string preferredGraphProfile = graphProfileForAnnotationCount(annotationCount);
+    const std::filesystem::path decoderInit = directory / "video_decoder_init.onnx";
+    const std::filesystem::path decoderProp = directory / "video_decoder_propagate.onnx";
+    const std::filesystem::path attnObjPtr = directory / "memory_attention_objptr.onnx";
+    const std::filesystem::path attn1Frame = directory / "memory_attention_no_objptr_1frame.onnx";
+    const std::filesystem::path attnDynamic = directory / "memory_attention_no_objptr.onnx";
+    const std::filesystem::path legacyMemEncoder = directory / "memory_encoder.onnx";
+    const std::filesystem::path memEncoderLite = directory / "memory_encoder_lite.onnx";
 
-    std::filesystem::path resolvedEncoderCandidate;
-    if (encoderPath.empty()) {
-        for (const auto& variant : preferredImageEncoderVariants(device)) {
-            for (const auto& candidate : imageEncoderPathsForVariant(imageOnnxDir, variant)) {
-                if (hasUsableImageArtifact(candidate, variant)) {
-                    resolvedEncoderCandidate = candidate;
-                    break;
-                }
-            }
-            if (!resolvedEncoderCandidate.empty()) {
-                break;
-            }
+    const bool specializedAvailable =
+        pathExists(decoderInit)
+        && pathExists(decoderProp)
+        && (pathExists(attnObjPtr) || pathExists(attn1Frame) || pathExists(attnDynamic));
+    const bool legacyAvailable = pathExists(candidatePath(decoderPath))
+        && pathExists(candidatePath(memoryAttentionPath))
+        && pathExists(candidatePath(memoryEncoderPath));
+    const bool hybridAvailable =
+        legacyAvailable
+        && pathExists(decoderProp);
+    const bool preferOptimized = device != "cpu";
+    const auto hybridResult = [&]() -> VideoRuntimeSelection {
+        return applyVideoModuleVariants({
+            normalizePath(candidatePath(decoderPath)),
+            normalizePath(decoderProp),
+            normalizePath(candidatePath(memoryAttentionPath)),
+            normalizePath(candidatePath(memoryEncoderPath)),
+            "hybrid-propagate",
+        });
+    };
+
+    const auto specializedResult = [&]() -> VideoRuntimeSelection {
+        std::filesystem::path selectedAttention;
+        std::string suffix;
+
+        if (pathExists(attnObjPtr)) {
+            selectedAttention = attnObjPtr;
+            suffix = "objptr";
+        } else if (experimentalOneFrameAttention && pathExists(attn1Frame)) {
+            selectedAttention = attn1Frame;
+            suffix = "1frame-attn";
+        } else if (pathExists(attnDynamic)) {
+            selectedAttention = attnDynamic;
+            suffix = "dynamic-attn";
+        } else {
+            selectedAttention = attn1Frame;
+            suffix = "1frame-attn-fallback";
         }
-    } else {
-        resolvedEncoderCandidate = candidatePath(encoderPath);
-    }
 
-    std::vector<std::string> graphProfiles = {preferredGraphProfile};
-    if (preferredGraphProfile != "single") {
-        graphProfiles.push_back("single");
-    }
+        const std::filesystem::path selectedMemEncoder = pathExists(legacyMemEncoder) ? legacyMemEncoder : memEncoderLite;
+        const std::string modePrefix = pathExists(legacyMemEncoder) ? "specialized-temporal" : "specialized-lite";
 
-    for (const auto& graphProfile : graphProfiles) {
-        for (const auto& precision : preferredTrackerPrecisions(device)) {
-            const std::string suffix = graphProfile + (precision == "fp16" ? "_fp16" : "");
+        return applyVideoModuleVariants({
+            normalizePath(decoderInit),
+            normalizePath(decoderProp),
+            normalizePath(selectedAttention),
+            normalizePath(selectedMemEncoder),
+            modePrefix + "-" + suffix,
+        });
+    };
 
-            const std::filesystem::path decoderCandidate = videoDir / ("image_decoder_" + suffix + ".onnx");
-            const std::filesystem::path memoryAttentionCandidate = videoDir / ("memory_attention_" + suffix + ".onnx");
-            const std::filesystem::path memoryEncoderCandidate = videoDir / ("memory_encoder_" + suffix + ".onnx");
-            const std::filesystem::path constantsCandidate = videoDir / ("video_constants_" + suffix + ".npz");
-
-            if (!pathExists(decoderCandidate)
-                || !pathExists(memoryAttentionCandidate)
-                || !pathExists(memoryEncoderCandidate)
-                || !pathExists(constantsCandidate)
-                || resolvedEncoderCandidate.empty()) {
-                continue;
-            }
-
-            VideoRuntimeSelection selection;
-            selection.encoderPath = preferDirectMLArtifactPath(
-                normalizePath(resolvedEncoderCandidate),
-                device).string();
-            selection.decoderPath = preferDirectMLArtifactPath(
-                normalizePath(decoderCandidate),
-                device).string();
-            selection.memoryAttentionPath = preferDirectMLArtifactPath(
-                normalizePath(memoryAttentionCandidate),
-                device).string();
-            selection.memoryEncoderPath = preferDirectMLArtifactPath(
-                normalizePath(memoryEncoderCandidate),
-                device).string();
-            selection.constantsPath = normalizePath(constantsCandidate).string();
-            selection.precision = precision;
-            selection.graphProfile = graphProfile;
-            selection.mode = "resolved";
-
-            if (!encoderPath.empty()) {
-                selection.encoderPath = preferDirectMLArtifactPath(
-                    normalizePath(candidatePath(encoderPath)),
-                    device).string();
-                selection.mode = "manual-encoder";
-            }
-            if (!decoderPath.empty()) {
-                selection.decoderPath = preferDirectMLArtifactPath(
-                    normalizePath(candidatePath(decoderPath)),
-                    device).string();
-                selection.mode = "manual-decoder";
-            }
-            if (!memoryAttentionPath.empty()) {
-                selection.memoryAttentionPath = preferDirectMLArtifactPath(
-                    normalizePath(candidatePath(memoryAttentionPath)),
-                    device).string();
-                selection.mode = "manual-memory-attention";
-            }
-            if (!memoryEncoderPath.empty()) {
-                selection.memoryEncoderPath = preferDirectMLArtifactPath(
-                    normalizePath(candidatePath(memoryEncoderPath)),
-                    device).string();
-                selection.mode = "manual-memory-encoder";
-            }
-            if (!constantsPath.empty()) {
-                selection.constantsPath = normalizePath(candidatePath(constantsPath)).string();
-                selection.mode = "manual-constants";
-            }
-            return selection;
+    const auto optimizedResult = [&]() -> VideoRuntimeSelection {
+        if (specializedAvailable) {
+            return specializedResult();
         }
+        return hybridResult();
+    };
+
+    if (preferOptimized && (hybridAvailable || specializedAvailable)) {
+        return optimizedResult();
     }
 
-    VideoRuntimeSelection fallback;
-    fallback.encoderPath = resolvedEncoderCandidate.empty()
-        ? std::string()
-        : preferDirectMLArtifactPath(
-            normalizePath(resolvedEncoderCandidate),
-            device).string();
-    fallback.decoderPath = preferDirectMLArtifactPath(
-        normalizePath(candidatePath(decoderPath)),
-        device).string();
-    fallback.memoryAttentionPath = preferDirectMLArtifactPath(
-        normalizePath(candidatePath(memoryAttentionPath)),
-        device).string();
-    fallback.memoryEncoderPath = preferDirectMLArtifactPath(
-        normalizePath(candidatePath(memoryEncoderPath)),
-        device).string();
-    fallback.constantsPath = normalizePath(candidatePath(constantsPath)).string();
-    fallback.precision = "manual";
-    fallback.graphProfile = preferredGraphProfile;
-    fallback.mode = "manual";
-    return fallback;
+    if (legacyAvailable) {
+        return applyVideoModuleVariants({decoderPath, decoderPath, memoryAttentionPath, memoryEncoderPath, "legacy"});
+    }
+
+    if (hybridAvailable || specializedAvailable) {
+        return optimizedResult();
+    }
+
+    return applyVideoModuleVariants({decoderPath, decoderPath, memoryAttentionPath, memoryEncoderPath, "legacy"});
 }
 
 } // namespace ArtifactResolver
 
-#endif // SAM3CPP__ARTIFACT_RESOLVER_H_
+#endif // ARTIFACTRESOLVER_H

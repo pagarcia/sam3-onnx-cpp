@@ -2,18 +2,39 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
-#include "CVHelpers.h"
-
 namespace {
 
-constexpr float kSam3Mean = 0.5f;
-constexpr float kSam3Std = 0.5f;
+Image<float> thresholdImage(Image<float> image, float threshold)
+{
+    for (float& value : image.getData()) {
+        value = value > threshold ? 1.0f : 0.0f;
+    }
+    return image;
+}
+
+Image<float> resizeAndThreshold(const Image<float>& image,
+                                int width,
+                                int height,
+                                float threshold)
+{
+    if (image.getWidth() <= 0 || image.getHeight() <= 0 || width <= 0 || height <= 0) {
+        return Image<float>();
+    }
+    const Image<float> resized =
+        image.getWidth() == width && image.getHeight() == height
+            ? image
+            : image.resize(width, height);
+    return thresholdImage(resized, threshold);
+}
 
 } // namespace
+
+namespace smseg_sam3 {
 
 bool SAM3::promptsEmpty(const SAM3Prompts& prompts) const
 {
@@ -43,103 +64,80 @@ bool SAM3::prepareMaskPrompt(const SAM3Prompts& prompts,
         return false;
     }
 
-    try {
-        cv::Mat maskFloat = CVHelpers::imageToCvMat(prompts.mask);
-        if (maskFloat.type() != CV_32FC1) {
-            maskFloat.convertTo(maskFloat, CV_32FC1);
-        }
-
-        cv::Mat targetFloat;
-        cv::Mat originalBinary;
-        if (prompts.mask.getWidth() == originalImageSize.width
-            && prompts.mask.getHeight() == originalImageSize.height) {
-            cv::threshold(maskFloat, originalBinary, 0.5, 1.0, cv::THRESH_BINARY);
-
-            cv::Mat resized;
-            cv::resize(
-                originalBinary,
-                resized,
-                cv::Size(inputSize.width, inputSize.height),
-                0.0,
-                0.0,
-                cv::INTER_LINEAR);
-            cv::threshold(resized, targetFloat, 0.5, 1.0, cv::THRESH_BINARY);
-            preparedOut->originalMask = CVHelpers::cvMatToImage<float>(originalBinary);
-        } else if (prompts.mask.getWidth() == inputSize.width
-                   && prompts.mask.getHeight() == inputSize.height) {
-            cv::threshold(maskFloat, targetFloat, 0.5, 1.0, cv::THRESH_BINARY);
-        } else {
-            std::cerr
-                << "[ERROR] Mask prompt must match either the original image size ("
-                << originalImageSize.width << "x" << originalImageSize.height
-                << ") or the SAM3 input size (" << inputSize.width << "x" << inputSize.height
-                << "); got " << prompts.mask.getWidth() << "x" << prompts.mask.getHeight() << ".\n";
-            return false;
-        }
-
-        int xMin = inputSize.width;
-        int yMin = inputSize.height;
-        int xMax = -1;
-        int yMax = -1;
-        preparedOut->maskLogitsHighRes.assign(
-            static_cast<size_t>(inputSize.width) * static_cast<size_t>(inputSize.height),
-            -20.0f);
-        for (int y = 0; y < inputSize.height; ++y) {
-            const float* row = targetFloat.ptr<float>(y);
-            for (int x = 0; x < inputSize.width; ++x) {
-                if (row[x] <= 0.5f) {
-                    continue;
-                }
-                preparedOut->maskLogitsHighRes[static_cast<size_t>(y) * inputSize.width + x] = 20.0f;
-                xMin = std::min(xMin, x);
-                yMin = std::min(yMin, y);
-                xMax = std::max(xMax, x);
-                yMax = std::max(yMax, y);
-            }
-        }
-
-        if (xMax < 0 || yMax < 0) {
-            std::cerr << "[ERROR] Mask prompt cannot be empty.\n";
-            return false;
-        }
-
-        preparedOut->maskLogitsShape = {
-            1,
-            1,
-            static_cast<int64_t>(inputSize.height),
-            static_cast<int64_t>(inputSize.width),
-        };
-        if (preparedOut->originalMask.getWidth() <= 0 || preparedOut->originalMask.getHeight() <= 0) {
-            preparedOut->originalMask = CVHelpers::resizeAndThresholdMask(
-                preparedOut->maskLogitsHighRes.data(),
-                inputSize.width,
-                inputSize.height,
-                originalImageSize.width,
-                originalImageSize.height,
-                0.0f);
-        }
-
-        const bool usePointPrompt =
-            prompts.maskPromptStrategy == SAM3MaskPromptStrategy::Point
-            || xMin == xMax
-            || yMin == yMax;
-        if (usePointPrompt) {
-            preparedOut->fallbackPointCoords.push_back((xMin + xMax) * 0.5f);
-            preparedOut->fallbackPointCoords.push_back((yMin + yMax) * 0.5f);
-            preparedOut->fallbackPointLabels.push_back(1);
-        } else {
-            preparedOut->fallbackPointCoords.push_back(static_cast<float>(xMin));
-            preparedOut->fallbackPointCoords.push_back(static_cast<float>(yMin));
-            preparedOut->fallbackPointLabels.push_back(2);
-            preparedOut->fallbackPointCoords.push_back(static_cast<float>(xMax));
-            preparedOut->fallbackPointCoords.push_back(static_cast<float>(yMax));
-            preparedOut->fallbackPointLabels.push_back(3);
-        }
-        return true;
-    } catch (const std::exception& error) {
-        std::cerr << "[ERROR] prepareMaskPrompt => " << error.what() << '\n';
+    Image<float> targetMask;
+    if (prompts.mask.getWidth() == originalImageSize.width
+        && prompts.mask.getHeight() == originalImageSize.height) {
+        preparedOut->originalMask = thresholdImage(prompts.mask, 0.5f);
+        targetMask = resizeAndThreshold(preparedOut->originalMask, inputSize.width, inputSize.height, 0.5f);
+    } else if (prompts.mask.getWidth() == inputSize.width
+               && prompts.mask.getHeight() == inputSize.height) {
+        targetMask = thresholdImage(prompts.mask, 0.5f);
+    } else {
+        std::cerr
+            << "[ERROR] Mask prompt must match either the original image size ("
+            << originalImageSize.width << "x" << originalImageSize.height
+            << ") or the Engine 3 input size (" << inputSize.width << "x" << inputSize.height
+            << "); got " << prompts.mask.getWidth() << "x" << prompts.mask.getHeight() << ".\n";
         return false;
     }
+
+    int xMin = inputSize.width;
+    int yMin = inputSize.height;
+    int xMax = -1;
+    int yMax = -1;
+    preparedOut->maskLogitsHighRes.assign(
+        static_cast<std::size_t>(inputSize.width) * static_cast<std::size_t>(inputSize.height),
+        -20.0f);
+
+    const auto& targetData = targetMask.getData();
+    for (int y = 0; y < inputSize.height; ++y) {
+        for (int x = 0; x < inputSize.width; ++x) {
+            const std::size_t index = static_cast<std::size_t>(y) * inputSize.width + x;
+            if (index >= targetData.size() || targetData[index] <= 0.5f) {
+                continue;
+            }
+            preparedOut->maskLogitsHighRes[index] = 20.0f;
+            xMin = std::min(xMin, x);
+            yMin = std::min(yMin, y);
+            xMax = std::max(xMax, x);
+            yMax = std::max(yMax, y);
+        }
+    }
+
+    if (xMax < 0 || yMax < 0) {
+        std::cerr << "[ERROR] Mask prompt cannot be empty.\n";
+        return false;
+    }
+
+    preparedOut->maskLogitsShape = {
+        1,
+        1,
+        static_cast<int64_t>(inputSize.height),
+        static_cast<int64_t>(inputSize.width),
+    };
+    if (preparedOut->originalMask.getWidth() <= 0 || preparedOut->originalMask.getHeight() <= 0) {
+        Image<float> logitsImage(inputSize.width, inputSize.height, 1, preparedOut->maskLogitsHighRes);
+        preparedOut->originalMask =
+            resizeAndThreshold(logitsImage, originalImageSize.width, originalImageSize.height, 0.0f);
+    }
+
+    const bool usePointPrompt =
+        prompts.maskPromptStrategy == SAM3MaskPromptStrategy::Point
+        || xMin == xMax
+        || yMin == yMax;
+    if (usePointPrompt) {
+        preparedOut->fallbackPointCoords.push_back((xMin + xMax) * 0.5f);
+        preparedOut->fallbackPointCoords.push_back((yMin + yMax) * 0.5f);
+        preparedOut->fallbackPointLabels.push_back(1);
+    } else {
+        preparedOut->fallbackPointCoords.push_back(static_cast<float>(xMin));
+        preparedOut->fallbackPointCoords.push_back(static_cast<float>(yMin));
+        preparedOut->fallbackPointLabels.push_back(2);
+        preparedOut->fallbackPointCoords.push_back(static_cast<float>(xMax));
+        preparedOut->fallbackPointCoords.push_back(static_cast<float>(yMax));
+        preparedOut->fallbackPointLabels.push_back(3);
+    }
+    return true;
 }
 
 void SAM3::buildImagePromptInputs(const SAM3Prompts& prompts,
@@ -209,29 +207,12 @@ Image<float> SAM3::createImageMaskFromLogits(const float* logits,
         return Image<float>();
     }
 
-    cv::Mat lowRes(maskHeight, maskWidth, CV_32FC1, const_cast<float*>(logits));
-    cv::Mat upsampledInput;
     const SAM3Size inputSize = getInputSize();
-    cv::resize(
-        lowRes,
-        upsampledInput,
-        cv::Size(inputSize.width, inputSize.height),
-        0.0,
-        0.0,
-        cv::INTER_LINEAR);
-
-    cv::Mat upsampledOriginal;
-    cv::resize(
-        upsampledInput,
-        upsampledOriginal,
-        cv::Size(originalImageSize.width, originalImageSize.height),
-        0.0,
-        0.0,
-        cv::INTER_LINEAR);
-
-    cv::Mat binary;
-    cv::threshold(upsampledOriginal, binary, 0.0, 1.0, cv::THRESH_BINARY);
-    return CVHelpers::cvMatToImage<float>(binary);
+    Image<float> lowRes(maskWidth, maskHeight, 1);
+    std::copy(logits, logits + static_cast<std::size_t>(maskWidth) * maskHeight, lowRes.getData().begin());
+    Image<float> inputRes = lowRes.resize(inputSize.width, inputSize.height);
+    Image<float> originalRes = inputRes.resize(originalImageSize.width, originalImageSize.height);
+    return thresholdImage(originalRes, 0.0f);
 }
 
 Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
@@ -349,24 +330,4 @@ Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
     }
 }
 
-Image<float> SAM3::inferSingleFrameTensor(const float* encoderInputData,
-                                          size_t elementCount,
-                                          const SAM3Size& originalImageSize,
-                                          const SAM3Prompts& prompts)
-{
-    if (!preprocessImageTensor(encoderInputData, elementCount)) {
-        return Image<float>();
-    }
-    return inferSingleFrame(originalImageSize, prompts);
-}
-
-Image<float> SAM3::inferSingleFrameTensor(const std::vector<float>& encoderInputData,
-                                          const SAM3Size& originalImageSize,
-                                          const SAM3Prompts& prompts)
-{
-    return inferSingleFrameTensor(
-        encoderInputData.data(),
-        encoderInputData.size(),
-        originalImageSize,
-        prompts);
-}
+} // namespace smseg_sam3
