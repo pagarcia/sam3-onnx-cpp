@@ -789,7 +789,7 @@ class Sam3OnnxTrackerSession:
 
         # The object is explicitly present in a user-provided mask, so force a positive
         # object-presence signal even though the exported decoder cannot ingest masks directly.
-        object_present_logits = np.ascontiguousarray(np.ones((1, 1), dtype=np.float32))
+        object_present_logits = np.ascontiguousarray(np.full((1, 1), 10.0, dtype=np.float32))
 
         t_mem = time.time()
         mem = self._run_memory_encoder(
@@ -805,6 +805,8 @@ class Sam3OnnxTrackerSession:
             maskmem_features=_to_numpy(mem["maskmem_features"]),
             maskmem_pos_enc=_to_numpy(mem["maskmem_pos_enc"]),
             obj_ptr=_to_numpy(dec["obj_ptr"]),
+            object_score_logits=object_present_logits,
+            eff_iou_score=1.0,
         )
         return state, prepared_mask.mask_uint8, dec_ms, mem_ms
 

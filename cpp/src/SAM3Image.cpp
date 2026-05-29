@@ -233,6 +233,14 @@ Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
         return Image<float>(originalImageSize.width, originalImageSize.height, 1);
     }
 
+    if (hasMaskPrompt(prompts)) {
+        PreparedSAM3MaskPrompt preparedMask;
+        if (prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
+            return preparedMask.originalMask;
+        }
+        return Image<float>(originalImageSize.width, originalImageSize.height, 1);
+    }
+
     std::vector<float> promptPoints;
     std::vector<int64_t> promptLabels;
     std::vector<float> promptBoxes;

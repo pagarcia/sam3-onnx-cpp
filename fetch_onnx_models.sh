@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ID="onnx-community/sam3-tracker-ONNX"
+HF_REVISION="429305c8a5b3de597243d919a07e4e6bdcd00ef7"
 OUTDIR="${SCRIPT_DIR}/checkpoints/sam3"
 
 VARIANT="${1:-fp32}"   # fp32 | fp16 | clean
@@ -33,18 +34,20 @@ elif [[ "${VARIANT}" != "fp32" ]]; then
 fi
 
 echo "[INFO] Variant: ${VARIANT}"
+echo "[INFO] HF revision: ${HF_REVISION}"
 echo "[INFO] Downloading to ${OUTDIR} ..."
 
 python -c "
 from huggingface_hub import hf_hub_download
 import os
 repo='${REPO_ID}'
+revision='${HF_REVISION}'
 out='${OUTDIR}'
 files=['${ENC}','${ENC_DATA}','${DEC}','${DEC_DATA}']
 os.makedirs(out, exist_ok=True)
 for f in files:
-  hf_hub_download(repo_id=repo, filename=f, local_dir=out)
-print('[OK] Downloaded:\\n  ' + '\\n  '.join(files))
+  hf_hub_download(repo_id=repo, filename=f, revision=revision, local_dir=out)
+print('[OK] Downloaded from ' + repo + '@' + revision + ':\\n  ' + '\\n  '.join(files))
 "
 
 echo "[OK] Done."

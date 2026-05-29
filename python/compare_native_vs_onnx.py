@@ -24,6 +24,7 @@ from prompt_spec_utils import (
     prompt_annotations_from_spec,
     save_prompt_spec as _shared_save_prompt_spec,
 )
+from sam3_revision import ensure_sam3_revision
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -352,6 +353,7 @@ def _install_optional_sam3_stubs() -> None:
 
 
 def _build_native_model(sam3_repo: Path, checkpoint: str):
+    ensure_sam3_revision(sam3_repo)
     _add_import_paths(sam3_repo)
     _install_optional_sam3_stubs()
     from sam3.model_builder import build_sam3_image_model

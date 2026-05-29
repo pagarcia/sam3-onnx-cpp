@@ -1,5 +1,6 @@
 # sam3-onnx-cpp/export/onnx_export.py
 import argparse
+import json
 import sys
 import types
 from dataclasses import dataclass
@@ -7,6 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from python.sam3_revision import PRE31_SAM3_COMMIT, ensure_sam3_revision, sync_sam3_repo
 
 
 def _repo_root() -> Path:
@@ -199,12 +203,35 @@ def _save_video_constants(model, outdir: Path, variant) -> None:
     print(f"[INFO] Saved video constants [{variant.token or 'default'}]: {constants_path}")
 
 
+def _save_export_metadata(outdir: Path, sam3_repo: Path, sam3_revision: str, args) -> None:
+    metadata = {
+        "sam3_repo": str(sam3_repo),
+        "sam3_revision": sam3_revision,
+        "expected_sam3_revision": args.sam3_revision,
+        "checkpoint": str(Path(args.checkpoint).resolve()) if args.checkpoint else "",
+        "load_from_hf": bool(args.load_from_hf),
+        "precisions": _parse_csv(args.precisions),
+        "exporter": "sam3-onnx-cpp/export/onnx_export.py",
+    }
+    metadata_path = outdir / "sam3_export_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[INFO] Metadata    : {metadata_path}")
+
+
 def main(args) -> None:
     sam3_repo = Path(args.sam3_repo).resolve() if args.sam3_repo else _default_sam3_repo()
+    if args.sync_sam3_repo:
+        sync_sam3_repo(sam3_repo, expected=args.sam3_revision)
     if not sam3_repo.exists():
         raise SystemExit(
-            f"SAM3 repo not found at {sam3_repo}. Pass --sam3-repo to the local facebookresearch/sam3 clone."
+            f"SAM3 repo not found at {sam3_repo}. Pass --sam3-repo to the local facebookresearch/sam3 clone "
+            "or add --sync-sam3-repo."
         )
+    sam3_revision = ensure_sam3_revision(
+        sam3_repo,
+        expected=args.sam3_revision,
+        allow_mismatch=args.allow_sam3_revision_mismatch,
+    )
 
     _add_import_paths(sam3_repo)
     _install_optional_sam3_stubs()
@@ -220,6 +247,7 @@ def main(args) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] SAM3 repo   : {sam3_repo}")
+    print(f"[INFO] SAM3 commit : {sam3_revision}")
     print(f"[INFO] Output dir  : {outdir}")
     if args.checkpoint:
         print(f"[INFO] Checkpoint  : {Path(args.checkpoint).resolve()}")
@@ -248,6 +276,8 @@ def main(args) -> None:
         export_memory_encoder(mem_enc, str(outdir), variant)
         _save_video_constants(model, outdir, variant)
 
+    _save_export_metadata(outdir, sam3_repo, sam3_revision, args)
+
     print("[INFO] Export complete.")
 
 
@@ -269,6 +299,21 @@ if __name__ == "__main__":
         "--sam3-repo",
         default="",
         help="Path to a local clone of the SAM3 repo. Defaults to ../sam3 next to this repo.",
+    )
+    parser.add_argument(
+        "--sam3-revision",
+        default=PRE31_SAM3_COMMIT,
+        help="Expected local SAM3 git revision for reproducible exports.",
+    )
+    parser.add_argument(
+        "--allow-sam3-revision-mismatch",
+        action="store_true",
+        help="Allow exporting with a local SAM3 checkout that is not at --sam3-revision.",
+    )
+    parser.add_argument(
+        "--sync-sam3-repo",
+        action="store_true",
+        help="Fetch and checkout --sam3-revision in --sam3-repo before exporting.",
     )
     parser.add_argument(
         "--outdir",

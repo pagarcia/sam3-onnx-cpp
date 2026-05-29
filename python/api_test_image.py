@@ -35,6 +35,8 @@ import numpy as np
 from PyQt5 import QtWidgets
 from PIL import Image
 
+from sam3_revision import ensure_sam3_revision
+
 
 def _add_sam3_repo_to_syspath():
     """
@@ -142,7 +144,9 @@ def main():
     mode_bbox = args.prompt == "bounding_box"
     print(f"[INFO] Prompt mode: {'bounding_box' if mode_bbox else 'seed_points'}")
     if sam3_repo:
+        sam3_revision = ensure_sam3_revision(sam3_repo)
         print(f"[INFO] Using local sam3 repo: {sam3_repo}")
+        print(f"[INFO] SAM3 commit: {sam3_revision}")
 
     # Import torch + sam3 after sys.path adjustment
     try:

@@ -79,6 +79,13 @@ export script focuses on the pieces that are still needed for video tracking:
 - `video_constants_*.npz`: stores tracker constants that the runtime needs
   alongside the ONNX graphs.
 
+The standalone download helpers fetch those hosted image ONNX artifacts from a
+frozen `onnx-community/sam3-tracker-ONNX` revision:
+
+```text
+429305c8a5b3de597243d919a07e4e6bdcd00ef7
+```
+
 The rationale is practical portability. SAM3 has more export-sensitive internals
 than SAM2, especially around tracker attention and rotary position handling, so
 the repo avoids re-exporting working image artifacts and concentrates the custom
@@ -249,6 +256,24 @@ The exporter expects a local SAM3 checkout next to this repo:
 /Users/pgarcia/Documents/sam3
 /Users/pgarcia/Documents/sam3-onnx-cpp
 ```
+
+Tracker exports are pinned to the official Meta pre-SAM 3.1 source revision:
+
+```text
+86ed77094094e5cabb16b0414ec60c5ba9ce0a0f
+Meta SAM3 pre-3.1, 2026-03-16, before SAM 3.1 Object Multiplex
+```
+
+Before exporting, put the sibling SAM3 checkout at that exact revision:
+
+```bash
+python python/fetch_sam3_repo.py
+```
+
+`export/onnx_export.py` verifies this revision by default and aborts on a
+mismatch. Use `--sync-sam3-repo` if the exporter should fetch and checkout the
+pinned revision before export. Use `--allow-sam3-revision-mismatch` only for
+deliberate experiments.
 
 On a CPU-only Mac, fp32-only export is the clean path:
 
@@ -672,7 +697,8 @@ The tensor must match the encoder input shape exactly, normally `1 x 3 x H x W`,
 
 ## Native Reference Demo
 
-The native reference path uses the sibling `../sam3` checkout:
+The native reference path uses the sibling `../sam3` checkout and enforces the
+same pre-SAM 3.1 source revision used by the ONNX exporter:
 
 ```bash
 python python/api_test_image.py --prompt seed_points

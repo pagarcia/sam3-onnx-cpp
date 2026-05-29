@@ -210,6 +210,18 @@ int bestScoreIndex(const std::vector<float>& scores, std::size_t maskCount)
     return best;
 }
 
+smseg_sam3::SAM3MaskCandidates singleAuthoritativeMaskCandidate(const Image<float>& mask)
+{
+    smseg_sam3::SAM3MaskCandidates result;
+    result.selectedMask = mask;
+    if (mask.getWidth() > 0 && mask.getHeight() > 0 && mask.getChannels() == 1) {
+        result.masks.push_back(mask);
+        result.scores.push_back(1.0f);
+        result.selectedIndex = 0;
+    }
+    return result;
+}
+
 bool copyMaskPlaneTensor(const Ort::Value& tensor,
                          int planeIndex,
                          std::vector<float>* logitsOut,
@@ -593,7 +605,7 @@ SAM3MaskCandidates SAM3::previewConditioningFrameCandidates(const SAM3Size& orig
     if (hasMaskPrompt(prompts)) {
         PreparedSAM3MaskPrompt preparedMask;
         if (prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
-            result.selectedMask = preparedMask.originalMask;
+            result = singleAuthoritativeMaskCandidate(preparedMask.originalMask);
             return result;
         }
         result.selectedMask = Image<float>(originalImageSize.width, originalImageSize.height, 1);
@@ -886,7 +898,9 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         }
         const auto candidateStart = std::chrono::steady_clock::now();
         SAM3MaskCandidates trackerMaskCandidates =
-            collectTrackerMaskCandidates(decoderOutputs, originalImageSize);
+            denseMaskConditioning
+                ? singleAuthoritativeMaskCandidate(preparedMask.originalMask)
+                : collectTrackerMaskCandidates(decoderOutputs, originalImageSize);
         timings.candidateMs += frameElapsedMs(candidateStart);
         timings.candidateCount =
             static_cast<int>(trackerMaskCandidates.masks.size());
@@ -964,7 +978,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             currentVisionShape));
         std::vector<float> objectPresentLogitsStorage;
         if (denseMaskConditioning) {
-            objectPresentLogitsStorage = {1.0f};
+            objectPresentLogitsStorage = {10.0f};
             memoryEncoderInputs.push_back(createTensor<float>(
                 m_memoryInfo,
                 objectPresentLogitsStorage,
@@ -1001,6 +1015,11 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             decoderOutputs,
             memoryEncoderOutputs,
             m_segmentFrameIndex);
+        if (denseMaskConditioning) {
+            frameState.objectScoreLogit = 10.0f;
+            frameState.effIouScore = 1.0f;
+            frameState.hasEffIouScore = true;
+        }
         timings.captureStateMs += frameElapsedMs(captureStateStart);
         const auto stateUpdateStart = std::chrono::steady_clock::now();
         m_lastTrackerFrameState = frameState;
