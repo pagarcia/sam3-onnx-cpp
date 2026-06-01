@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SAM3_REPO = REPO_ROOT.parent / "sam3"
 DEFAULT_ONNX_DIR = REPO_ROOT / "checkpoints" / "sam3" / "video_onnx"
 DEFAULT_CKPT = Path(
-    r"C:\Users\Pablo\.cache\huggingface\hub\models--facebook--sam3\snapshots\3c879f39826c281e95690f02c7821c4de09afae7\sam3.pt"
+    os.getenv("SAM3_CHECKPOINT", REPO_ROOT / "checkpoints" / "sam3" / "sam3.pt")
 )
 TARGET_SIZE = 1008
 DEFAULT_RUN_ORDER = "onnx,native"
