@@ -168,6 +168,47 @@ def export_image_decoder(model, outdir: str, variant: ExportVariant) -> None:
     )
 
 
+def export_image_decoder_mask(model, outdir: str, variant: ExportVariant) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, variant.filename("image_decoder_mask.onnx"))
+
+    point_coords = torch.randn(1, 2, 2, dtype=torch.float32)
+    point_labels = torch.tensor([[1, 0]], dtype=torch.int32)
+    image_embed = torch.randn(1, 256, 72, 72, dtype=torch.float32)
+    high_res_0 = torch.randn(1, 32, 288, 288, dtype=torch.float32)
+    high_res_1 = torch.randn(1, 64, 144, 144, dtype=torch.float32)
+    mask_inputs = torch.randn(1, 1, 288, 288, dtype=torch.float32)
+
+    _export_model(
+        model,
+        (point_coords, point_labels, image_embed, high_res_0, high_res_1, mask_inputs),
+        path,
+        label=variant.label("image decoder mask"),
+        input_names=[
+            "point_coords",
+            "point_labels",
+            "image_embed",
+            "high_res_feats_0",
+            "high_res_feats_1",
+            "mask_inputs",
+        ],
+        output_names=[
+            "obj_ptr",
+            "pred_mask",
+            "pred_mask_high_res",
+            "object_score_logits",
+            "iou_scores",
+            "pred_multimasks",
+            "pred_multimasks_high_res",
+        ],
+        dynamic_axes={
+            "point_coords": {1: "num_points"},
+            "point_labels": {1: "num_points"},
+        },
+        variant=variant,
+    )
+
+
 def export_memory_attention(model, outdir: str, variant: ExportVariant) -> None:
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, variant.filename("memory_attention.onnx"))

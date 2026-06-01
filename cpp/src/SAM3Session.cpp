@@ -949,6 +949,25 @@ bool preloadCudaWindowsRuntime()
 }
 #endif
 
+std::string trackerMaskDecoderPathFor(const std::string& decoderPath)
+{
+    const std::filesystem::path path(decoderPath);
+    const std::string stem = path.stem().string();
+    constexpr const char* prefix = "image_decoder";
+    if (stem.rfind("image_decoder_mask", 0) == 0 || stem.rfind(prefix, 0) != 0) {
+        return {};
+    }
+
+    const std::string maskStem =
+        std::string("image_decoder_mask") + stem.substr(std::char_traits<char>::length(prefix));
+    const std::filesystem::path maskPath = path.parent_path() / (maskStem + path.extension().string());
+    std::error_code error;
+    if (!std::filesystem::exists(maskPath, error)) {
+        return {};
+    }
+    return maskPath.string();
+}
+
 } // namespace
 
 namespace smseg_sam3 {
@@ -982,7 +1001,9 @@ bool SAM3::clearSessions()
     try {
         m_encoderSession.reset();
         m_imageDecoderSession.reset();
+        m_imageMaskDecoderSession.reset();
         m_trackerDecoderSession.reset();
+        m_trackerMaskDecoderSession.reset();
         m_memoryAttentionSession.reset();
         m_memoryEncoderSession.reset();
 
@@ -990,8 +1011,12 @@ bool SAM3::clearSessions()
         m_encoderOutputNodes.clear();
         m_imageDecoderInputNodes.clear();
         m_imageDecoderOutputNodes.clear();
+        m_imageMaskDecoderInputNodes.clear();
+        m_imageMaskDecoderOutputNodes.clear();
         m_trackerDecoderInputNodes.clear();
         m_trackerDecoderOutputNodes.clear();
+        m_trackerMaskDecoderInputNodes.clear();
+        m_trackerMaskDecoderOutputNodes.clear();
         m_memoryAttentionInputNodes.clear();
         m_memoryAttentionOutputNodes.clear();
         m_memoryEncoderInputNodes.clear();
@@ -1001,8 +1026,12 @@ bool SAM3::clearSessions()
         m_encoderOutputNames.clear();
         m_imageDecoderInputNames.clear();
         m_imageDecoderOutputNames.clear();
+        m_imageMaskDecoderInputNames.clear();
+        m_imageMaskDecoderOutputNames.clear();
         m_trackerDecoderInputNames.clear();
         m_trackerDecoderOutputNames.clear();
+        m_trackerMaskDecoderInputNames.clear();
+        m_trackerMaskDecoderOutputNames.clear();
         m_memoryAttentionInputNames.clear();
         m_memoryAttentionOutputNames.clear();
         m_memoryEncoderInputNames.clear();
@@ -1015,11 +1044,20 @@ bool SAM3::clearSessions()
         m_encoderImageEmb2Index = -1;
         m_imageDecoderPredMasksIndex = -1;
         m_imageDecoderIouScoresIndex = -1;
+        m_imageDecoderMaskInputIndex = -1;
+        m_imageDecoderUsesTrackerIo = false;
+        m_imageMaskDecoderPredMasksIndex = -1;
+        m_imageMaskDecoderIouScoresIndex = -1;
+        m_imageMaskDecoderMaskInputIndex = -1;
+        m_imageMaskDecoderUsesTrackerIo = false;
         m_trackerDecoderObjPtrIndex = -1;
         m_trackerDecoderPredMaskHighResIndex = -1;
         m_trackerDecoderPredMultimasksHighResIndex = -1;
         m_trackerDecoderObjectScoreIndex = -1;
         m_trackerDecoderIouScoresIndex = -1;
+        m_trackerMaskDecoderObjPtrIndex = -1;
+        m_trackerMaskDecoderObjectScoreIndex = -1;
+        m_trackerMaskDecoderIouScoresIndex = -1;
         m_memoryAttentionFusedFeatIndex = -1;
         m_memoryEncoderFeaturesIndex = -1;
         m_memoryEncoderPosIndex = -1;
@@ -1301,6 +1339,15 @@ bool SAM3::initializeImage(const std::string& encoderPath,
                            int threadsNumber,
                            const std::string& device)
 {
+    return initializeImage(encoderPath, decoderPath, std::string(), threadsNumber, device);
+}
+
+bool SAM3::initializeImage(const std::string& encoderPath,
+                           const std::string& decoderPath,
+                           const std::string& constantsPath,
+                           int threadsNumber,
+                           const std::string& device)
+{
     clearSessions();
     m_device = device;
 
@@ -1347,6 +1394,20 @@ bool SAM3::initializeImage(const std::string& encoderPath,
             &m_imageDecoderOutputNames)) {
         return false;
     }
+    const std::string imageMaskDecoderPath = trackerMaskDecoderPathFor(decoderPath);
+    if (!imageMaskDecoderPath.empty()) {
+        if (!initializeNamedSession(
+                &m_imageMaskDecoderSession,
+                m_imageDecoderEnv,
+                imageMaskDecoderPath,
+                decoderOptions,
+                &m_imageMaskDecoderInputNodes,
+                &m_imageMaskDecoderOutputNodes,
+                &m_imageMaskDecoderInputNames,
+                &m_imageMaskDecoderOutputNames)) {
+            return false;
+        }
+    }
 
     if (m_encoderInputNodes.empty()) {
         std::cerr << "[ERROR] Encoder did not expose its input metadata.\n";
@@ -1370,11 +1431,54 @@ bool SAM3::initializeImage(const std::string& encoderPath,
         return false;
     }
 
+    m_imageDecoderUsesTrackerIo =
+        findNodeIndex(m_imageDecoderInputNodes, "point_coords") >= 0
+        && findNodeIndex(m_imageDecoderInputNodes, "image_embed") >= 0;
+    m_imageDecoderMaskInputIndex = findNodeIndex(m_imageDecoderInputNodes, "mask_input");
+
     m_imageDecoderPredMasksIndex = findNodeIndex(m_imageDecoderOutputNodes, "pred_masks");
+    if (m_imageDecoderPredMasksIndex < 0) {
+        m_imageDecoderPredMasksIndex = findNodeIndex(m_imageDecoderOutputNodes, "pred_mask_high_res");
+    }
+    if (m_imageDecoderPredMasksIndex < 0) {
+        m_imageDecoderPredMasksIndex = findNodeIndex(m_imageDecoderOutputNodes, "pred_mask");
+    }
     m_imageDecoderIouScoresIndex = findNodeIndex(m_imageDecoderOutputNodes, "iou_scores");
     if (m_imageDecoderPredMasksIndex < 0 || m_imageDecoderIouScoresIndex < 0) {
-        std::cerr << "[ERROR] Image decoder outputs are missing pred_masks or iou_scores.\n";
+        std::cerr << "[ERROR] Image decoder outputs are missing mask logits or iou_scores.\n";
         return false;
+    }
+    if (m_imageMaskDecoderSession) {
+        m_imageMaskDecoderUsesTrackerIo =
+            findNodeIndex(m_imageMaskDecoderInputNodes, "point_coords") >= 0
+            && findNodeIndex(m_imageMaskDecoderInputNodes, "image_embed") >= 0;
+        m_imageMaskDecoderMaskInputIndex = findNodeIndex(m_imageMaskDecoderInputNodes, "mask_input");
+        m_imageMaskDecoderPredMasksIndex = findNodeIndex(m_imageMaskDecoderOutputNodes, "pred_masks");
+        if (m_imageMaskDecoderPredMasksIndex < 0) {
+            m_imageMaskDecoderPredMasksIndex =
+                findNodeIndex(m_imageMaskDecoderOutputNodes, "pred_mask_high_res");
+        }
+        if (m_imageMaskDecoderPredMasksIndex < 0) {
+            m_imageMaskDecoderPredMasksIndex = findNodeIndex(m_imageMaskDecoderOutputNodes, "pred_mask");
+        }
+        m_imageMaskDecoderIouScoresIndex = findNodeIndex(m_imageMaskDecoderOutputNodes, "iou_scores");
+        if (!m_imageMaskDecoderUsesTrackerIo
+            || m_imageMaskDecoderMaskInputIndex < 0
+            || m_imageMaskDecoderPredMasksIndex < 0
+            || m_imageMaskDecoderIouScoresIndex < 0) {
+            std::cerr << "[ERROR] Image mask decoder is missing tracker inputs, mask_inputs, mask logits, or iou_scores.\n";
+            return false;
+        }
+    }
+
+    if (m_imageDecoderUsesTrackerIo || m_imageMaskDecoderUsesTrackerIo) {
+        if (constantsPath.empty() || !modelExists(constantsPath)) {
+            std::cerr << "[ERROR] Tracker-style image decoder requires video constants.\n";
+            return false;
+        }
+        if (!loadVideoConstants(constantsPath)) {
+            return false;
+        }
     }
 
     return true;
@@ -1523,6 +1627,20 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
             &m_trackerDecoderOutputNames)) {
         return false;
     }
+    const std::string maskDecoderPath = trackerMaskDecoderPathFor(decoderPath);
+    if (!maskDecoderPath.empty()) {
+        if (!initializeNamedSession(
+                &m_trackerMaskDecoderSession,
+                m_trackerDecoderEnv,
+                maskDecoderPath,
+                decoderOptions,
+                &m_trackerMaskDecoderInputNodes,
+                &m_trackerMaskDecoderOutputNodes,
+                &m_trackerMaskDecoderInputNames,
+                &m_trackerMaskDecoderOutputNames)) {
+            return false;
+        }
+    }
     if (!initializeNamedSession(
             &m_memoryAttentionSession,
             m_memoryAttentionEnv,
@@ -1582,6 +1700,17 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
         || m_trackerDecoderObjectScoreIndex < 0) {
         std::cerr << "[ERROR] Tracker decoder outputs are missing obj_ptr, pred_mask_high_res, or object_score_logits.\n";
         return false;
+    }
+    if (m_trackerMaskDecoderSession) {
+        m_trackerMaskDecoderObjPtrIndex = findNodeIndex(m_trackerMaskDecoderOutputNodes, "obj_ptr");
+        m_trackerMaskDecoderObjectScoreIndex =
+            findNodeIndex(m_trackerMaskDecoderOutputNodes, "object_score_logits");
+        m_trackerMaskDecoderIouScoresIndex = findNodeIndex(m_trackerMaskDecoderOutputNodes, "iou_scores");
+        if (m_trackerMaskDecoderObjPtrIndex < 0
+            || findNodeIndex(m_trackerMaskDecoderInputNodes, "mask_input") < 0) {
+            std::cerr << "[ERROR] Tracker mask decoder is missing obj_ptr output or mask_inputs input.\n";
+            return false;
+        }
     }
 
     m_memoryAttentionFusedFeatIndex = findNodeIndex(m_memoryAttentionOutputNodes, "fused_feat");

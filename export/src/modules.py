@@ -202,13 +202,14 @@ class ImageDecoder(nn.Module):
         self.tracker = image_model.inst_interactive_predictor.model
 
     @torch.no_grad()
-    def forward(
+    def _forward(
         self,
         point_coords: torch.Tensor,
         point_labels: torch.Tensor,
         image_embed: torch.Tensor,
         high_res_feats_0: torch.Tensor,
         high_res_feats_1: torch.Tensor,
+        mask_inputs: torch.Tensor | None,
     ):
         point_inputs = {
             "point_coords": point_coords.to(torch.float32),
@@ -225,7 +226,7 @@ class ImageDecoder(nn.Module):
         ) = self.tracker._forward_sam_heads(
             backbone_features=image_embed,
             point_inputs=point_inputs,
-            mask_inputs=None,
+            mask_inputs=mask_inputs,
             high_res_features=[high_res_feats_0, high_res_feats_1],
             multimask_output=True,
         )
@@ -237,6 +238,45 @@ class ImageDecoder(nn.Module):
             iou_scores,
             _low_res_multimasks,
             _high_res_multimasks,
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        image_embed: torch.Tensor,
+        high_res_feats_0: torch.Tensor,
+        high_res_feats_1: torch.Tensor,
+    ):
+        return self._forward(
+            point_coords,
+            point_labels,
+            image_embed,
+            high_res_feats_0,
+            high_res_feats_1,
+            mask_inputs=None,
+        )
+
+
+class ImageDecoderWithMask(ImageDecoder):
+    @torch.no_grad()
+    def forward(
+        self,
+        point_coords: torch.Tensor,
+        point_labels: torch.Tensor,
+        image_embed: torch.Tensor,
+        high_res_feats_0: torch.Tensor,
+        high_res_feats_1: torch.Tensor,
+        mask_inputs: torch.Tensor,
+    ):
+        return self._forward(
+            point_coords,
+            point_labels,
+            image_embed,
+            high_res_feats_0,
+            high_res_feats_1,
+            mask_inputs=mask_inputs,
         )
 
 

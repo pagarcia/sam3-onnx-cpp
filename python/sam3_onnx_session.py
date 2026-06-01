@@ -1526,10 +1526,14 @@ class Sam3OnnxTrackerSession:
 
     @classmethod
     def _resolve_encoder_path(cls, onnx_dir: Path) -> Path:
-        custom_candidates = [
-            onnx_dir / "image_encoder.onnx",
-            onnx_dir / "image_encoder_fp16.onnx",
-        ]
+        precision_order = cls._preferred_tracker_precisions()
+        prefer_fp16 = precision_order[0] == "fp16"
+
+        custom_candidates = (
+            [onnx_dir / "image_encoder_fp16.onnx", onnx_dir / "image_encoder.onnx"]
+            if prefer_fp16
+            else [onnx_dir / "image_encoder.onnx", onnx_dir / "image_encoder_fp16.onnx"]
+        )
         for custom_encoder in custom_candidates:
             if custom_encoder.exists():
                 return custom_encoder
@@ -1537,14 +1541,9 @@ class Sam3OnnxTrackerSession:
         repo_root = Path(__file__).resolve().parent.parent
         shared_dir = repo_root / "checkpoints" / "sam3" / "onnx"
 
-        accel = os.getenv("SAM3_ORT_ACCEL", "auto").strip().lower()
-        prefers_fp16 = accel != "cpu" and any(
-            provider in ("CUDAExecutionProvider", "TensorrtExecutionProvider")
-            for provider in ort.get_available_providers()
-        )
         encoder_candidates = (
             [shared_dir / "vision_encoder_fp16.onnx", shared_dir / "vision_encoder.onnx"]
-            if prefers_fp16
+            if prefer_fp16
             else [shared_dir / "vision_encoder.onnx", shared_dir / "vision_encoder_fp16.onnx"]
         )
 

@@ -236,9 +236,10 @@ def main(args) -> None:
     _add_import_paths(sam3_repo)
     _install_optional_sam3_stubs()
 
-    from src.modules import ImageDecoder, MemAttention, MemEncoder
+    from src.modules import ImageDecoder, ImageDecoderWithMask, MemAttention, MemEncoder
     from src.utils import (
         export_image_decoder,
+        export_image_decoder_mask,
         export_memory_attention,
         export_memory_encoder,
     )
@@ -257,6 +258,7 @@ def main(args) -> None:
     model = _build_model(args)
 
     decoder = ImageDecoder(model).eval().cpu()
+    decoder_mask = ImageDecoderWithMask(model).eval().cpu()
     mem_attn = MemAttention(model).eval().cpu()
     mem_enc = MemEncoder(model).eval().cpu()
 
@@ -272,6 +274,7 @@ def main(args) -> None:
 
     for variant in export_variants:
         export_image_decoder(decoder, str(outdir), variant)
+        export_image_decoder_mask(decoder_mask, str(outdir), variant)
         export_memory_attention(mem_attn, str(outdir), variant)
         export_memory_encoder(mem_enc, str(outdir), variant)
         _save_video_constants(model, outdir, variant)

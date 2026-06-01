@@ -71,8 +71,12 @@ Hugging Face/community ONNX artifacts because those already provide a working
 `vision_encoder.onnx` and `prompt_encoder_mask_decoder.onnx` pair. The local
 export script focuses on the pieces that are still needed for video tracking:
 
-- `image_decoder_*.onnx`: turns prompts and image embeddings into masks and
-  object pointers.
+- `image_decoder_*.onnx`: turns point prompts and image embeddings into masks
+  and object pointers for the video tracker.
+- `image_decoder_mask_*.onnx`: uses the same tracker head but also exposes
+  `mask_inputs` as a dense mask prompt for painted-mask or prior-mask
+  conditioning. Keeping this as a separate graph lets video propagation
+  preserve the original no-mask tracker contract on propagation frames.
 - `memory_attention_*.onnx`: fuses the current frame with previous mask memory.
 - `memory_encoder_*.onnx`: converts a predicted mask back into memory for later
   frames.
@@ -198,14 +202,32 @@ Expected FP32 files:
 
 ```text
 image_decoder_single.onnx
+image_decoder_mask_single.onnx
 memory_attention_single.onnx
 memory_encoder_single.onnx
 video_constants_single.npz
 image_decoder_multi.onnx
+image_decoder_mask_multi.onnx
 memory_attention_multi.onnx
 memory_encoder_multi.onnx
 video_constants_multi.npz
 ```
+
+The exported `image_decoder_mask_*` input contract is:
+
+```text
+point_coords
+point_labels
+image_embed
+high_res_feats_0
+high_res_feats_1
+mask_inputs
+```
+
+`mask_inputs` is shaped as a single-channel prompt mask
+`[1, 1, 288, 288]` at SAM3's prompt-mask resolution for the standard
+`1008x1008` image size. The regular `image_decoder_*` files intentionally keep
+the five-input point-prompt contract used by standard video propagation.
 
 ## macOS Workflow
 
@@ -454,6 +476,19 @@ For ONNX Runtime CUDA:
 ```powershell
 python -m pip uninstall -y onnxruntime
 python -m pip install onnxruntime-gpu
+```
+
+On Pascal/Volta-era GPUs, such as TITAN X Pascal, the newest
+`onnxruntime-gpu` CUDA 12/cuDNN 9 wheels may expose `CUDAExecutionProvider`
+but fail at runtime with cuDNN frontend errors such as `no kernel image is
+available for execution on the device`. Use the CUDA 11/cuDNN 8 stack and fp32
+tracker models instead:
+
+```powershell
+python -m pip uninstall -y onnxruntime onnxruntime-gpu
+python -m pip install onnxruntime-gpu==1.18.0 nvidia-cudnn-cu11==8.9.5.29
+$env:SAM3_ORT_ACCEL = "cuda"
+$env:SAM3_ORT_TRACKER_PRECISION = "fp32"
 ```
 
 ### 2. Download image ONNX files

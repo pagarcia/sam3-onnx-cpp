@@ -129,6 +129,8 @@ using TrackerMaskSelectionCallback =
 struct PreparedSAM3MaskPrompt {
     std::vector<float> maskLogitsHighRes;
     std::vector<int64_t> maskLogitsShape;
+    std::vector<float> maskPrompt;
+    std::vector<int64_t> maskPromptShape;
     Image<float> originalMask;
     std::vector<float> fallbackPointCoords;
     std::vector<int32_t> fallbackPointLabels;
@@ -244,6 +246,11 @@ public:
                          const std::string& decoderPath,
                          int threadsNumber,
                          const std::string& device = "cpu");
+    bool initializeImage(const std::string& encoderPath,
+                         const std::string& decoderPath,
+                         const std::string& constantsPath,
+                         int threadsNumber,
+                         const std::string& device = "cpu");
 
     bool initializeVideo(const std::string& encoderPath,
                          const std::string& decoderPath,
@@ -326,6 +333,9 @@ private:
                                            int maskWidth,
                                            int maskHeight,
                                            const SAM3Size& originalImageSize) const;
+    Image<float> createImageMaskFromDecoderOutput(const Ort::Value& predMasks,
+                                                  const Ort::Value& iouScores,
+                                                  const SAM3Size& originalImageSize) const;
     Image<float> createTrackerMaskFromHighRes(const Ort::Value& predMaskHighRes,
                                               const SAM3Size& originalImageSize) const;
     bool hasMaskPrompt(const SAM3Prompts& prompts) const;
@@ -350,7 +360,9 @@ private:
 private:
     std::unique_ptr<Ort::Session> m_encoderSession;
     std::unique_ptr<Ort::Session> m_imageDecoderSession;
+    std::unique_ptr<Ort::Session> m_imageMaskDecoderSession;
     std::unique_ptr<Ort::Session> m_trackerDecoderSession;
+    std::unique_ptr<Ort::Session> m_trackerMaskDecoderSession;
     std::unique_ptr<Ort::Session> m_memoryAttentionSession;
     std::unique_ptr<Ort::Session> m_memoryEncoderSession;
 
@@ -358,8 +370,12 @@ private:
     std::vector<SAM3Node> m_encoderOutputNodes;
     std::vector<SAM3Node> m_imageDecoderInputNodes;
     std::vector<SAM3Node> m_imageDecoderOutputNodes;
+    std::vector<SAM3Node> m_imageMaskDecoderInputNodes;
+    std::vector<SAM3Node> m_imageMaskDecoderOutputNodes;
     std::vector<SAM3Node> m_trackerDecoderInputNodes;
     std::vector<SAM3Node> m_trackerDecoderOutputNodes;
+    std::vector<SAM3Node> m_trackerMaskDecoderInputNodes;
+    std::vector<SAM3Node> m_trackerMaskDecoderOutputNodes;
     std::vector<SAM3Node> m_memoryAttentionInputNodes;
     std::vector<SAM3Node> m_memoryAttentionOutputNodes;
     std::vector<SAM3Node> m_memoryEncoderInputNodes;
@@ -369,8 +385,12 @@ private:
     std::vector<const char*> m_encoderOutputNames;
     std::vector<const char*> m_imageDecoderInputNames;
     std::vector<const char*> m_imageDecoderOutputNames;
+    std::vector<const char*> m_imageMaskDecoderInputNames;
+    std::vector<const char*> m_imageMaskDecoderOutputNames;
     std::vector<const char*> m_trackerDecoderInputNames;
     std::vector<const char*> m_trackerDecoderOutputNames;
+    std::vector<const char*> m_trackerMaskDecoderInputNames;
+    std::vector<const char*> m_trackerMaskDecoderOutputNames;
     std::vector<const char*> m_memoryAttentionInputNames;
     std::vector<const char*> m_memoryAttentionOutputNames;
     std::vector<const char*> m_memoryEncoderInputNames;
@@ -384,12 +404,21 @@ private:
 
     int m_imageDecoderPredMasksIndex = -1;
     int m_imageDecoderIouScoresIndex = -1;
+    int m_imageDecoderMaskInputIndex = -1;
+    bool m_imageDecoderUsesTrackerIo = false;
+    int m_imageMaskDecoderPredMasksIndex = -1;
+    int m_imageMaskDecoderIouScoresIndex = -1;
+    int m_imageMaskDecoderMaskInputIndex = -1;
+    bool m_imageMaskDecoderUsesTrackerIo = false;
 
     int m_trackerDecoderObjPtrIndex = -1;
     int m_trackerDecoderPredMaskHighResIndex = -1;
     int m_trackerDecoderPredMultimasksHighResIndex = -1;
     int m_trackerDecoderObjectScoreIndex = -1;
     int m_trackerDecoderIouScoresIndex = -1;
+    int m_trackerMaskDecoderObjPtrIndex = -1;
+    int m_trackerMaskDecoderObjectScoreIndex = -1;
+    int m_trackerMaskDecoderIouScoresIndex = -1;
 
     int m_memoryAttentionFusedFeatIndex = -1;
     int m_memoryEncoderFeaturesIndex = -1;

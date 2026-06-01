@@ -15,7 +15,6 @@ from pathlib import Path
 
 import cv2
 import onnxruntime as ort
-from PyQt5 import QtWidgets
 
 from onnx_test_utils import (
     compute_display_base,
@@ -67,6 +66,8 @@ def _resolve_image_path(arg_value: str) -> str:
     img_path = _resolve_image_path_macos()
     if img_path:
         return img_path
+
+    from PyQt5 import QtWidgets
 
     app = QtWidgets.QApplication.instance()
     owns_app = app is None

@@ -365,6 +365,16 @@ void SAM3::buildTrackerPromptInputs(const SAM3Prompts& prompts,
             prompts.points[index].y * static_cast<float>(inputSize.height) / originalImageSize.height);
         labelsOut->push_back(static_cast<int32_t>(prompts.pointLabels[index]));
     }
+
+    if (labelsOut->empty() && hasMaskPrompt(prompts)) {
+        PreparedSAM3MaskPrompt preparedMask;
+        if (!prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
+            return;
+        }
+
+        *coordsOut = preparedMask.fallbackPointCoords;
+        *labelsOut = preparedMask.fallbackPointLabels;
+    }
 }
 
 Image<float> SAM3::createTrackerMaskFromHighRes(const Ort::Value& predMaskHighRes,
@@ -896,6 +906,71 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             std::cerr << "[ERROR] inferMultiFrame => tracker decoder returned insufficient outputs.\n";
             return Image<float>();
         }
+
+        std::vector<float> denseMaskObjPtrOverride;
+        bool hasDenseMaskObjPtrOverride = false;
+        if (denseMaskConditioning && m_trackerMaskDecoderSession) {
+            try {
+                const std::vector<int64_t> pointCoordsShape = {1, static_cast<int64_t>(pointLabelsStorage.size()), 2};
+                const std::vector<int64_t> pointLabelsShape = {1, static_cast<int64_t>(pointLabelsStorage.size())};
+                std::vector<Ort::Value> maskDecoderInputs;
+                maskDecoderInputs.reserve(m_trackerMaskDecoderInputNodes.size());
+                for (const SAM3Node& inputNode : m_trackerMaskDecoderInputNodes) {
+                    const std::string name = lowerCopy(inputNode.name);
+                    if (name.find("point_coords") != std::string::npos) {
+                        maskDecoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, pointCoordsShape));
+                    } else if (name.find("point_labels") != std::string::npos) {
+                        maskDecoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, pointLabelsShape));
+                    } else if (name == "image_embed" && imageEmbedStorage) {
+                        maskDecoderInputs.push_back(createTensor<float>(m_memoryInfo, *imageEmbedStorage, currentVisionShape));
+                    } else if (name.find("high_res_feats_0") != std::string::npos
+                               || name.find("image_embeddings.0") != std::string::npos) {
+                        maskDecoderInputs.push_back(createTensorView<float>(
+                            m_memoryInfo,
+                            encoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)].GetTensorMutableData<float>(),
+                            highRes0.GetTensorTypeAndShapeInfo().GetShape()));
+                    } else if (name.find("high_res_feats_1") != std::string::npos
+                               || name.find("image_embeddings.1") != std::string::npos) {
+                        maskDecoderInputs.push_back(createTensorView<float>(
+                            m_memoryInfo,
+                            encoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)].GetTensorMutableData<float>(),
+                            highRes1.GetTensorTypeAndShapeInfo().GetShape()));
+                    } else if (name.find("mask_input") != std::string::npos) {
+                        maskDecoderInputs.push_back(createTensor<float>(
+                            m_memoryInfo,
+                            preparedMask.maskPrompt,
+                            preparedMask.maskPromptShape));
+                    } else {
+                        throw std::runtime_error("Unsupported tracker mask decoder input: " + inputNode.name);
+                    }
+                }
+                auto maskDecoderResult = runSession(
+                    m_trackerMaskDecoderSession.get(),
+                    m_trackerMaskDecoderInputNames,
+                    m_trackerMaskDecoderOutputNames,
+                    maskDecoderInputs,
+                    "trackerMaskConditioningDecoder");
+                if (maskDecoderResult.index() == 1) {
+                    std::cerr << std::get<std::string>(maskDecoderResult) << '\n';
+                    return Image<float>();
+                }
+                auto maskDecoderOutputs = std::move(std::get<0>(maskDecoderResult));
+                if (maskDecoderOutputs.size() <= static_cast<size_t>(m_trackerMaskDecoderObjPtrIndex)) {
+                    std::cerr << "[ERROR] inferMultiFrame => tracker mask decoder returned no obj_ptr.\n";
+                    return Image<float>();
+                }
+                std::vector<int64_t> scratchShape;
+                extractTensorData(
+                    maskDecoderOutputs[static_cast<size_t>(m_trackerMaskDecoderObjPtrIndex)],
+                    denseMaskObjPtrOverride,
+                    scratchShape);
+                hasDenseMaskObjPtrOverride = !denseMaskObjPtrOverride.empty();
+            } catch (const std::exception& error) {
+                std::cerr << "[ERROR] inferMultiFrame => tracker mask decoder failed: " << error.what() << '\n';
+                return Image<float>();
+            }
+        }
+
         const auto candidateStart = std::chrono::steady_clock::now();
         SAM3MaskCandidates trackerMaskCandidates =
             denseMaskConditioning
@@ -1016,6 +1091,9 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             memoryEncoderOutputs,
             m_segmentFrameIndex);
         if (denseMaskConditioning) {
+            if (hasDenseMaskObjPtrOverride) {
+                frameState.objPtr = std::move(denseMaskObjPtrOverride);
+            }
             frameState.objectScoreLogit = 10.0f;
             frameState.effIouScore = 1.0f;
             frameState.hasEffIouScore = true;

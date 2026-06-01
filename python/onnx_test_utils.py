@@ -18,6 +18,7 @@ Important:
 from __future__ import annotations
 
 import os
+import site
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,16 +31,60 @@ from onnxruntime import InferenceSession
 
 ACCEL = os.getenv("SAM3_ORT_ACCEL", "auto").lower()  # auto|cpu|cuda|trt
 
+# Keep Windows DLL directory handles alive for the process lifetime.
+_DLL_DIRECTORY_HANDLES = []
+
+
+def _add_nvidia_site_package_dll_dirs() -> None:
+    if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+        return
+
+    roots = [Path(sys.prefix) / "Lib" / "site-packages"]
+    try:
+        roots.extend(Path(path) for path in site.getsitepackages())
+    except Exception:
+        pass
+
+    rel_dirs = (
+        "nvidia/cublas/bin",
+        "nvidia/cuda_nvrtc/bin",
+        "nvidia/cuda_runtime/bin",
+        "nvidia/cudnn/bin",
+        "nvidia/cufft/bin",
+        "nvidia/curand/bin",
+        "nvidia/nvjitlink/bin",
+        "torch/lib",
+    )
+    seen: set[Path] = set()
+    for root in roots:
+        for rel_dir in rel_dirs:
+            dll_dir = (root / rel_dir).resolve()
+            if dll_dir in seen or not dll_dir.is_dir():
+                continue
+            seen.add(dll_dir)
+            try:
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(dll_dir)))
+                os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
+            except Exception:
+                pass
+
+
 # Try preloading DLLs when CUDA EP exists (helps with pip-provided runtime DLLs).
 # Set SAM3_ORT_PRELOAD_DLLS=0 if this stalls on a machine with CUDA DLLs already on PATH.
 try:
     _preload_dlls = os.getenv("SAM3_ORT_PRELOAD_DLLS", "auto").strip().lower()
     if (
         _preload_dlls not in ("0", "false", "no", "off")
-        and hasattr(ort, "preload_dlls")
         and "CUDAExecutionProvider" in ort.get_available_providers()
     ):
-        ort.preload_dlls()
+        _add_nvidia_site_package_dll_dirs()
+        if hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls(directory="")
+            except TypeError:
+                ort.preload_dlls()
+            except Exception:
+                ort.preload_dlls()
 except Exception:
     pass
 

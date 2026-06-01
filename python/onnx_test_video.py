@@ -14,7 +14,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt5 import QtWidgets
 
 from onnx_runtime_policy import (
     DEFAULT_MAX_OBJ_PTRS,
@@ -384,6 +383,8 @@ def _resolve_video(args):
     video_path = _resolve_video_macos()
     if video_path:
         return video_path
+
+    from PyQt5 import QtWidgets
 
     app = QtWidgets.QApplication.instance()
     owns_app = app is None

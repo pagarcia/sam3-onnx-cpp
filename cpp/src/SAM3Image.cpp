@@ -32,6 +32,18 @@ Image<float> resizeAndThreshold(const Image<float>& image,
     return thresholdImage(resized, threshold);
 }
 
+smseg_sam3::SAM3Size promptMaskInputSize(const smseg_sam3::SAM3Size& inputSize)
+{
+    constexpr int kSam3BackboneStride = 14;
+    constexpr int kSam3MaskPromptScale = 4;
+    if (inputSize.width <= 0 || inputSize.height <= 0) {
+        return smseg_sam3::SAM3Size();
+    }
+    return smseg_sam3::SAM3Size(
+        std::max(1, (inputSize.width / kSam3BackboneStride) * kSam3MaskPromptScale),
+        std::max(1, (inputSize.height / kSam3BackboneStride) * kSam3MaskPromptScale));
+}
+
 } // namespace
 
 namespace smseg_sam3 {
@@ -114,6 +126,19 @@ bool SAM3::prepareMaskPrompt(const SAM3Prompts& prompts,
         1,
         static_cast<int64_t>(inputSize.height),
         static_cast<int64_t>(inputSize.width),
+    };
+    const SAM3Size promptSize = promptMaskInputSize(inputSize);
+    if (promptSize.width <= 0 || promptSize.height <= 0) {
+        return false;
+    }
+    const Image<float> promptMask =
+        resizeAndThreshold(targetMask, promptSize.width, promptSize.height, 0.5f);
+    preparedOut->maskPrompt = promptMask.getData();
+    preparedOut->maskPromptShape = {
+        1,
+        1,
+        static_cast<int64_t>(promptSize.height),
+        static_cast<int64_t>(promptSize.width),
     };
     if (preparedOut->originalMask.getWidth() <= 0 || preparedOut->originalMask.getHeight() <= 0) {
         Image<float> logitsImage(inputSize.width, inputSize.height, 1, preparedOut->maskLogitsHighRes);
@@ -215,6 +240,47 @@ Image<float> SAM3::createImageMaskFromLogits(const float* logits,
     return thresholdImage(originalRes, 0.0f);
 }
 
+Image<float> SAM3::createImageMaskFromDecoderOutput(const Ort::Value& predMasks,
+                                                    const Ort::Value& iouScores,
+                                                    const SAM3Size& originalImageSize) const
+{
+    const auto maskShape = predMasks.GetTensorTypeAndShapeInfo().GetShape();
+    const auto scoreShape = iouScores.GetTensorTypeAndShapeInfo().GetShape();
+    if (maskShape.size() != 4 && maskShape.size() != 5) {
+        std::cerr << "[ERROR] Unexpected image decoder mask output shape.\n";
+        return Image<float>();
+    }
+
+    const int64_t numMasks = maskShape.size() == 5 ? maskShape[2] : maskShape[1];
+    const int64_t maskHeight = maskShape.size() == 5 ? maskShape[3] : maskShape[2];
+    const int64_t maskWidth = maskShape.size() == 5 ? maskShape[4] : maskShape[3];
+    const float* maskData = predMasks.GetTensorData<float>();
+    const float* scoreData = iouScores.GetTensorData<float>();
+    if (!maskData || !scoreData || numMasks <= 0 || maskHeight <= 0 || maskWidth <= 0) {
+        std::cerr << "[ERROR] Decoder returned empty mask data.\n";
+        return Image<float>();
+    }
+
+    const size_t scoreCount = computeElementCount(scoreShape);
+    int bestMaskIndex = 0;
+    if (scoreCount >= static_cast<size_t>(numMasks)) {
+        float bestScore = scoreData[0];
+        for (int64_t index = 1; index < numMasks; ++index) {
+            if (scoreData[index] > bestScore) {
+                bestScore = scoreData[index];
+                bestMaskIndex = static_cast<int>(index);
+            }
+        }
+    }
+
+    const size_t maskPlaneSize = static_cast<size_t>(maskHeight * maskWidth);
+    return createImageMaskFromLogits(
+        maskData + static_cast<size_t>(bestMaskIndex) * maskPlaneSize,
+        static_cast<int>(maskWidth),
+        static_cast<int>(maskHeight),
+        originalImageSize);
+}
+
 Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
                                     const SAM3Prompts& prompts)
 {
@@ -233,58 +299,140 @@ Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
         return Image<float>(originalImageSize.width, originalImageSize.height, 1);
     }
 
-    if (hasMaskPrompt(prompts)) {
-        PreparedSAM3MaskPrompt preparedMask;
-        if (prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
-            return preparedMask.originalMask;
-        }
-        return Image<float>(originalImageSize.width, originalImageSize.height, 1);
-    }
-
-    std::vector<float> promptPoints;
-    std::vector<int64_t> promptLabels;
-    std::vector<float> promptBoxes;
-    buildImagePromptInputs(prompts, originalImageSize, &promptPoints, &promptLabels, &promptBoxes);
-
-    const int64_t numPoints = static_cast<int64_t>(promptLabels.size());
-    const int64_t numBoxes = static_cast<int64_t>(promptBoxes.size() / 4);
-    const std::vector<int64_t> pointsShape = {1, 1, numPoints, 2};
-    const std::vector<int64_t> labelsShape = {1, 1, numPoints};
-    const std::vector<int64_t> boxesShape = {1, numBoxes, 4};
-
     try {
-        std::vector<Ort::Value> inputs;
-        inputs.reserve(m_imageDecoderInputNodes.size());
-        inputs.push_back(createTensor<float>(m_memoryInfo, promptPoints, pointsShape));
-        inputs.push_back(createTensor<int64_t>(m_memoryInfo, promptLabels, labelsShape));
-        inputs.push_back(createTensor<float>(m_memoryInfo, promptBoxes, boxesShape));
+        PreparedSAM3MaskPrompt preparedMask;
+        bool hasPreparedMask = false;
+        if (hasMaskPrompt(prompts)) {
+            if (!prepareMaskPrompt(prompts, originalImageSize, &preparedMask)) {
+                return Image<float>(originalImageSize.width, originalImageSize.height, 1);
+            }
+            hasPreparedMask = true;
+        }
 
-        const auto emb0Shape = m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)]
-                                   .GetTensorTypeAndShapeInfo()
-                                   .GetShape();
-        const auto emb1Shape = m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)]
-                                   .GetTensorTypeAndShapeInfo()
-                                   .GetShape();
-        const auto emb2Shape = m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)]
-                                   .GetTensorTypeAndShapeInfo()
-                                   .GetShape();
-        inputs.push_back(createTensorView<float>(
-            m_memoryInfo,
-            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)].GetTensorMutableData<float>(),
-            emb0Shape));
-        inputs.push_back(createTensorView<float>(
-            m_memoryInfo,
-            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)].GetTensorMutableData<float>(),
-            emb1Shape));
-        inputs.push_back(createTensorView<float>(
-            m_memoryInfo,
-            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)].GetTensorMutableData<float>(),
-            emb2Shape));
+        const bool useMaskDecoder = hasPreparedMask && m_imageMaskDecoderSession;
+        const bool decoderUsesTrackerIo =
+            useMaskDecoder ? m_imageMaskDecoderUsesTrackerIo : m_imageDecoderUsesTrackerIo;
+        const std::vector<SAM3Node>& decoderInputNodes =
+            useMaskDecoder ? m_imageMaskDecoderInputNodes : m_imageDecoderInputNodes;
+        const std::vector<const char*>& decoderInputNames =
+            useMaskDecoder ? m_imageMaskDecoderInputNames : m_imageDecoderInputNames;
+        const std::vector<const char*>& decoderOutputNames =
+            useMaskDecoder ? m_imageMaskDecoderOutputNames : m_imageDecoderOutputNames;
+        const int decoderPredMasksIndex =
+            useMaskDecoder ? m_imageMaskDecoderPredMasksIndex : m_imageDecoderPredMasksIndex;
+        const int decoderIouScoresIndex =
+            useMaskDecoder ? m_imageMaskDecoderIouScoresIndex : m_imageDecoderIouScoresIndex;
+        Ort::Session* decoderSession =
+            useMaskDecoder ? m_imageMaskDecoderSession.get() : m_imageDecoderSession.get();
+
+        std::vector<float> promptPoints;
+        std::vector<int64_t> promptLabels;
+        std::vector<float> promptBoxes;
+        std::vector<float> trackerPointCoords;
+        std::vector<int32_t> trackerPointLabels;
+        if (decoderUsesTrackerIo) {
+            buildTrackerPromptInputs(
+                prompts,
+                originalImageSize,
+                &trackerPointCoords,
+                &trackerPointLabels);
+        } else {
+            buildImagePromptInputs(
+                prompts,
+                originalImageSize,
+                &promptPoints,
+                &promptLabels,
+                &promptBoxes);
+        }
+
+        const int64_t numPoints = static_cast<int64_t>(promptLabels.size());
+        const int64_t numBoxes = static_cast<int64_t>(promptBoxes.size() / 4);
+        const int64_t trackerNumPoints = static_cast<int64_t>(trackerPointLabels.size());
+        const std::vector<int64_t> pointsShape = {1, 1, numPoints, 2};
+        const std::vector<int64_t> labelsShape = {1, 1, numPoints};
+        const std::vector<int64_t> boxesShape = {1, numBoxes, 4};
+        const std::vector<int64_t> trackerPointsShape = {1, trackerNumPoints, 2};
+        const std::vector<int64_t> trackerLabelsShape = {1, trackerNumPoints};
+
+        std::vector<float> emptyMaskLogits;
+        std::vector<int64_t> maskLogitsShape;
+        if (useMaskDecoder) {
+            if (hasPreparedMask) {
+                maskLogitsShape = preparedMask.maskPromptShape;
+            } else {
+                const SAM3Size promptSize = promptMaskInputSize(getInputSize());
+                maskLogitsShape = {1, 1, promptSize.height, promptSize.width};
+                emptyMaskLogits.assign(
+                    static_cast<std::size_t>(promptSize.width) * static_cast<std::size_t>(promptSize.height),
+                    0.0f);
+            }
+        }
+
+        const std::vector<int64_t> emb0Shape =
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)]
+                .GetTensorTypeAndShapeInfo()
+                .GetShape();
+        const std::vector<int64_t> emb1Shape =
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)]
+                .GetTensorTypeAndShapeInfo()
+                .GetShape();
+        const std::vector<int64_t> emb2Shape =
+            m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)]
+                .GetTensorTypeAndShapeInfo()
+                .GetShape();
+        const std::vector<float>* imageEmbed = nullptr;
+        if (decoderUsesTrackerIo) {
+            imageEmbed = &buildNoMemoryImageEmbedding(
+                m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)],
+                emb2Shape);
+        }
+
+        std::vector<Ort::Value> inputs;
+        inputs.reserve(decoderInputNodes.size());
+        for (const SAM3Node& inputNode : decoderInputNodes) {
+            const std::string name = lowerCopy(inputNode.name);
+            if (name.find("input_points") != std::string::npos) {
+                inputs.push_back(createTensor<float>(m_memoryInfo, promptPoints, pointsShape));
+            } else if (name.find("input_labels") != std::string::npos) {
+                inputs.push_back(createTensor<int64_t>(m_memoryInfo, promptLabels, labelsShape));
+            } else if (name.find("input_boxes") != std::string::npos) {
+                inputs.push_back(createTensor<float>(m_memoryInfo, promptBoxes, boxesShape));
+            } else if (name.find("point_coords") != std::string::npos) {
+                inputs.push_back(createTensor<float>(m_memoryInfo, trackerPointCoords, trackerPointsShape));
+            } else if (name.find("point_labels") != std::string::npos) {
+                inputs.push_back(createTensor<int32_t>(m_memoryInfo, trackerPointLabels, trackerLabelsShape));
+            } else if (name.find("mask_input") != std::string::npos) {
+                const std::vector<float>& maskLogits =
+                    hasPreparedMask ? preparedMask.maskPrompt : emptyMaskLogits;
+                inputs.push_back(createTensor<float>(m_memoryInfo, maskLogits, maskLogitsShape));
+            } else if (name.find("image_embeddings.0") != std::string::npos
+                       || name.find("high_res_feats_0") != std::string::npos) {
+                inputs.push_back(createTensorView<float>(
+                    m_memoryInfo,
+                    m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)].GetTensorMutableData<float>(),
+                    emb0Shape));
+            } else if (name.find("image_embeddings.1") != std::string::npos
+                       || name.find("high_res_feats_1") != std::string::npos) {
+                inputs.push_back(createTensorView<float>(
+                    m_memoryInfo,
+                    m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)].GetTensorMutableData<float>(),
+                    emb1Shape));
+            } else if (name.find("image_embeddings.2") != std::string::npos) {
+                inputs.push_back(createTensorView<float>(
+                    m_memoryInfo,
+                    m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)].GetTensorMutableData<float>(),
+                    emb2Shape));
+            } else if (name == "image_embed" && imageEmbed) {
+                inputs.push_back(createTensor<float>(m_memoryInfo, *imageEmbed, emb2Shape));
+            } else {
+                throw std::runtime_error("Unsupported image decoder input: " + inputNode.name);
+            }
+        }
 
         auto result = runSession(
-            m_imageDecoderSession.get(),
-            m_imageDecoderInputNames,
-            m_imageDecoderOutputNames,
+            decoderSession,
+            decoderInputNames,
+            decoderOutputNames,
             inputs,
             "imageDecoder");
         if (result.index() == 1) {
@@ -293,45 +441,14 @@ Image<float> SAM3::inferSingleFrame(const SAM3Size& originalImageSize,
         }
 
         auto outputs = std::move(std::get<0>(result));
-        if (outputs.size() <= static_cast<size_t>(std::max(m_imageDecoderPredMasksIndex, m_imageDecoderIouScoresIndex))) {
+        if (outputs.size() <= static_cast<size_t>(std::max(decoderPredMasksIndex, decoderIouScoresIndex))) {
             std::cerr << "[ERROR] Image decoder returned insufficient outputs.\n";
             return Image<float>();
         }
 
-        const Ort::Value& predMasks = outputs[static_cast<size_t>(m_imageDecoderPredMasksIndex)];
-        const Ort::Value& iouScores = outputs[static_cast<size_t>(m_imageDecoderIouScoresIndex)];
-        const auto maskShape = predMasks.GetTensorTypeAndShapeInfo().GetShape();
-        const auto scoreShape = iouScores.GetTensorTypeAndShapeInfo().GetShape();
-        if (maskShape.size() < 5 || scoreShape.size() < 3) {
-            std::cerr << "[ERROR] Unexpected image decoder output shapes.\n";
-            return Image<float>();
-        }
-
-        const int64_t numMasks = maskShape[2];
-        const int64_t maskHeight = maskShape[3];
-        const int64_t maskWidth = maskShape[4];
-        const float* maskData = predMasks.GetTensorData<float>();
-        const float* scoreData = iouScores.GetTensorData<float>();
-        if (!maskData || !scoreData || numMasks <= 0 || maskHeight <= 0 || maskWidth <= 0) {
-            std::cerr << "[ERROR] Decoder returned empty mask data.\n";
-            return Image<float>();
-        }
-
-        int bestMaskIndex = 0;
-        float bestScore = scoreData[0];
-        for (int64_t index = 1; index < numMasks; ++index) {
-            if (scoreData[index] > bestScore) {
-                bestScore = scoreData[index];
-                bestMaskIndex = static_cast<int>(index);
-            }
-        }
-
-        const size_t maskPlaneSize = static_cast<size_t>(maskHeight * maskWidth);
-        return createImageMaskFromLogits(
-            maskData + static_cast<size_t>(bestMaskIndex) * maskPlaneSize,
-            static_cast<int>(maskWidth),
-            static_cast<int>(maskHeight),
-            originalImageSize);
+        const Ort::Value& predMasks = outputs[static_cast<size_t>(decoderPredMasksIndex)];
+        const Ort::Value& iouScores = outputs[static_cast<size_t>(decoderIouScoresIndex)];
+        return createImageMaskFromDecoderOutput(predMasks, iouScores, originalImageSize);
     } catch (const std::exception& error) {
         std::cerr << "[ERROR] inferSingleFrame => " << error.what() << '\n';
         return Image<float>();
