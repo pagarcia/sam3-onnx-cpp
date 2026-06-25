@@ -14,6 +14,8 @@
 #include <thread>
 #include <vector>
 
+using namespace smseg_sam3;
+
 namespace {
 
 enum class PromptMode { SeedPoints, BoundingBox };

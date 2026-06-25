@@ -102,13 +102,22 @@ struct SAM3Prompts {
     SAM3MaskPromptStrategy maskPromptStrategy = SAM3MaskPromptStrategy::Box;
 };
 
+struct SAM3LogitsTensor {
+    std::vector<int64_t> shape;
+    bool empty() const noexcept { return shape.empty(); }
+};
+
 struct SAM3MaskCandidates {
     Image<float> selectedMask;
     std::vector<Image<float>> masks;
     std::vector<float> scores;
     int selectedIndex = -1;
+    SAM3LogitsTensor selectedMaskLogitsHighRes;
+    SAM3LogitsTensor multimaskLogitsHighRes;
 
     bool hasCandidates() const { return !masks.empty(); }
+    bool hasSelectedLogits() const { return !selectedMaskLogitsHighRes.empty(); }
+    bool hasMultimaskLogits() const { return !multimaskLogitsHighRes.empty(); }
 };
 
 struct SAM3MaskSelection {
@@ -229,12 +238,57 @@ struct SAM3FrameTimings {
     double memoryBuildMs = 0.0;
     double attnMs = 0.0;
     double decoderMs = 0.0;
+    double decMs = 0.0;
     double candidateMs = 0.0;
     double selectionMs = 0.0;
     double selectionLogitsMs = 0.0;
     double memMs = 0.0;
     double captureStateMs = 0.0;
     double stateUpdateMs = 0.0;
+};
+
+struct SAM3DiagnosticsOptions {
+    bool runtimeMetadata = false;
+    bool frameTimings = false;
+};
+
+struct SAM3RuntimeMetadata {
+    std::string mode;
+    std::string device;
+    SAM3Size inputSize;
+    bool videoInitialized = false;
+    bool imageInitialized = false;
+    bool hasVideoConstants = false;
+    bool decoderHasMultimasks = false;
+    bool decoderHasIouScores = false;
+    int trackerDecoderObjPtrIndex = -1;
+    int trackerDecoderPredMaskHighResIndex = -1;
+    int trackerDecoderPredMultimasksHighResIndex = -1;
+    int trackerDecoderObjectScoreIndex = -1;
+    int trackerDecoderIouScoresIndex = -1;
+    int memoryAttentionFusedFeatIndex = -1;
+    int memoryEncoderFeaturesIndex = -1;
+    int memoryEncoderPosEncIndex = -1;
+    int staticNumMemFrames = 0;
+    int staticNumObjPtrs = 0;
+    int effectiveMaxMemFrames = 0;
+    int effectiveMaxObjPtrs = 0;
+    int maxCondFramesInAttn = 0;
+    bool keepFirstCondFrame = false;
+    int memoryTemporalStrideForEval = 1;
+    bool useMemorySelection = false;
+    float mfThreshold = 0.0f;
+    std::vector<std::string> trackerDecoderOutputNames;
+    std::vector<SAM3Node> encoderInputNodes;
+    std::vector<SAM3Node> encoderOutputNodes;
+    std::vector<SAM3Node> trackerDecoderInputNodes;
+    std::vector<SAM3Node> trackerDecoderOutputNodes;
+    std::vector<SAM3Node> memoryAttentionInputNodes;
+    std::vector<SAM3Node> memoryAttentionOutputNodes;
+    std::vector<SAM3Node> memoryEncoderInputNodes;
+    std::vector<SAM3Node> memoryEncoderOutputNodes;
+    std::vector<SAM3Node> imageDecoderInputNodes;
+    std::vector<SAM3Node> imageDecoderOutputNodes;
 };
 
 class SAM3 {
@@ -279,6 +333,8 @@ public:
     bool lastFrameTimings(SAM3FrameTimings* timingsOut) const;
     bool lastTrackerFrameState(TrackerFrameState* stateOut) const;
     bool lastTrackerMaskCandidates(SAM3MaskCandidates* candidatesOut) const;
+    void setDiagnosticsOptions(const SAM3DiagnosticsOptions&) {}
+    bool runtimeMetadata(SAM3RuntimeMetadata*) const { return false; }
     bool captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const;
     void restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot);
     void resetMemory();
@@ -320,6 +376,7 @@ private:
     const std::vector<float>& buildNoMemoryImageEmbedding(
         const Ort::Value& currentVisionFeat,
         const std::vector<int64_t>& currentVisionShape);
+    void invalidateNoMemoryImageEmbeddingCache();
     void buildImagePromptInputs(const SAM3Prompts& prompts,
                                 const SAM3Size& originalImageSize,
                                 std::vector<float>* pointsOut,
@@ -446,6 +503,9 @@ private:
     int m_segmentFrameIndex = 0;
 
     std::vector<float> m_noMemoryImageEmbedScratch;
+    std::vector<int64_t> m_noMemoryImageEmbedCacheShape;
+    const float* m_noMemoryImageEmbedCacheSource = nullptr;
+    bool m_hasNoMemoryImageEmbedCache = false;
     std::vector<float> m_memoryObjPtrsScratch;
     std::vector<float> m_memoryObjTposScratch;
     std::vector<float> m_memoryMaskFeatsScratch;

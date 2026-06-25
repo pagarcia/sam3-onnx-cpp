@@ -1067,6 +1067,7 @@ bool SAM3::clearSessions()
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
+        invalidateNoMemoryImageEmbeddingCache();
 
         m_constants = SAM3Constants();
         m_hasVideoConstants = false;
@@ -1812,6 +1813,7 @@ bool SAM3::restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs)
             m_cachedEncoderHostCopy.imageEmb2.shape);
 
     m_cachedEncoderOutputs = std::move(restored);
+    invalidateNoMemoryImageEmbeddingCache();
     return true;
 }
 
@@ -1842,14 +1844,24 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
         m_cachedEncoderOutputs = std::move(std::get<0>(result));
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
+        invalidateNoMemoryImageEmbeddingCache();
         return true;
     } catch (const std::exception& error) {
         std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
+        invalidateNoMemoryImageEmbeddingCache();
         return false;
     }
+}
+
+void SAM3::invalidateNoMemoryImageEmbeddingCache()
+{
+    m_noMemoryImageEmbedScratch.clear();
+    m_noMemoryImageEmbedCacheShape.clear();
+    m_noMemoryImageEmbedCacheSource = nullptr;
+    m_hasNoMemoryImageEmbedCache = false;
 }
 
 const std::vector<float>& SAM3::buildNoMemoryImageEmbedding(
@@ -1862,11 +1874,21 @@ const std::vector<float>& SAM3::buildNoMemoryImageEmbedding(
         throw std::runtime_error("current_vision_feat tensor has no float data.");
     }
 
+    if (m_hasNoMemoryImageEmbedCache
+        && m_noMemoryImageEmbedCacheSource == currentVisionValues
+        && m_noMemoryImageEmbedCacheShape == currentVisionShape
+        && m_noMemoryImageEmbedScratch.size() == currentVisionCount) {
+        return m_noMemoryImageEmbedScratch;
+    }
+
     m_noMemoryImageEmbedScratch.resize(currentVisionCount);
     if (currentVisionCount == m_constants.noMemEmbed.size()) {
         for (size_t index = 0; index < currentVisionCount; ++index) {
             m_noMemoryImageEmbedScratch[index] = currentVisionValues[index] + m_constants.noMemEmbed[index];
         }
+        m_noMemoryImageEmbedCacheSource = currentVisionValues;
+        m_noMemoryImageEmbedCacheShape = currentVisionShape;
+        m_hasNoMemoryImageEmbedCache = true;
         return m_noMemoryImageEmbedScratch;
     }
 
@@ -1906,6 +1928,9 @@ const std::vector<float>& SAM3::buildNoMemoryImageEmbedding(
         m_noMemoryImageEmbedScratch[currentIndex] =
             currentVisionValues[currentIndex] + m_constants.noMemEmbed[noMemIndex];
     }
+    m_noMemoryImageEmbedCacheSource = currentVisionValues;
+    m_noMemoryImageEmbedCacheShape = currentVisionShape;
+    m_hasNoMemoryImageEmbedCache = true;
     return m_noMemoryImageEmbedScratch;
 }
 

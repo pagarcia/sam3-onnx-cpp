@@ -14,12 +14,25 @@ struct ImageDecoderSelection {
     std::string mode;
 };
 
+struct ImageRuntimeSelection {
+    std::string encoderPath;
+    std::string decoderPath;
+    std::string precision;
+    std::string graphProfile;
+    std::string mode;
+};
+
 struct VideoRuntimeSelection {
     std::string decoderInitPath;
     std::string decoderPropagatePath;
     std::string memoryAttentionPath;
     std::string memoryEncoderPath;
     std::string mode;
+    std::string encoderPath;
+    std::string decoderPath;
+    std::string constantsPath;
+    std::string precision;
+    std::string graphProfile;
 };
 
 inline std::string lowerCopy(std::string value)
@@ -217,6 +230,18 @@ inline std::string preferQuantizedRuntimeArtifactPath(const std::string &path,
     return path;
 }
 
+inline std::string precisionLabelForPath(const std::string &path)
+{
+    const std::string lowered = lowerCopy(path);
+    if (lowered.find("int8") != std::string::npos) {
+        return "int8";
+    }
+    if (lowered.find("fp16") != std::string::npos) {
+        return "fp16";
+    }
+    return "fp32";
+}
+
 inline ImageDecoderSelection resolveImageDecoderPath(const std::string &decoderPath,
                                                      const std::string &promptMode,
                                                      bool experimentalImagePointDecoder = false)
@@ -245,6 +270,22 @@ inline ImageDecoderSelection resolveImageDecoderPath(const std::string &decoderP
     }
 
     return {decoderPath, "legacy"};
+}
+
+inline ImageRuntimeSelection resolveImageRuntimePaths(const std::string &encoderPath,
+                                                      const std::string &decoderPath,
+                                                      const std::string &device = "cpu")
+{
+    const std::string selectedEncoder = preferQuantizedEncoderPath(encoderPath, device);
+    const ImageDecoderSelection selectedDecoder =
+        resolveImageDecoderPath(decoderPath, "seed_points", false);
+    return {
+        selectedEncoder,
+        selectedDecoder.path,
+        precisionLabelForPath(selectedEncoder),
+        selectedDecoder.mode,
+        selectedDecoder.mode,
+    };
 }
 
 inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string &decoderPath,
@@ -381,6 +422,31 @@ inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string &decoder
     }
 
     return applyVideoModuleVariants({decoderPath, decoderPath, memoryAttentionPath, memoryEncoderPath, "legacy"});
+}
+
+inline VideoRuntimeSelection resolveVideoRuntimePaths(const std::string &encoderPath,
+                                                      const std::string &decoderPath,
+                                                      const std::string &memoryAttentionPath,
+                                                      const std::string &memoryEncoderPath,
+                                                      const std::string &constantsPath,
+                                                      const std::string &device = "cpu",
+                                                      std::size_t anchorCount = 0)
+{
+    const std::string selectedEncoder = preferQuantizedEncoderPath(encoderPath, device);
+    VideoRuntimeSelection selection = resolveVideoRuntimePaths(
+        decoderPath,
+        memoryAttentionPath,
+        memoryEncoderPath,
+        anchorCount <= 1,
+        device);
+    selection.encoderPath = selectedEncoder;
+    selection.decoderPath = selection.decoderPropagatePath.empty()
+        ? decoderPath
+        : selection.decoderPropagatePath;
+    selection.constantsPath = constantsPath;
+    selection.precision = precisionLabelForPath(selectedEncoder);
+    selection.graphProfile = selection.mode;
+    return selection;
 }
 
 } // namespace ArtifactResolver

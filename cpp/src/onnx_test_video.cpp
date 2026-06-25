@@ -16,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+using namespace smseg_sam3;
+
 namespace {
 
 constexpr int kJumpFrames = 10;
