@@ -10,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <exception>
+#include <limits>
 
 namespace sam2_detail {
 
@@ -64,16 +65,15 @@ public:
     Image() : width(0), height(0), channels(1) {}
 
     Image(int w, int h, int c = 1)
-        : width(w), height(h), channels(c), data(static_cast<std::size_t>(w) * h * c) {
-        if (w < 0 || h < 0 || c <= 0) throw std::runtime_error("Invalid image dimensions/channels");
-    }
+        : width(w), height(h), channels(c), data(checkedElementCount(w, h, c)) {}
 
     Image(int w, int h, int c, const std::vector<T>& d)
-        : width(w), height(h), channels(c), data(d) {
-        if (w < 0 || h < 0 || c <= 0) throw std::runtime_error("Invalid image dimensions/channels");
-        if (data.size() != static_cast<std::size_t>(w) * h * c) {
+        : width(w), height(h), channels(c) {
+        const std::size_t expected = checkedElementCount(w, h, c);
+        if (d.size() != expected) {
             throw std::runtime_error("Data size does not match image dimensions and channel count.");
         }
+        data = d;
     }
 
     int getWidth()    const { return width; }
@@ -139,11 +139,19 @@ public:
         if (newWidth <= 0 || newHeight <= 0) {
             throw std::runtime_error("resize: invalid target size");
         }
+        if (width <= 0 || height <= 0) {
+            throw std::runtime_error("resize: invalid source size");
+        }
 
         Image<T> out(newWidth, newHeight, channels);
+        const std::vector<T>& srcData = data;
+        std::vector<T>& outData = out.getData();
 
         const double scaleX = static_cast<double>(width)  / static_cast<double>(newWidth);
         const double scaleY = static_cast<double>(height) / static_cast<double>(newHeight);
+        const std::size_t srcWidth = static_cast<std::size_t>(width);
+        const std::size_t dstWidth = static_cast<std::size_t>(newWidth);
+        const std::size_t channelCount = static_cast<std::size_t>(channels);
 
         sam2_detail::parallel_for(0, static_cast<std::size_t>(newHeight), [&](std::size_t jz) {
             const int j = static_cast<int>(jz);
@@ -163,17 +171,31 @@ public:
                 const double dx = srcX - static_cast<double>(x0);
 
                 for (int c = 0; c < channels; ++c) {
-                    const double v00 = static_cast<double>(at(x0, y0, c));
-                    const double v10 = static_cast<double>(at(x1, y0, c));
-                    const double v01 = static_cast<double>(at(x0, y1, c));
-                    const double v11 = static_cast<double>(at(x1, y1, c));
+                    const std::size_t channel = static_cast<std::size_t>(c);
+                    const std::size_t i00 =
+                        ((static_cast<std::size_t>(y0) * srcWidth) + static_cast<std::size_t>(x0))
+                        * channelCount + channel;
+                    const std::size_t i10 =
+                        ((static_cast<std::size_t>(y0) * srcWidth) + static_cast<std::size_t>(x1))
+                        * channelCount + channel;
+                    const std::size_t i01 =
+                        ((static_cast<std::size_t>(y1) * srcWidth) + static_cast<std::size_t>(x0))
+                        * channelCount + channel;
+                    const std::size_t i11 =
+                        ((static_cast<std::size_t>(y1) * srcWidth) + static_cast<std::size_t>(x1))
+                        * channelCount + channel;
+                    const double v00 = static_cast<double>(srcData[i00]);
+                    const double v10 = static_cast<double>(srcData[i10]);
+                    const double v01 = static_cast<double>(srcData[i01]);
+                    const double v11 = static_cast<double>(srcData[i11]);
 
                     // Bilinear
                     const double v0 = v00 + (v10 - v00) * dx;
                     const double v1 = v01 + (v11 - v01) * dx;
                     const double v  = v0  + (v1  - v0)  * dy;
 
-                    out.at(i, j, c) = static_cast<T>(v);
+                    outData[((jz * dstWidth) + static_cast<std::size_t>(i)) * channelCount + channel] =
+                        static_cast<T>(v);
                 }
             }
         });
@@ -182,6 +204,21 @@ public:
     }
 
 private:
+    static std::size_t checkedElementCount(int w, int h, int c) {
+        if (w < 0 || h < 0 || c <= 0) {
+            throw std::runtime_error("Invalid image dimensions/channels");
+        }
+
+        const std::size_t W = static_cast<std::size_t>(w);
+        const std::size_t H = static_cast<std::size_t>(h);
+        const std::size_t C = static_cast<std::size_t>(c);
+        constexpr std::size_t maxSize = std::numeric_limits<std::size_t>::max();
+        if ((H != 0 && W > maxSize / H) || (C != 0 && W * H > maxSize / C)) {
+            throw std::runtime_error("Image dimensions overflow addressable size.");
+        }
+        return W * H * C;
+    }
+
     inline std::size_t indexOf(int x, int y, int c) const {
         return static_cast<std::size_t>((y * width + x) * channels + c);
     }

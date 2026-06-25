@@ -19,6 +19,15 @@ size_t safeMinCount(size_t a, size_t b)
     return std::min(a, b);
 }
 
+template <typename T>
+void resizeAndClear(std::vector<T>& values, std::size_t count, const T& value = T{})
+{
+    if (values.size() != count) {
+        values.resize(count);
+    }
+    std::fill(values.begin(), values.end(), value);
+}
+
 double frameElapsedMs(std::chrono::steady_clock::time_point start)
 {
     return std::chrono::duration<double, std::milli>(
@@ -493,11 +502,14 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
     const size_t featurePlaneSize = static_cast<size_t>(64 * 72 * 72);
     const size_t objPtrSize = 256;
 
-    m_memoryMaskFeatsScratch.assign(memorySlotCount * featurePlaneSize, 0.0f);
-    m_memoryMaskPosScratch.assign(memorySlotCount * featurePlaneSize, 0.0f);
-    m_memoryMaskTposScratch.assign(memorySlotCount, 0);
-    m_memoryObjPtrsScratch.assign(objSlotCount * objPtrSize, 0.0f);
-    m_memoryObjTposScratch.assign(objSlotCount, 0.0f);
+    resizeAndClear(m_memoryMaskFeatsScratch, memorySlotCount * featurePlaneSize, 0.0f);
+    resizeAndClear(m_memoryMaskPosScratch, memorySlotCount * featurePlaneSize, 0.0f);
+    resizeAndClear(
+        m_memoryMaskTposScratch,
+        memorySlotCount,
+        decltype(m_memoryMaskTposScratch)::value_type{0});
+    resizeAndClear(m_memoryObjPtrsScratch, objSlotCount * objPtrSize, 0.0f);
+    resizeAndClear(m_memoryObjTposScratch, objSlotCount, 0.0f);
 
     size_t memoryRow = 0;
     if (m_hasConditioningState && memoryRow < memorySlotCount) {

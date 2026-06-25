@@ -52,12 +52,21 @@ inline std::string normalizePath(const std::filesystem::path &path)
     return path.lexically_normal().string();
 }
 
+inline const char *envValue(const char *primary, const char *fallback = nullptr)
+{
+    const char *value = std::getenv(primary);
+    if (value && *value) {
+        return value;
+    }
+    return fallback ? std::getenv(fallback) : nullptr;
+}
+
 inline std::string preferredRuntimeProfile();
 inline bool isLowCostCpuProfile();
 
 inline std::string preferredRuntimeProfile()
 {
-    const char *value = std::getenv("SAM2_ORT_RUNTIME_PROFILE");
+    const char *value = envValue("SAM3_ORT_RUNTIME_PROFILE", "SAM2_ORT_RUNTIME_PROFILE");
     if (!value) {
         return "";
     }
@@ -75,7 +84,7 @@ inline bool isLowCostCpuProfile()
 
 inline int preferredRuntimeThreads(int fallback, const std::string &device)
 {
-    const char *value = std::getenv("SAM2_ORT_CPU_THREADS");
+    const char *value = envValue("SAM3_ORT_CPU_THREADS", "SAM2_ORT_CPU_THREADS");
     if (value && *value) {
         try {
             return std::max(1, std::stoi(value));
@@ -91,7 +100,7 @@ inline int preferredRuntimeThreads(int fallback, const std::string &device)
 
 inline std::string preferredEncoderVariant()
 {
-    const char *value = std::getenv("SAM2_ORT_ENCODER_VARIANT");
+    const char *value = envValue("SAM3_ORT_ENCODER_VARIANT", "SAM2_ORT_ENCODER_VARIANT");
     if (!value) {
         return "auto";
     }
@@ -104,7 +113,7 @@ inline std::string preferredEncoderVariant()
 
 inline std::string preferredVideoModuleVariant()
 {
-    const char *value = std::getenv("SAM2_ORT_VIDEO_MODULE_VARIANT");
+    const char *value = envValue("SAM3_ORT_VIDEO_MODULE_VARIANT", "SAM2_ORT_VIDEO_MODULE_VARIANT");
     if (!value) {
         return "fp32";
     }
@@ -117,7 +126,9 @@ inline std::string preferredVideoModuleVariant()
 
 inline bool useExperimentalVideoInitDecoder()
 {
-    const char *value = std::getenv("SAM2_ORT_EXPERIMENTAL_VIDEO_INIT_DECODER");
+    const char *value = envValue(
+        "SAM3_ORT_EXPERIMENTAL_VIDEO_INIT_DECODER",
+        "SAM2_ORT_EXPERIMENTAL_VIDEO_INIT_DECODER");
     if (!value) {
         return false;
     }
