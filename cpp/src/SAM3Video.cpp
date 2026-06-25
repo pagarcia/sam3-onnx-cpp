@@ -908,6 +908,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         const double decoderTimeMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - decoderStart).count();
         timings.decoderMs = decoderTimeMs;
+        timings.decMs = decoderTimeMs;
         if (decoderResult.index() == 1) {
             std::cerr << std::get<std::string>(decoderResult) << '\n';
             return Image<float>();
