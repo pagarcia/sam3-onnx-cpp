@@ -252,6 +252,14 @@ struct SAM3DiagnosticsOptions {
     bool frameTimings = false;
 };
 
+// Session roles get independent graph-optimization policies. The encoder is the
+// large, well-behaved community graph; the tracker graphs are the ones that are
+// sensitive to aggressive ORT rewrites (see README "safe mode" notes).
+enum class SAM3SessionRole {
+    Encoder,
+    Tracker,
+};
+
 struct SAM3RuntimeMetadata {
     std::string mode;
     std::string device;
@@ -347,10 +355,16 @@ public:
                                     int threadsNumber,
                                     GraphOptimizationLevel optLevel,
                                     const std::string& device);
+    static void setupSessionOptions(Ort::SessionOptions& options,
+                                    int threadsNumber,
+                                    GraphOptimizationLevel optLevel,
+                                    const std::string& device,
+                                    SAM3SessionRole role);
     static std::vector<SAM3Node> getSessionNodes(Ort::Session* session, bool isInput);
 
 private:
     bool clearSessions();
+    void warmupVideoRuntime(bool includeEncoder);
     bool initializeNamedSession(std::unique_ptr<Ort::Session>* sessionOut,
                                 const Ort::Env& env,
                                 const std::string& modelPath,
@@ -415,6 +429,10 @@ private:
     void buildMemoryInputBuffers(int frameIndex);
 
 private:
+    // Single shared environment for all sessions. Declared before the sessions
+    // so it outlives them during destruction.
+    Ort::Env m_env{ORT_LOGGING_LEVEL_WARNING, "smseg_sam3"};
+
     std::unique_ptr<Ort::Session> m_encoderSession;
     std::unique_ptr<Ort::Session> m_imageDecoderSession;
     std::unique_ptr<Ort::Session> m_imageMaskDecoderSession;
@@ -470,6 +488,7 @@ private:
 
     int m_trackerDecoderObjPtrIndex = -1;
     int m_trackerDecoderPredMaskHighResIndex = -1;
+    int m_trackerDecoderPredMultimasksIndex = -1;
     int m_trackerDecoderPredMultimasksHighResIndex = -1;
     int m_trackerDecoderObjectScoreIndex = -1;
     int m_trackerDecoderIouScoresIndex = -1;
@@ -511,12 +530,6 @@ private:
     std::vector<float> m_memoryMaskFeatsScratch;
     std::vector<float> m_memoryMaskPosScratch;
     std::vector<int64_t> m_memoryMaskTposScratch;
-
-    Ort::Env m_encoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_encoder"};
-    Ort::Env m_imageDecoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_image_decoder"};
-    Ort::Env m_trackerDecoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_tracker_decoder"};
-    Ort::Env m_memoryAttentionEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_memory_attention"};
-    Ort::Env m_memoryEncoderEnv{ORT_LOGGING_LEVEL_WARNING, "engine3_memory_encoder"};
 
     Ort::MemoryInfo m_memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::string m_device = "cpu";

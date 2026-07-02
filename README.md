@@ -677,6 +677,9 @@ Noninteractive smoke tests:
 | `SAM3_ORT_DECODER_VARIANT` | `auto`, `int8`, `fp32`, `fp16` | C++ image prompt decoder precision override. |
 | `SAM3_ORT_TRACKER_PRECISION` | `auto`, `fp32`, `fp16` | Video tracker precision. |
 | `SAM3_ORT_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++/Python graph optimization override. |
+| `SAM3_ORT_ENCODER_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++ per-role override for the vision encoder session; takes precedence over `SAM3_ORT_GRAPH_OPT`. On DML the encoder now defaults to normal optimizations while tracker graphs keep safe mode. |
+| `SAM3_ORT_TRACKER_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++ per-role override for tracker sessions (decoder, memory attention, memory encoder); takes precedence over `SAM3_ORT_GRAPH_OPT`. |
+| `SAM3_ORT_WARMUP` | `auto`, `on`, `off`, `full` | C++ video warm-up after `initializeVideo`. `auto` warms tracker modules on non-CPU devices; `full` also runs one dummy encoder pass. |
 | `SAM3_ORT_CPU_THREADS` | integer, including `0` | C++ CPU thread override; `0` leaves ORT intra-op threads at its default. |
 | `SAM3_ORT_INTRA_OP_THREADS` | integer, including `0` | Python ORT thread override, and C++ fallback when `SAM3_ORT_CPU_THREADS` is unset. |
 | `SAM3_ORT_IO_BINDING` | `auto`, `0`, `1` | Python I/O binding override. |

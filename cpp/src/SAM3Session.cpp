@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -655,8 +656,35 @@ int envInt(const char* name, int fallback, int minValue = 1)
     }
 }
 
-GraphOptimizationLevel resolveGraphOptimizationLevel(const std::string& device,
-                                                     GraphOptimizationLevel fallback)
+bool parseGraphOptimizationToken(const std::string& raw, GraphOptimizationLevel* levelOut)
+{
+    const std::string lowered = lowerAsciiCopy(raw);
+    if (lowered == "disable" || lowered == "disabled" || lowered == "none" || lowered == "off") {
+        *levelOut = GraphOptimizationLevel::ORT_DISABLE_ALL;
+        return true;
+    }
+    if (lowered == "basic") {
+        *levelOut = GraphOptimizationLevel::ORT_ENABLE_BASIC;
+        return true;
+    }
+    if (lowered == "extended") {
+        *levelOut = GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
+        return true;
+    }
+    if (lowered == "all" || lowered == "full" || lowered == "aggressive") {
+        *levelOut = GraphOptimizationLevel::ORT_ENABLE_ALL;
+        return true;
+    }
+    return false;
+}
+
+struct ResolvedGraphOpt {
+    GraphOptimizationLevel level = GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
+    bool explicitEnv = false;
+};
+
+ResolvedGraphOpt resolveGraphOptimizationLevelEx(const std::string& device,
+                                                 GraphOptimizationLevel fallback)
 {
     auto platformDefault = [&]() {
 #ifdef __APPLE__
@@ -672,26 +700,43 @@ GraphOptimizationLevel resolveGraphOptimizationLevel(const std::string& device,
 
     const char* value = std::getenv("SAM3_ORT_GRAPH_OPT");
     if (!value || !*value) {
-        return platformDefault();
+        return {platformDefault(), false};
     }
 
-    const std::string lowered = lowerAsciiCopy(value);
-    if (lowered == "disable" || lowered == "disabled" || lowered == "none" || lowered == "off") {
-        return GraphOptimizationLevel::ORT_DISABLE_ALL;
-    }
-    if (lowered == "basic") {
-        return GraphOptimizationLevel::ORT_ENABLE_BASIC;
-    }
-    if (lowered == "extended") {
-        return GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
-    }
-    if (lowered == "all" || lowered == "full" || lowered == "aggressive") {
-        return GraphOptimizationLevel::ORT_ENABLE_ALL;
+    GraphOptimizationLevel parsed;
+    if (parseGraphOptimizationToken(value, &parsed)) {
+        return {parsed, true};
     }
     if (device.rfind("dml", 0) == 0 || device.rfind("directml", 0) == 0) {
-        return GraphOptimizationLevel::ORT_DISABLE_ALL;
+        return {GraphOptimizationLevel::ORT_DISABLE_ALL, false};
     }
-    return platformDefault();
+    return {platformDefault(), false};
+}
+
+GraphOptimizationLevel resolveGraphOptimizationLevel(const std::string& device,
+                                                     GraphOptimizationLevel fallback)
+{
+    return resolveGraphOptimizationLevelEx(device, fallback).level;
+}
+
+// Per-role override: SAM3_ORT_ENCODER_GRAPH_OPT / SAM3_ORT_TRACKER_GRAPH_OPT
+// take precedence over the global SAM3_ORT_GRAPH_OPT.
+ResolvedGraphOpt resolveRoleGraphOptimizationLevel(const std::string& device,
+                                                   GraphOptimizationLevel fallback,
+                                                   smseg_sam3::SAM3SessionRole role)
+{
+    const char* roleEnvName =
+        role == smseg_sam3::SAM3SessionRole::Encoder
+            ? "SAM3_ORT_ENCODER_GRAPH_OPT"
+            : "SAM3_ORT_TRACKER_GRAPH_OPT";
+    const char* value = std::getenv(roleEnvName);
+    if (value && *value) {
+        GraphOptimizationLevel parsed;
+        if (parseGraphOptimizationToken(value, &parsed)) {
+            return {parsed, true};
+        }
+    }
+    return resolveGraphOptimizationLevelEx(device, fallback);
 }
 
 std::vector<int64_t> concreteEncoderInputShape(const std::vector<int64_t>& modelShape)
@@ -1052,6 +1097,7 @@ bool SAM3::clearSessions()
         m_imageMaskDecoderUsesTrackerIo = false;
         m_trackerDecoderObjPtrIndex = -1;
         m_trackerDecoderPredMaskHighResIndex = -1;
+        m_trackerDecoderPredMultimasksIndex = -1;
         m_trackerDecoderPredMultimasksHighResIndex = -1;
         m_trackerDecoderObjectScoreIndex = -1;
         m_trackerDecoderIouScoresIndex = -1;
@@ -1153,14 +1199,25 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
                                GraphOptimizationLevel optLevel,
                                const std::string& device)
 {
+    setupSessionOptions(options, threadsNumber, optLevel, device, SAM3SessionRole::Tracker);
+}
+
+void SAM3::setupSessionOptions(Ort::SessionOptions& options,
+                               int threadsNumber,
+                               GraphOptimizationLevel optLevel,
+                               const std::string& device,
+                               SAM3SessionRole role)
+{
     const int safeThreads = std::max(1, threadsNumber);
     const int safeInterOpThreads = envInt("SAM3_ORT_INTER_OP_THREADS", 1, 1);
     const bool enableCpuArena = envBool("SAM3_ORT_CPU_ARENA", true);
     const bool enableMemPattern = envBool("SAM3_ORT_MEM_PATTERN", true);
+    const ResolvedGraphOpt resolvedOpt =
+        resolveRoleGraphOptimizationLevel(device, optLevel, role);
     options.SetIntraOpNumThreads(safeThreads);
     options.SetInterOpNumThreads(safeInterOpThreads);
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-    options.SetGraphOptimizationLevel(resolveGraphOptimizationLevel(device, optLevel));
+    options.SetGraphOptimizationLevel(resolvedOpt.level);
     if (enableCpuArena) {
         options.EnableCpuMemArena();
     } else {
@@ -1204,10 +1261,17 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
             }
         }
 
+        // Memory pattern must stay off for the DML EP.
         options.DisableMemPattern();
-        options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
-        options.AddConfigEntry("session.disable_prepacking", "1");
-        options.AddConfigEntry("session.disable_gemm_fast_gelu_fusion", "1");
+        if (role == SAM3SessionRole::Tracker && !resolvedOpt.explicitEnv) {
+            // The exported tracker graphs are sensitive to aggressive ORT
+            // rewrites, so they keep the historical DML safe mode unless an
+            // env override asks otherwise. The encoder is the stock community
+            // graph and runs with normal optimizations.
+            options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
+            options.AddConfigEntry("session.disable_prepacking", "1");
+            options.AddConfigEntry("session.disable_gemm_fast_gelu_fusion", "1");
+        }
 
         const auto appendDml = loadDmlProviderAppendFn();
         if (!appendDml) {
@@ -1365,7 +1429,8 @@ bool SAM3::initializeImage(const std::string& encoderPath,
         encoderOptions,
         threadsNumber,
         optLevel,
-        device);
+        device,
+        SAM3SessionRole::Encoder);
     setupSessionOptions(
         decoderOptions,
         threadsNumber,
@@ -1374,7 +1439,7 @@ bool SAM3::initializeImage(const std::string& encoderPath,
 
     if (!initializeNamedSession(
             &m_encoderSession,
-            m_encoderEnv,
+            m_env,
             encoderPath,
             encoderOptions,
             &m_encoderInputNodes,
@@ -1386,7 +1451,7 @@ bool SAM3::initializeImage(const std::string& encoderPath,
 
     if (!initializeNamedSession(
             &m_imageDecoderSession,
-            m_imageDecoderEnv,
+            m_env,
             decoderPath,
             decoderOptions,
             &m_imageDecoderInputNodes,
@@ -1399,7 +1464,7 @@ bool SAM3::initializeImage(const std::string& encoderPath,
     if (!imageMaskDecoderPath.empty()) {
         if (!initializeNamedSession(
                 &m_imageMaskDecoderSession,
-                m_imageDecoderEnv,
+                m_env,
                 imageMaskDecoderPath,
                 decoderOptions,
                 &m_imageMaskDecoderInputNodes,
@@ -1558,6 +1623,32 @@ bool SAM3::loadVideoConstants(const std::string& constantsPath)
     return true;
 }
 
+namespace {
+
+// SAM3_ORT_WARMUP: auto (default; tracker warmup on non-CPU devices), off,
+// on/tracker (tracker modules only), full (tracker modules plus encoder).
+int resolveWarmupMode(const std::string& device)
+{
+    const char* value = std::getenv("SAM3_ORT_WARMUP");
+    const std::string lowered = value && *value ? lowerAsciiCopy(value) : std::string("auto");
+    if (lowered == "auto") {
+        return device == "cpu" ? 0 : 1;
+    }
+    if (lowered == "0" || lowered == "off" || lowered == "false" || lowered == "no") {
+        return 0;
+    }
+    if (lowered == "full" || lowered == "all") {
+        return 2;
+    }
+    if (lowered == "1" || lowered == "on" || lowered == "true" || lowered == "yes"
+        || lowered == "tracker") {
+        return 1;
+    }
+    return device == "cpu" ? 0 : 1;
+}
+
+} // namespace
+
 bool SAM3::initializeVideo(const std::string& encoderPath,
                            const std::string& decoderPath,
                            const std::string& memoryAttentionPath,
@@ -1589,7 +1680,8 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
         encoderOptions,
         threadsNumber,
         optLevel,
-        device);
+        device,
+        SAM3SessionRole::Encoder);
     setupSessionOptions(
         decoderOptions,
         threadsNumber,
@@ -1608,7 +1700,7 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
 
     if (!initializeNamedSession(
             &m_encoderSession,
-            m_encoderEnv,
+            m_env,
             encoderPath,
             encoderOptions,
             &m_encoderInputNodes,
@@ -1619,7 +1711,7 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
     }
     if (!initializeNamedSession(
             &m_trackerDecoderSession,
-            m_trackerDecoderEnv,
+            m_env,
             decoderPath,
             decoderOptions,
             &m_trackerDecoderInputNodes,
@@ -1632,7 +1724,7 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
     if (!maskDecoderPath.empty()) {
         if (!initializeNamedSession(
                 &m_trackerMaskDecoderSession,
-                m_trackerDecoderEnv,
+                m_env,
                 maskDecoderPath,
                 decoderOptions,
                 &m_trackerMaskDecoderInputNodes,
@@ -1644,7 +1736,7 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
     }
     if (!initializeNamedSession(
             &m_memoryAttentionSession,
-            m_memoryAttentionEnv,
+            m_env,
             memoryAttentionPath,
             memoryAttentionOptions,
             &m_memoryAttentionInputNodes,
@@ -1655,7 +1747,7 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
     }
     if (!initializeNamedSession(
             &m_memoryEncoderSession,
-            m_memoryEncoderEnv,
+            m_env,
             memoryEncoderPath,
             memoryEncoderOptions,
             &m_memoryEncoderInputNodes,
@@ -1692,6 +1784,8 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
 
     m_trackerDecoderObjPtrIndex = findNodeIndex(m_trackerDecoderOutputNodes, "obj_ptr");
     m_trackerDecoderPredMaskHighResIndex = findNodeIndex(m_trackerDecoderOutputNodes, "pred_mask_high_res");
+    m_trackerDecoderPredMultimasksIndex =
+        findNodeIndex(m_trackerDecoderOutputNodes, "pred_multimasks");
     m_trackerDecoderPredMultimasksHighResIndex =
         findNodeIndex(m_trackerDecoderOutputNodes, "pred_multimasks_high_res");
     m_trackerDecoderObjectScoreIndex = findNodeIndex(m_trackerDecoderOutputNodes, "object_score_logits");
@@ -1746,7 +1840,159 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
         m_staticNumObjPtrs = std::max(1, m_constants.exportMaxObjPtrs);
     }
 
+    const int warmupMode = resolveWarmupMode(device);
+    if (warmupMode > 0) {
+        warmupVideoRuntime(warmupMode >= 2);
+    }
+
     return true;
+}
+
+void SAM3::warmupVideoRuntime(bool includeEncoder)
+{
+    if (!m_trackerDecoderSession || !m_memoryAttentionSession || !m_memoryEncoderSession
+        || !m_hasVideoConstants || m_inputShapeEncoder.size() < 4) {
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        const int64_t inputHeight = m_inputShapeEncoder[2];
+        const int64_t inputWidth = m_inputShapeEncoder[3];
+
+        const std::vector<int64_t> featShape = {1, 256, 72, 72};
+        const std::vector<int64_t> hi0Shape = {1, 32, 288, 288};
+        const std::vector<int64_t> hi1Shape = {1, 64, 144, 144};
+        const std::vector<float> featZeros(static_cast<size_t>(256) * 72 * 72, 0.0f);
+        const std::vector<float> hi0Zeros(static_cast<size_t>(32) * 288 * 288, 0.0f);
+        const std::vector<float> hi1Zeros(static_cast<size_t>(64) * 144 * 144, 0.0f);
+
+        if (includeEncoder && m_encoderSession) {
+            const std::vector<float> imageZeros(
+                static_cast<size_t>(3) * inputHeight * inputWidth, 0.0f);
+            std::vector<Ort::Value> encoderInputs;
+            encoderInputs.push_back(createTensor<float>(
+                m_memoryInfo, imageZeros, {1, 3, inputHeight, inputWidth}));
+            auto encoderResult = runSession(
+                m_encoderSession.get(),
+                m_encoderInputNames,
+                m_encoderOutputNames,
+                encoderInputs,
+                "warmupEncoder");
+            if (encoderResult.index() == 1) {
+                std::cerr << "[WARN] SAM3 encoder warmup skipped: "
+                          << std::get<std::string>(encoderResult) << '\n';
+            }
+        }
+
+        // Conditioning-style decoder pass (one positive point).
+        const std::vector<float> centerPoint = {
+            static_cast<float>(inputWidth) / 2.0f,
+            static_cast<float>(inputHeight) / 2.0f,
+        };
+        const std::vector<int32_t> centerLabel = {1};
+        std::vector<Ort::Value> condInputs;
+        condInputs.push_back(createTensor<float>(m_memoryInfo, centerPoint, {1, 1, 2}));
+        condInputs.push_back(createTensor<int32_t>(m_memoryInfo, centerLabel, {1, 1}));
+        condInputs.push_back(createTensor<float>(m_memoryInfo, featZeros, featShape));
+        condInputs.push_back(createTensor<float>(m_memoryInfo, hi0Zeros, hi0Shape));
+        condInputs.push_back(createTensor<float>(m_memoryInfo, hi1Zeros, hi1Shape));
+        auto condResult = runSession(
+            m_trackerDecoderSession.get(),
+            m_trackerDecoderInputNames,
+            m_trackerDecoderOutputNames,
+            condInputs,
+            "warmupConditioningDecoder");
+        if (condResult.index() == 1) {
+            std::cerr << "[WARN] SAM3 tracker warmup skipped: "
+                      << std::get<std::string>(condResult) << '\n';
+            return;
+        }
+
+        // Memory attention with zeroed static memory slots.
+        const size_t memorySlots = static_cast<size_t>(std::max(1, m_staticNumMemFrames));
+        const size_t objSlots = static_cast<size_t>(std::max(1, m_staticNumObjPtrs));
+        const std::vector<float> maskFeatZeros(memorySlots * 64 * 72 * 72, 0.0f);
+        const std::vector<float> objPtrZeros(objSlots * 256, 0.0f);
+        const std::vector<float> objTposZeros(objSlots, 0.0f);
+        const std::vector<int64_t> maskTposZeros(memorySlots, 0);
+        std::vector<Ort::Value> attnInputs;
+        attnInputs.push_back(createTensor<float>(m_memoryInfo, featZeros, featShape));
+        attnInputs.push_back(createTensor<float>(
+            m_memoryInfo,
+            m_constants.currentVisionPosEmbed,
+            m_constants.currentVisionPosEmbedShape));
+        attnInputs.push_back(createTensor<float>(
+            m_memoryInfo, objPtrZeros, {static_cast<int64_t>(objSlots), 256}));
+        attnInputs.push_back(createTensor<float>(
+            m_memoryInfo, objTposZeros, {static_cast<int64_t>(objSlots)}));
+        attnInputs.push_back(createTensor<float>(
+            m_memoryInfo, maskFeatZeros, {static_cast<int64_t>(memorySlots), 64, 72, 72}));
+        attnInputs.push_back(createTensor<float>(
+            m_memoryInfo, maskFeatZeros, {static_cast<int64_t>(memorySlots), 64, 72, 72}));
+        attnInputs.push_back(createTensor<int64_t>(
+            m_memoryInfo, maskTposZeros, {static_cast<int64_t>(memorySlots)}));
+        auto attnResult = runSession(
+            m_memoryAttentionSession.get(),
+            m_memoryAttentionInputNames,
+            m_memoryAttentionOutputNames,
+            attnInputs,
+            "warmupMemoryAttention");
+        if (attnResult.index() == 1) {
+            std::cerr << "[WARN] SAM3 memory attention warmup skipped: "
+                      << std::get<std::string>(attnResult) << '\n';
+        }
+
+        // Propagation-style decoder pass (empty prompt, different input shapes).
+        std::vector<float> emptyCoords;
+        std::vector<int32_t> emptyLabels;
+        std::vector<Ort::Value> propInputs;
+        propInputs.push_back(createTensor<float>(m_memoryInfo, emptyCoords, {1, 0, 2}));
+        propInputs.push_back(createTensor<int32_t>(m_memoryInfo, emptyLabels, {1, 0}));
+        propInputs.push_back(createTensor<float>(m_memoryInfo, featZeros, featShape));
+        propInputs.push_back(createTensor<float>(m_memoryInfo, hi0Zeros, hi0Shape));
+        propInputs.push_back(createTensor<float>(m_memoryInfo, hi1Zeros, hi1Shape));
+        auto propResult = runSession(
+            m_trackerDecoderSession.get(),
+            m_trackerDecoderInputNames,
+            m_trackerDecoderOutputNames,
+            propInputs,
+            "warmupPropagationDecoder");
+        if (propResult.index() == 1) {
+            std::cerr << "[WARN] SAM3 propagation warmup skipped: "
+                      << std::get<std::string>(propResult) << '\n';
+        }
+
+        // Memory encoder.
+        const std::vector<float> maskZeros(
+            static_cast<size_t>(inputHeight) * inputWidth, 0.0f);
+        const std::vector<float> scoreZeros = {0.0f};
+        const std::vector<float> maskFromPoints = {1.0f};
+        std::vector<Ort::Value> memInputs;
+        memInputs.push_back(createTensor<float>(
+            m_memoryInfo, maskZeros, {1, 1, inputHeight, inputWidth}));
+        memInputs.push_back(createTensor<float>(m_memoryInfo, featZeros, featShape));
+        memInputs.push_back(createTensor<float>(m_memoryInfo, scoreZeros, {1, 1}));
+        memInputs.push_back(createTensor<float>(m_memoryInfo, maskFromPoints, {1}));
+        auto memResult = runSession(
+            m_memoryEncoderSession.get(),
+            m_memoryEncoderInputNames,
+            m_memoryEncoderOutputNames,
+            memInputs,
+            "warmupMemoryEncoder");
+        if (memResult.index() == 1) {
+            std::cerr << "[WARN] SAM3 memory encoder warmup skipped: "
+                      << std::get<std::string>(memResult) << '\n';
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[WARN] SAM3 warmup skipped: " << error.what() << '\n';
+    }
+
+    const double elapsedMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cout << "[INFO] SAM3 video warmup"
+              << (includeEncoder ? " (with encoder)" : "")
+              << " took " << elapsedMs << " ms on " << m_device << ".\n";
 }
 
 bool SAM3::captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const

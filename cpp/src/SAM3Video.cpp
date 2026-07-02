@@ -418,7 +418,18 @@ SAM3MaskCandidates SAM3::collectTrackerMaskCandidates(
         decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMaskHighResIndex)],
         originalImageSize);
 
-    if (m_trackerDecoderPredMultimasksHighResIndex >= 0
+    // Candidate masks are thresholded logit fields; the high-res multimask
+    // output is just the low-res logits bilinearly upsampled in-graph, so
+    // resizing the low-res planes to the target size gives the same binary
+    // masks while avoiding three full-resolution resizes per slice.
+    if (m_trackerDecoderPredMultimasksIndex >= 0
+        && decoderOutputs.size() > static_cast<size_t>(m_trackerDecoderPredMultimasksIndex)) {
+        result.masks = resizeAndThresholdMaskPlanes(
+            decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMultimasksIndex)],
+            originalImageSize.width,
+            originalImageSize.height,
+            0.0f);
+    } else if (m_trackerDecoderPredMultimasksHighResIndex >= 0
         && decoderOutputs.size() > static_cast<size_t>(m_trackerDecoderPredMultimasksHighResIndex)) {
         result.masks = resizeAndThresholdMaskPlanes(
             decoderOutputs[static_cast<size_t>(m_trackerDecoderPredMultimasksHighResIndex)],
@@ -898,26 +909,36 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
             encoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)].GetTensorMutableData<float>(),
             highRes1.GetTensorTypeAndShapeInfo().GetShape()));
 
-        const auto decoderStart = std::chrono::steady_clock::now();
-        auto decoderResult = runSession(
-            m_trackerDecoderSession.get(),
-            m_trackerDecoderInputNames,
-            m_trackerDecoderOutputNames,
-            decoderInputs,
-            conditioningFrame ? "trackerConditioningDecoder" : "trackerPropagationDecoder");
-        const double decoderTimeMs = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - decoderStart).count();
-        timings.decoderMs = decoderTimeMs;
-        timings.decMs = decoderTimeMs;
-        if (decoderResult.index() == 1) {
-            std::cerr << std::get<std::string>(decoderResult) << '\n';
-            return Image<float>();
-        }
+        // When a dense mask conditions the frame and the dedicated mask decoder
+        // exists, every point-decoder output is overridden downstream (mask and
+        // candidates come from the prepared mask, the object score is forced,
+        // and obj_ptr comes from the mask decoder), so skip its run entirely.
+        const bool skipPointDecoder =
+            denseMaskConditioning && m_trackerMaskDecoderSession != nullptr;
 
-        auto decoderOutputs = std::move(std::get<0>(decoderResult));
-        if (decoderOutputs.size() <= static_cast<size_t>(std::max(m_trackerDecoderPredMaskHighResIndex, m_trackerDecoderObjectScoreIndex))) {
-            std::cerr << "[ERROR] inferMultiFrame => tracker decoder returned insufficient outputs.\n";
-            return Image<float>();
+        std::vector<Ort::Value> decoderOutputs;
+        if (!skipPointDecoder) {
+            const auto decoderStart = std::chrono::steady_clock::now();
+            auto decoderResult = runSession(
+                m_trackerDecoderSession.get(),
+                m_trackerDecoderInputNames,
+                m_trackerDecoderOutputNames,
+                decoderInputs,
+                conditioningFrame ? "trackerConditioningDecoder" : "trackerPropagationDecoder");
+            const double decoderTimeMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - decoderStart).count();
+            timings.decoderMs = decoderTimeMs;
+            timings.decMs = decoderTimeMs;
+            if (decoderResult.index() == 1) {
+                std::cerr << std::get<std::string>(decoderResult) << '\n';
+                return Image<float>();
+            }
+
+            decoderOutputs = std::move(std::get<0>(decoderResult));
+            if (decoderOutputs.size() <= static_cast<size_t>(std::max(m_trackerDecoderPredMaskHighResIndex, m_trackerDecoderObjectScoreIndex))) {
+                std::cerr << "[ERROR] inferMultiFrame => tracker decoder returned insufficient outputs.\n";
+                return Image<float>();
+            }
         }
 
         std::vector<float> denseMaskObjPtrOverride;
@@ -957,12 +978,17 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                         throw std::runtime_error("Unsupported tracker mask decoder input: " + inputNode.name);
                     }
                 }
+                const auto maskDecoderStart = std::chrono::steady_clock::now();
                 auto maskDecoderResult = runSession(
                     m_trackerMaskDecoderSession.get(),
                     m_trackerMaskDecoderInputNames,
                     m_trackerMaskDecoderOutputNames,
                     maskDecoderInputs,
                     "trackerMaskConditioningDecoder");
+                const double maskDecoderTimeMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - maskDecoderStart).count();
+                timings.decoderMs += maskDecoderTimeMs;
+                timings.decMs += maskDecoderTimeMs;
                 if (maskDecoderResult.index() == 1) {
                     std::cerr << std::get<std::string>(maskDecoderResult) << '\n';
                     return Image<float>();
@@ -1099,10 +1125,31 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
 
         auto memoryEncoderOutputs = std::move(std::get<0>(memoryEncoderResult));
         const auto captureStateStart = std::chrono::steady_clock::now();
-        TrackerFrameState frameState = captureTrackerState(
-            decoderOutputs,
-            memoryEncoderOutputs,
-            m_segmentFrameIndex);
+        TrackerFrameState frameState;
+        if (skipPointDecoder) {
+            if (!hasDenseMaskObjPtrOverride
+                || memoryEncoderOutputs.size() <= static_cast<size_t>(
+                       std::max(m_memoryEncoderFeaturesIndex, m_memoryEncoderPosIndex))) {
+                std::cerr << "[ERROR] inferMultiFrame => dense-mask conditioning is missing "
+                             "obj_ptr or memory tensors.\n";
+                return Image<float>();
+            }
+            frameState.frameIndex = m_segmentFrameIndex;
+            std::vector<int64_t> scratchShape;
+            extractTensorData(
+                memoryEncoderOutputs[static_cast<size_t>(m_memoryEncoderFeaturesIndex)],
+                frameState.maskmemFeatures,
+                scratchShape);
+            extractTensorData(
+                memoryEncoderOutputs[static_cast<size_t>(m_memoryEncoderPosIndex)],
+                frameState.maskmemPosEnc,
+                scratchShape);
+        } else {
+            frameState = captureTrackerState(
+                decoderOutputs,
+                memoryEncoderOutputs,
+                m_segmentFrameIndex);
+        }
         if (denseMaskConditioning) {
             if (hasDenseMaskObjPtrOverride) {
                 frameState.objPtr = std::move(denseMaskObjPtrOverride);
