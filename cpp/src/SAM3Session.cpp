@@ -2186,7 +2186,26 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
                 ? originalImage
                 : originalImage.resize(targetSize.width, targetSize.height);
         const std::vector<float> encoderData = encoderImage.getDataPlanarFormat();
-        Ort::Value inputTensor = createTensor<float>(m_memoryInfo, encoderData, m_inputShapeEncoder);
+        return preprocessImageTensor(encoderData);
+    } catch (const std::exception& error) {
+        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
+        m_cachedEncoderOutputs.clear();
+        m_cachedEncoderHostCopy = CachedEncoderOutputs();
+        m_hasCachedEncoderHostCopy = false;
+        invalidateNoMemoryImageEmbeddingCache();
+        return false;
+    }
+}
+
+bool SAM3::preprocessImageTensor(const std::vector<float>& encoderNchw)
+{
+    try {
+        const std::size_t expected = computeElementCount(m_inputShapeEncoder);
+        if (expected == 0 || encoderNchw.size() != expected) {
+            throw std::runtime_error("encoder tensor does not match the model input shape");
+        }
+        Ort::Value inputTensor =
+            createTensor<float>(m_memoryInfo, encoderNchw, m_inputShapeEncoder);
         std::vector<Ort::Value> inputs;
         inputs.push_back(std::move(inputTensor));
 
@@ -2207,7 +2226,7 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
         invalidateNoMemoryImageEmbeddingCache();
         return true;
     } catch (const std::exception& error) {
-        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
+        std::cerr << "[ERROR] preprocessImageTensor => " << error.what() << '\n';
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;

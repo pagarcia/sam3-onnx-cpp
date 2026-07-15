@@ -250,14 +250,53 @@ std::vector<Image<float>> resizeAndThresholdMaskPlanes(const Ort::Value& tensor,
     std::vector<Image<float>> masks;
     masks.reserve(planes);
     for (std::size_t i = 0; i < planes; ++i) {
-        masks.push_back(resizeAndThresholdMask(
-            maskData + i * planeSize,
-            maskWidth,
-            maskHeight,
-            targetWidth,
-            targetHeight,
-            threshold));
+        masks.emplace_back(targetWidth, targetHeight, 1);
     }
+    std::vector<float*> destinations;
+    destinations.reserve(planes);
+    for (Image<float>& mask : masks) {
+        destinations.push_back(mask.getData().data());
+    }
+
+    // Resize all candidate planes with one row-parallel pass. The previous
+    // implementation created and joined a new native thread group for every
+    // plane and copied every low-resolution plane into a temporary Image.
+    const double scaleX = static_cast<double>(maskWidth) / targetWidth;
+    const double scaleY = static_cast<double>(maskHeight) / targetHeight;
+    sam2_detail::parallel_for(
+        0,
+        static_cast<std::size_t>(targetHeight),
+        [&](std::size_t targetY) {
+            const double sourceY = (static_cast<double>(targetY) + 0.5) * scaleY - 0.5;
+            int y0 = static_cast<int>(std::floor(sourceY));
+            int y1 = y0 + 1;
+            if (y0 < 0) y0 = 0;
+            if (y1 >= maskHeight) y1 = maskHeight - 1;
+            const double dy = sourceY - static_cast<double>(y0);
+            for (int targetX = 0; targetX < targetWidth; ++targetX) {
+                const double sourceX = (static_cast<double>(targetX) + 0.5) * scaleX - 0.5;
+                int x0 = static_cast<int>(std::floor(sourceX));
+                int x1 = x0 + 1;
+                if (x0 < 0) x0 = 0;
+                if (x1 >= maskWidth) x1 = maskWidth - 1;
+                const double dx = sourceX - static_cast<double>(x0);
+                const std::size_t destinationIndex =
+                    targetY * static_cast<std::size_t>(targetWidth)
+                    + static_cast<std::size_t>(targetX);
+                for (std::size_t plane = 0; plane < planes; ++plane) {
+                    const float* source = maskData + plane * planeSize;
+                    const double v00 = source[static_cast<std::size_t>(y0) * maskWidth + x0];
+                    const double v10 = source[static_cast<std::size_t>(y0) * maskWidth + x1];
+                    const double v01 = source[static_cast<std::size_t>(y1) * maskWidth + x0];
+                    const double v11 = source[static_cast<std::size_t>(y1) * maskWidth + x1];
+                    const double v0 = v00 + (v10 - v00) * dx;
+                    const double v1 = v01 + (v11 - v01) * dx;
+                    const float resized = static_cast<float>(v0 + (v1 - v0) * dy);
+                    destinations[plane][destinationIndex] =
+                        resized > threshold ? 1.0f : 0.0f;
+                }
+            }
+        });
     return masks;
 }
 
@@ -830,6 +869,23 @@ Image<float> SAM3::inferMultiFrame(const Image<float>& originalImage,
     const double encTimeMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     return inferMultiFrameWithEncoderOutputs(m_cachedEncoderOutputs, originalSize, prompts, encTimeMs);
+}
+
+Image<float> SAM3::inferMultiFrameTensor(const std::vector<float>& encoderNchw,
+                                         const SAM3Size& originalImageSize,
+                                         const SAM3Prompts& prompts)
+{
+    const auto start = std::chrono::steady_clock::now();
+    if (!preprocessImageTensor(encoderNchw)) {
+        return Image<float>();
+    }
+    const double encTimeMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    return inferMultiFrameWithEncoderOutputs(
+        m_cachedEncoderOutputs,
+        originalImageSize,
+        prompts,
+        encTimeMs);
 }
 
 Image<float> SAM3::inferMultiFrameCached(const SAM3Size& originalImageSize,

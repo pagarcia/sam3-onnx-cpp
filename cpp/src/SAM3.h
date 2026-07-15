@@ -337,6 +337,7 @@ public:
                          const std::string& device = "cpu");
 
     bool preprocessImage(const Image<float>& originalImage);
+    bool preprocessImageTensor(const std::vector<float>& encoderNchw);
     bool captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const;
     bool restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs);
 
@@ -348,6 +349,9 @@ public:
                                                           const SAM3Prompts& prompts);
     Image<float> inferMultiFrame(const Image<float>& originalImage,
                                  const SAM3Prompts& prompts);
+    Image<float> inferMultiFrameTensor(const std::vector<float>& encoderNchw,
+                                       const SAM3Size& originalImageSize,
+                                       const SAM3Prompts& prompts);
     Image<float> inferMultiFrameCached(const SAM3Size& originalImageSize,
                                        const SAM3Prompts& prompts);
 
