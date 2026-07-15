@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(SAM3_ONNX)
 
+include(CTest)
+
 set(TARGET_NAME "Segment")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -12,6 +14,16 @@ if(MSVC)
   add_compile_options(/O2)
 else()
   add_compile_options(-O3 -fno-omit-frame-pointer)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(ArtifactResolverTests
+    tests/ArtifactResolverTests.cpp
+  )
+  target_include_directories(ArtifactResolverTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  add_test(NAME ArtifactResolverTests COMMAND ArtifactResolverTests)
 endif()
 
 if(NOT DEFINED OpenCV_DIR)

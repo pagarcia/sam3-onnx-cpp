@@ -215,11 +215,22 @@ struct TrackerFrameState {
     bool hasEffIouScore = false;
 };
 
+// Scalar-only view for quality gates and diagnostics. Callers that only need
+// confidence must not copy the multi-megabyte memory feature tensors.
+struct TrackerFrameMetrics {
+    int frameIndex = -1;
+    float objectScoreLogit = 0.0f;
+    float effIouScore = 0.0f;
+    bool hasEffIouScore = false;
+};
+
+using TrackerFrameStateHandle = std::shared_ptr<const TrackerFrameState>;
+
 struct SAM3MemorySnapshot {
     bool hasConditioningState = false;
-    TrackerFrameState conditioningState;
-    std::deque<TrackerFrameState> nonConditioningStates;
-    TrackerFrameState lastTrackerFrameState;
+    std::deque<TrackerFrameStateHandle> conditioningStates;
+    std::deque<TrackerFrameStateHandle> nonConditioningStates;
+    TrackerFrameStateHandle lastTrackerFrameState;
     bool hasLastTrackerFrameState = false;
     int segmentFrameIndex = 0;
 };
@@ -245,6 +256,9 @@ struct SAM3FrameTimings {
     double memMs = 0.0;
     double captureStateMs = 0.0;
     double stateUpdateMs = 0.0;
+    bool propagationIoBindingRequested = false;
+    bool propagationIoBindingUsed = false;
+    bool propagationIoBindingFellBack = false;
 };
 
 struct SAM3DiagnosticsOptions {
@@ -340,6 +354,7 @@ public:
     void setTrackerMaskSelectionCallback(TrackerMaskSelectionCallback callback);
     bool lastFrameTimings(SAM3FrameTimings* timingsOut) const;
     bool lastTrackerFrameState(TrackerFrameState* stateOut) const;
+    bool lastTrackerFrameMetrics(TrackerFrameMetrics* metricsOut) const;
     bool lastTrackerMaskCandidates(SAM3MaskCandidates* candidatesOut) const;
     void setDiagnosticsOptions(const SAM3DiagnosticsOptions&) {}
     bool runtimeMetadata(SAM3RuntimeMetadata*) const { return false; }
@@ -386,6 +401,13 @@ private:
         const std::vector<const char*>& outputNames,
         const std::vector<Ort::Value>& inputTensors,
         const std::string& debugName);
+    std::variant<std::vector<Ort::Value>, std::string> runSessionWithOutputMemory(
+        Ort::Session* session,
+        const std::vector<const char*>& inputNames,
+        const std::vector<const char*>& outputNames,
+        const std::vector<Ort::Value>& inputTensors,
+        const Ort::MemoryInfo& outputMemoryInfo,
+        const std::string& debugName);
 
     const std::vector<float>& buildNoMemoryImageEmbedding(
         const Ort::Value& currentVisionFeat,
@@ -424,7 +446,7 @@ private:
     TrackerFrameState captureTrackerState(const std::vector<Ort::Value>& decoderOutputs,
                                           const std::vector<Ort::Value>& memoryEncoderOutputs,
                                           int frameIndex);
-    void appendNonConditioningState(const TrackerFrameState& state);
+    void appendNonConditioningState(TrackerFrameStateHandle state);
     void trimNonConditioningStates();
     void buildMemoryInputBuffers(int frameIndex);
 
@@ -506,13 +528,14 @@ private:
     std::vector<Ort::Value> m_cachedEncoderOutputs;
     CachedEncoderOutputs m_cachedEncoderHostCopy;
     bool m_hasCachedEncoderHostCopy = false;
+    bool m_compressEncoderCacheToHalf = false;
 
     SAM3Constants m_constants;
     bool m_hasVideoConstants = false;
     bool m_hasConditioningState = false;
-    TrackerFrameState m_conditioningState;
-    std::deque<TrackerFrameState> m_nonConditioningStates;
-    TrackerFrameState m_lastTrackerFrameState;
+    std::deque<TrackerFrameStateHandle> m_conditioningStates;
+    std::deque<TrackerFrameStateHandle> m_nonConditioningStates;
+    TrackerFrameStateHandle m_lastTrackerFrameState;
     bool m_hasLastTrackerFrameState = false;
     SAM3MaskCandidates m_lastTrackerMaskCandidates;
     bool m_hasLastTrackerMaskCandidates = false;
@@ -532,6 +555,9 @@ private:
     std::vector<int64_t> m_memoryMaskTposScratch;
 
     Ort::MemoryInfo m_memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::MemoryInfo m_cudaMemoryInfo{nullptr};
+    bool m_usePropagationIoBinding = false;
+    bool m_propagationIoBindingDisabledAfterFailure = false;
     std::string m_device = "cpu";
 };
 

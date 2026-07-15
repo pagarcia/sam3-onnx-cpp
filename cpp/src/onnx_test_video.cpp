@@ -660,11 +660,17 @@ void printFrameDiagnostics(int frameIndex, const SAM3& sam)
                   << ",capture:" << timings.captureStateMs
                   << ",state:" << timings.stateUpdateMs
                   << ",mem:" << timings.memMs
-                  << ",total:" << timings.totalMs << "}\n";
+                  << ",total:" << timings.totalMs << "}"
+                  << " ioBinding={requested:"
+                  << (timings.propagationIoBindingRequested ? "yes" : "no")
+                  << ",used:" << (timings.propagationIoBindingUsed ? "yes" : "no")
+                  << ",fallback:"
+                  << (timings.propagationIoBindingFellBack ? "yes" : "no")
+                  << "}\n";
     }
 
-    TrackerFrameState state;
-    if (sam.lastTrackerFrameState(&state)) {
+    TrackerFrameMetrics state;
+    if (sam.lastTrackerFrameMetrics(&state)) {
         const double objectProb = 1.0 / (1.0 + std::exp(-static_cast<double>(state.objectScoreLogit)));
         std::cout << "[DIAG] frame=" << frameIndex
                   << " objectLogit=" << state.objectScoreLogit

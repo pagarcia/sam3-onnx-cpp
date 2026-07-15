@@ -50,7 +50,7 @@ double trackerStateMemoryQuality(const smseg_sam3::TrackerFrameState& state)
 }
 
 std::vector<std::size_t> selectMemoryStateIndices(
-    const std::deque<smseg_sam3::TrackerFrameState>& states,
+    const std::deque<smseg_sam3::TrackerFrameStateHandle>& states,
     std::size_t limit,
     int currentFrameIndex)
 {
@@ -84,12 +84,17 @@ std::vector<std::size_t> selectMemoryStateIndices(
                 continue;
             }
 
-            const smseg_sam3::TrackerFrameState& state = states[i];
+            if (!states[i]) {
+                continue;
+            }
+            const smseg_sam3::TrackerFrameState& state = *states[i];
             int minFrameDistance = std::numeric_limits<int>::max();
             for (const std::size_t selectedIndex : selected) {
                 minFrameDistance =
                     std::min(minFrameDistance,
-                             std::abs(state.frameIndex - states[selectedIndex].frameIndex));
+                             states[selectedIndex]
+                                 ? std::abs(state.frameIndex - states[selectedIndex]->frameIndex)
+                                 : 0);
             }
             if (minFrameDistance == std::numeric_limits<int>::max()) {
                 minFrameDistance = 0;
@@ -115,6 +120,77 @@ std::vector<std::size_t> selectMemoryStateIndices(
         used[bestIndex] = std::uint8_t(1);
     }
 
+    return selected;
+}
+
+std::vector<std::size_t> selectConditioningStateIndices(
+    const std::deque<smseg_sam3::TrackerFrameStateHandle>& states,
+    std::size_t limit,
+    int currentFrameIndex,
+    bool keepFirst)
+{
+    std::vector<std::size_t> selected;
+    if (states.empty() || limit == 0) {
+        return selected;
+    }
+
+    limit = std::min(limit, states.size());
+    std::vector<std::uint8_t> used(states.size(), std::uint8_t(0));
+    const auto add = [&](std::size_t index) {
+        if (index < states.size() && states[index] && !used[index]
+            && selected.size() < limit) {
+            selected.push_back(index);
+            used[index] = std::uint8_t(1);
+        }
+    };
+
+    if (keepFirst) {
+        for (std::size_t i = 0; i < states.size(); ++i) {
+            if (states[i]) {
+                add(i);
+                break;
+            }
+        }
+    }
+
+    std::size_t nearestBefore = states.size();
+    std::size_t nearestAfter = states.size();
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        if (!states[i]) {
+            continue;
+        }
+        if (states[i]->frameIndex < currentFrameIndex
+            && (nearestBefore == states.size()
+                || states[i]->frameIndex > states[nearestBefore]->frameIndex)) {
+            nearestBefore = i;
+        }
+        if (states[i]->frameIndex >= currentFrameIndex
+            && (nearestAfter == states.size()
+                || states[i]->frameIndex < states[nearestAfter]->frameIndex)) {
+            nearestAfter = i;
+        }
+    }
+    add(nearestBefore);
+    add(nearestAfter);
+
+    while (selected.size() < limit) {
+        std::size_t best = states.size();
+        int bestDistance = std::numeric_limits<int>::max();
+        for (std::size_t i = 0; i < states.size(); ++i) {
+            if (!states[i] || used[i]) {
+                continue;
+            }
+            const int distance = std::abs(states[i]->frameIndex - currentFrameIndex);
+            if (distance < bestDistance) {
+                best = i;
+                bestDistance = distance;
+            }
+        }
+        if (best == states.size()) {
+            break;
+        }
+        add(best);
+    }
     return selected;
 }
 
@@ -490,9 +566,12 @@ TrackerFrameState SAM3::captureTrackerState(const std::vector<Ort::Value>& decod
     return state;
 }
 
-void SAM3::appendNonConditioningState(const TrackerFrameState& state)
+void SAM3::appendNonConditioningState(TrackerFrameStateHandle state)
 {
-    m_nonConditioningStates.push_back(state);
+    if (!state) {
+        return;
+    }
+    m_nonConditioningStates.push_back(std::move(state));
     trimNonConditioningStates();
 }
 
@@ -523,15 +602,31 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
     resizeAndClear(m_memoryObjTposScratch, objSlotCount, 0.0f);
 
     size_t memoryRow = 0;
-    if (m_hasConditioningState && memoryRow < memorySlotCount) {
-        const size_t copyCount = safeMinCount(featurePlaneSize, m_conditioningState.maskmemFeatures.size());
-        const size_t posCopyCount = safeMinCount(featurePlaneSize, m_conditioningState.maskmemPosEnc.size());
+    const std::size_t maxConditioningRows =
+        m_constants.maxCondFramesInAttn < 0
+            ? memorySlotCount
+            : std::min(memorySlotCount,
+                       static_cast<std::size_t>(std::max(0, m_constants.maxCondFramesInAttn)));
+    const std::vector<std::size_t> conditioningMemoryIndices =
+        selectConditioningStateIndices(
+            m_conditioningStates,
+            maxConditioningRows,
+            frameIndex,
+            m_constants.keepFirstCondFrame);
+    for (const std::size_t stateIndex : conditioningMemoryIndices) {
+        if (stateIndex >= m_conditioningStates.size() || !m_conditioningStates[stateIndex]
+            || memoryRow >= memorySlotCount) {
+            continue;
+        }
+        const TrackerFrameState& state = *m_conditioningStates[stateIndex];
+        const size_t copyCount = safeMinCount(featurePlaneSize, state.maskmemFeatures.size());
+        const size_t posCopyCount = safeMinCount(featurePlaneSize, state.maskmemPosEnc.size());
         std::copy_n(
-            m_conditioningState.maskmemFeatures.begin(),
+            state.maskmemFeatures.begin(),
             copyCount,
             m_memoryMaskFeatsScratch.begin() + static_cast<ptrdiff_t>(memoryRow * featurePlaneSize));
         std::copy_n(
-            m_conditioningState.maskmemPosEnc.begin(),
+            state.maskmemPosEnc.begin(),
             posCopyCount,
             m_memoryMaskPosScratch.begin() + static_cast<ptrdiff_t>(memoryRow * featurePlaneSize));
         m_memoryMaskTposScratch[memoryRow] = std::max(0, m_constants.numMaskmem - 1);
@@ -549,7 +644,10 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
         if (stateIndex >= m_nonConditioningStates.size() || memoryRow >= memorySlotCount) {
             continue;
         }
-        const TrackerFrameState& state = m_nonConditioningStates[stateIndex];
+        if (!m_nonConditioningStates[stateIndex]) {
+            continue;
+        }
+        const TrackerFrameState& state = *m_nonConditioningStates[stateIndex];
         const size_t copyCount = safeMinCount(featurePlaneSize, state.maskmemFeatures.size());
         const size_t posCopyCount = safeMinCount(featurePlaneSize, state.maskmemPosEnc.size());
         std::copy_n(
@@ -572,14 +670,30 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
     }
 
     size_t objRow = 0;
-    if (m_hasConditioningState && objRow < objSlotCount) {
-        const size_t copyCount = safeMinCount(objPtrSize, m_conditioningState.objPtr.size());
+    const std::size_t maxConditioningPointers =
+        m_constants.maxCondFramesInAttn < 0
+            ? objSlotCount
+            : std::min(objSlotCount,
+                       static_cast<std::size_t>(std::max(0, m_constants.maxCondFramesInAttn)));
+    const std::vector<std::size_t> conditioningPointerIndices =
+        selectConditioningStateIndices(
+            m_conditioningStates,
+            maxConditioningPointers,
+            frameIndex,
+            m_constants.keepFirstCondFrame);
+    for (const std::size_t stateIndex : conditioningPointerIndices) {
+        if (stateIndex >= m_conditioningStates.size() || !m_conditioningStates[stateIndex]
+            || objRow >= objSlotCount) {
+            continue;
+        }
+        const TrackerFrameState& state = *m_conditioningStates[stateIndex];
+        const size_t copyCount = safeMinCount(objPtrSize, state.objPtr.size());
         std::copy_n(
-            m_conditioningState.objPtr.begin(),
+            state.objPtr.begin(),
             copyCount,
             m_memoryObjPtrsScratch.begin() + static_cast<ptrdiff_t>(objRow * objPtrSize));
         m_memoryObjTposScratch[objRow] =
-            static_cast<float>(std::max(0, frameIndex - m_conditioningState.frameIndex));
+            static_cast<float>(std::max(0, frameIndex - state.frameIndex));
         ++objRow;
     }
 
@@ -594,7 +708,10 @@ void SAM3::buildMemoryInputBuffers(int frameIndex)
         if (stateIndex >= m_nonConditioningStates.size() || objRow >= objSlotCount) {
             continue;
         }
-        const TrackerFrameState& state = m_nonConditioningStates[stateIndex];
+        if (!m_nonConditioningStates[stateIndex]) {
+            continue;
+        }
+        const TrackerFrameState& state = *m_nonConditioningStates[stateIndex];
         const size_t copyCount = safeMinCount(objPtrSize, state.objPtr.size());
         std::copy_n(
             state.objPtr.begin(),
@@ -727,10 +844,22 @@ Image<float> SAM3::inferMultiFrameCached(const SAM3Size& originalImageSize,
 
 bool SAM3::lastTrackerFrameState(TrackerFrameState* stateOut) const
 {
-    if (!stateOut || !m_hasLastTrackerFrameState) {
+    if (!stateOut || !m_hasLastTrackerFrameState || !m_lastTrackerFrameState) {
         return false;
     }
-    *stateOut = m_lastTrackerFrameState;
+    *stateOut = *m_lastTrackerFrameState;
+    return true;
+}
+
+bool SAM3::lastTrackerFrameMetrics(TrackerFrameMetrics* metricsOut) const
+{
+    if (!metricsOut || !m_hasLastTrackerFrameState || !m_lastTrackerFrameState) {
+        return false;
+    }
+    metricsOut->frameIndex = m_lastTrackerFrameState->frameIndex;
+    metricsOut->objectScoreLogit = m_lastTrackerFrameState->objectScoreLogit;
+    metricsOut->effIouScore = m_lastTrackerFrameState->effIouScore;
+    metricsOut->hasEffIouScore = m_lastTrackerFrameState->hasEffIouScore;
     return true;
 }
 
@@ -757,6 +886,7 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
     SAM3FrameTimings timings;
     timings.frameIndex = m_segmentFrameIndex;
     timings.encMs = encTimeMs;
+    timings.propagationIoBindingRequested = m_usePropagationIoBinding;
 
     m_hasLastTrackerFrameState = false;
     m_lastTrackerMaskCandidates = SAM3MaskCandidates();
@@ -809,6 +939,8 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         std::vector<int32_t> pointLabelsStorage;
         const std::vector<float>* imageEmbedStorage = nullptr;
         std::vector<Ort::Value> memoryAttentionOutputs;
+        std::vector<Ort::Value> propagationMemoryInputs;
+        bool propagationAttentionOutputOnCuda = false;
 
         if (conditioningFrame) {
             const auto promptStart = std::chrono::steady_clock::now();
@@ -835,44 +967,73 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         } else {
             const auto memoryBuildStart = std::chrono::steady_clock::now();
             buildMemoryInputBuffers(m_segmentFrameIndex);
-            std::vector<Ort::Value> memoryInputs;
-            memoryInputs.push_back(createTensorView<float>(
+            propagationMemoryInputs.push_back(createTensorView<float>(
                 m_memoryInfo,
                 encoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)].GetTensorMutableData<float>(),
                 currentVisionShape));
-            memoryInputs.push_back(createTensor<float>(
+            propagationMemoryInputs.push_back(createTensor<float>(
                 m_memoryInfo,
                 m_constants.currentVisionPosEmbed,
                 m_constants.currentVisionPosEmbedShape));
-            memoryInputs.push_back(createTensor<float>(
+            propagationMemoryInputs.push_back(createTensor<float>(
                 m_memoryInfo,
                 m_memoryObjPtrsScratch,
                 {static_cast<int64_t>(m_staticNumObjPtrs), 256}));
-            memoryInputs.push_back(createTensor<float>(
+            propagationMemoryInputs.push_back(createTensor<float>(
                 m_memoryInfo,
                 m_memoryObjTposScratch,
                 {static_cast<int64_t>(m_staticNumObjPtrs)}));
-            memoryInputs.push_back(createTensor<float>(
+            propagationMemoryInputs.push_back(createTensor<float>(
                 m_memoryInfo,
                 m_memoryMaskFeatsScratch,
                 {static_cast<int64_t>(m_staticNumMemFrames), 64, 72, 72}));
-            memoryInputs.push_back(createTensor<float>(
+            propagationMemoryInputs.push_back(createTensor<float>(
                 m_memoryInfo,
                 m_memoryMaskPosScratch,
                 {static_cast<int64_t>(m_staticNumMemFrames), 64, 72, 72}));
-            memoryInputs.push_back(createTensor<int64_t>(
+            propagationMemoryInputs.push_back(createTensor<int64_t>(
                 m_memoryInfo,
                 m_memoryMaskTposScratch,
                 {static_cast<int64_t>(m_staticNumMemFrames)}));
             timings.memoryBuildMs += frameElapsedMs(memoryBuildStart);
 
             const auto attnStart = std::chrono::steady_clock::now();
-            auto memoryAttentionResult = runSession(
-                m_memoryAttentionSession.get(),
-                m_memoryAttentionInputNames,
-                m_memoryAttentionOutputNames,
-                memoryInputs,
-                "memoryAttention");
+            const bool bindingEligible =
+                m_usePropagationIoBinding
+                && !m_propagationIoBindingDisabledAfterFailure
+                && m_memoryAttentionOutputNames.size() == 1
+                && m_memoryAttentionFusedFeatIndex == 0
+                && m_memoryAttentionOutputNames.front()
+                && lowerCopy(m_memoryAttentionOutputNames.front()) == "fused_feat";
+            auto memoryAttentionResult = bindingEligible
+                ? runSessionWithOutputMemory(
+                      m_memoryAttentionSession.get(),
+                      m_memoryAttentionInputNames,
+                      m_memoryAttentionOutputNames,
+                      propagationMemoryInputs,
+                      m_cudaMemoryInfo,
+                      "memoryAttention(cuda-bound)")
+                : runSession(
+                      m_memoryAttentionSession.get(),
+                      m_memoryAttentionInputNames,
+                      m_memoryAttentionOutputNames,
+                      propagationMemoryInputs,
+                      "memoryAttention");
+            if (bindingEligible && memoryAttentionResult.index() == 1) {
+                std::cerr << "[WARN] SAM3 propagation I/O binding failed; using ordinary Run: "
+                          << std::get<std::string>(memoryAttentionResult) << '\n';
+                m_propagationIoBindingDisabledAfterFailure = true;
+                timings.propagationIoBindingFellBack = true;
+                memoryAttentionResult = runSession(
+                    m_memoryAttentionSession.get(),
+                    m_memoryAttentionInputNames,
+                    m_memoryAttentionOutputNames,
+                    propagationMemoryInputs,
+                    "memoryAttention(fallback)");
+            } else if (bindingEligible) {
+                propagationAttentionOutputOnCuda = true;
+                timings.propagationIoBindingUsed = true;
+            }
             attnTimeMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - attnStart).count();
             timings.attnMs = attnTimeMs;
@@ -887,16 +1048,44 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 return Image<float>();
             }
 
+            std::vector<int64_t> fusedShape =
+                memoryAttentionOutputs[static_cast<size_t>(m_memoryAttentionFusedFeatIndex)]
+                    .GetTensorTypeAndShapeInfo().GetShape();
+            if (propagationAttentionOutputOnCuda && fusedShape != currentVisionShape) {
+                std::cerr << "[WARN] SAM3 bound fused_feat shape did not match current_vision_feat; "
+                             "using ordinary Run.\n";
+                m_propagationIoBindingDisabledAfterFailure = true;
+                timings.propagationIoBindingFellBack = true;
+                timings.propagationIoBindingUsed = false;
+                auto fallbackAttention = runSession(
+                    m_memoryAttentionSession.get(),
+                    m_memoryAttentionInputNames,
+                    m_memoryAttentionOutputNames,
+                    propagationMemoryInputs,
+                    "memoryAttention(shape-fallback)");
+                if (fallbackAttention.index() == 1) {
+                    std::cerr << std::get<std::string>(fallbackAttention) << '\n';
+                    return Image<float>();
+                }
+                memoryAttentionOutputs = std::move(std::get<0>(fallbackAttention));
+                propagationAttentionOutputOnCuda = false;
+                fusedShape =
+                    memoryAttentionOutputs[static_cast<size_t>(m_memoryAttentionFusedFeatIndex)]
+                        .GetTensorTypeAndShapeInfo().GetShape();
+            }
             Ort::Value& fusedFeat = memoryAttentionOutputs[static_cast<size_t>(m_memoryAttentionFusedFeatIndex)];
-            const auto fusedShape = fusedFeat.GetTensorTypeAndShapeInfo().GetShape();
             pointCoordsStorage.clear();
             pointLabelsStorage.clear();
             decoderInputs.push_back(createTensor<float>(m_memoryInfo, pointCoordsStorage, {1, 0, 2}));
             decoderInputs.push_back(createTensor<int32_t>(m_memoryInfo, pointLabelsStorage, {1, 0}));
-            decoderInputs.push_back(createTensorView<float>(
-                m_memoryInfo,
-                fusedFeat.GetTensorMutableData<float>(),
-                fusedShape));
+            if (propagationAttentionOutputOnCuda) {
+                decoderInputs.push_back(std::move(fusedFeat));
+            } else {
+                decoderInputs.push_back(createTensorView<float>(
+                    m_memoryInfo,
+                    fusedFeat.GetTensorMutableData<float>(),
+                    fusedShape));
+            }
             isMaskFromPoints = false;
         }
 
@@ -925,6 +1114,35 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
                 m_trackerDecoderOutputNames,
                 decoderInputs,
                 conditioningFrame ? "trackerConditioningDecoder" : "trackerPropagationDecoder");
+            if (!conditioningFrame && propagationAttentionOutputOnCuda
+                && decoderResult.index() == 1) {
+                std::cerr << "[WARN] SAM3 bound fused_feat was rejected by the decoder; "
+                             "using ordinary Run for this and later frames: "
+                          << std::get<std::string>(decoderResult) << '\n';
+                m_propagationIoBindingDisabledAfterFailure = true;
+                timings.propagationIoBindingFellBack = true;
+                timings.propagationIoBindingUsed = false;
+                auto fallbackAttention = runSession(
+                    m_memoryAttentionSession.get(),
+                    m_memoryAttentionInputNames,
+                    m_memoryAttentionOutputNames,
+                    propagationMemoryInputs,
+                    "memoryAttention(decoder-fallback)");
+                if (fallbackAttention.index() == 0) {
+                    memoryAttentionOutputs = std::move(std::get<0>(fallbackAttention));
+                    Ort::Value& fallbackFused = memoryAttentionOutputs.front();
+                    decoderInputs[2] = createTensorView<float>(
+                        m_memoryInfo,
+                        fallbackFused.GetTensorMutableData<float>(),
+                        fallbackFused.GetTensorTypeAndShapeInfo().GetShape());
+                    decoderResult = runSession(
+                        m_trackerDecoderSession.get(),
+                        m_trackerDecoderInputNames,
+                        m_trackerDecoderOutputNames,
+                        decoderInputs,
+                        "trackerPropagationDecoder(fallback)");
+                }
+            }
             const double decoderTimeMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - decoderStart).count();
             timings.decoderMs = decoderTimeMs;
@@ -1160,14 +1378,34 @@ Image<float> SAM3::inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& en
         }
         timings.captureStateMs += frameElapsedMs(captureStateStart);
         const auto stateUpdateStart = std::chrono::steady_clock::now();
-        m_lastTrackerFrameState = frameState;
+        const TrackerFrameStateHandle stateHandle =
+            std::make_shared<const TrackerFrameState>(std::move(frameState));
+        m_lastTrackerFrameState = stateHandle;
         m_hasLastTrackerFrameState = true;
         if (conditioningFrame) {
-            m_conditioningState = frameState;
+            // Match the reference tracker: retain multiple conditioning
+            // frames and select the closest bounded set at attention time.
+            // Replacing the same index keeps correction prompts idempotent.
+            m_conditioningStates.erase(
+                std::remove_if(
+                    m_conditioningStates.begin(),
+                    m_conditioningStates.end(),
+                    [this](const TrackerFrameStateHandle& state) {
+                        return state && state->frameIndex == m_segmentFrameIndex;
+                    }),
+                m_conditioningStates.end());
+            m_conditioningStates.push_back(stateHandle);
             m_hasConditioningState = true;
-            m_nonConditioningStates.clear();
+            m_nonConditioningStates.erase(
+                std::remove_if(
+                    m_nonConditioningStates.begin(),
+                    m_nonConditioningStates.end(),
+                    [this](const TrackerFrameStateHandle& state) {
+                        return state && state->frameIndex == m_segmentFrameIndex;
+                    }),
+                m_nonConditioningStates.end());
         } else {
-            appendNonConditioningState(frameState);
+            appendNonConditioningState(stateHandle);
         }
 
         Image<float> mask = denseMaskConditioning

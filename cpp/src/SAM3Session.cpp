@@ -211,6 +211,46 @@ bool captureTensorAsHalf(const Ort::Value& tensor,
     return !target->halfValues.empty();
 }
 
+bool captureTensorAsFloat(const Ort::Value& tensor,
+                          smseg_sam3::CachedTensorData* target)
+{
+    if (!target) {
+        return false;
+    }
+
+    const float* tensorData = tensor.GetTensorData<float>();
+    const auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
+    const std::size_t count = smseg_sam3::computeElementCount(shape);
+    if (!tensorData || count == 0) {
+        return false;
+    }
+
+    target->halfValues.clear();
+    target->values.assign(tensorData, tensorData + count);
+    target->shape.assign(shape.begin(), shape.end());
+    target->elementType = smseg_sam3::CachedTensorElementType::Float32;
+    return true;
+}
+
+bool compressEncoderCacheToHalf(const std::string& encoderPath)
+{
+    const char* value = std::getenv("SAM3_ORT_ENCODER_CACHE_PRECISION");
+    const std::string requested = value && *value
+        ? lowerAsciiCopy(trimCopy(value))
+        : std::string("auto");
+    if (requested == "fp16" || requested == "half") {
+        return true;
+    }
+    if (requested == "fp32" || requested == "float" || requested == "exact") {
+        return false;
+    }
+
+    // FP16 encoder artifacts already carry FP16 numerical precision. Preserve
+    // FP32/INT8 outputs exactly so cold and cache-hit inference do not diverge
+    // solely because the host cache quantized them.
+    return lowerAsciiCopy(encoderPath).find("fp16") != std::string::npos;
+}
+
 bool expandTensorToFloat(const smseg_sam3::CachedTensorData& source,
                          smseg_sam3::CachedTensorData* target)
 {
@@ -1117,6 +1157,9 @@ bool SAM3::clearSessions()
 
         m_constants = SAM3Constants();
         m_hasVideoConstants = false;
+        m_cudaMemoryInfo = Ort::MemoryInfo{nullptr};
+        m_usePropagationIoBinding = false;
+        m_propagationIoBindingDisabledAfterFailure = false;
 
         resetMemory();
         m_device = "cpu";
@@ -1130,9 +1173,9 @@ bool SAM3::clearSessions()
 void SAM3::resetMemory()
 {
     m_hasConditioningState = false;
-    m_conditioningState = TrackerFrameState();
+    m_conditioningStates.clear();
     m_nonConditioningStates.clear();
-    m_lastTrackerFrameState = TrackerFrameState();
+    m_lastTrackerFrameState.reset();
     m_hasLastTrackerFrameState = false;
     m_lastTrackerMaskCandidates = SAM3MaskCandidates();
     m_hasLastTrackerMaskCandidates = false;
@@ -1161,7 +1204,7 @@ bool SAM3::captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const
         return false;
 
     snapshotOut->hasConditioningState = m_hasConditioningState;
-    snapshotOut->conditioningState = m_conditioningState;
+    snapshotOut->conditioningStates = m_conditioningStates;
     snapshotOut->nonConditioningStates = m_nonConditioningStates;
     snapshotOut->lastTrackerFrameState = m_lastTrackerFrameState;
     snapshotOut->hasLastTrackerFrameState = m_hasLastTrackerFrameState;
@@ -1172,7 +1215,7 @@ bool SAM3::captureMemorySnapshot(SAM3MemorySnapshot* snapshotOut) const
 void SAM3::restoreMemorySnapshot(const SAM3MemorySnapshot& snapshot)
 {
     m_hasConditioningState = snapshot.hasConditioningState;
-    m_conditioningState = snapshot.conditioningState;
+    m_conditioningStates = snapshot.conditioningStates;
     m_nonConditioningStates = snapshot.nonConditioningStates;
     m_lastTrackerFrameState = snapshot.lastTrackerFrameState;
     m_hasLastTrackerFrameState = snapshot.hasLastTrackerFrameState;
@@ -1208,13 +1251,17 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
                                const std::string& device,
                                SAM3SessionRole role)
 {
-    const int safeThreads = std::max(1, threadsNumber);
     const int safeInterOpThreads = envInt("SAM3_ORT_INTER_OP_THREADS", 1, 1);
     const bool enableCpuArena = envBool("SAM3_ORT_CPU_ARENA", true);
     const bool enableMemPattern = envBool("SAM3_ORT_MEM_PATTERN", true);
     const ResolvedGraphOpt resolvedOpt =
         resolveRoleGraphOptimizationLevel(device, optLevel, role);
-    options.SetIntraOpNumThreads(safeThreads);
+    // ORT uses its platform default when this option is not set. Preserve the
+    // documented --threads 0 / SAM3_ORT_CPU_THREADS=0 behavior instead of
+    // silently coercing it to one worker.
+    if (threadsNumber > 0) {
+        options.SetIntraOpNumThreads(threadsNumber);
+    }
     options.SetInterOpNumThreads(safeInterOpThreads);
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
     options.SetGraphOptimizationLevel(resolvedOpt.level);
@@ -1264,13 +1311,12 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
         // Memory pattern must stay off for the DML EP.
         options.DisableMemPattern();
         if (role == SAM3SessionRole::Tracker && !resolvedOpt.explicitEnv) {
-            // The exported tracker graphs are sensitive to aggressive ORT
-            // rewrites, so they keep the historical DML safe mode unless an
-            // env override asks otherwise. The encoder is the stock community
-            // graph and runs with normal optimizations.
-            options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
-            options.AddConfigEntry("session.disable_prepacking", "1");
-            options.AddConfigEntry("session.disable_gemm_fast_gelu_fusion", "1");
+            // Tracker graphs default to BASIC on DML: the 2026-07-03 bisect
+            // (fp32 and fp16 tracker bundles, 8-frame DML runs) showed BASIC
+            // is bit-identical to the historical safe mode while measurably
+            // faster; EXTENDED/ALL changed fp16 masks and stay opt-in via
+            // SAM3_ORT_TRACKER_GRAPH_OPT.
+            options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
         }
 
         const auto appendDml = loadDmlProviderAppendFn();
@@ -1399,6 +1445,40 @@ std::variant<std::vector<Ort::Value>, std::string> SAM3::runSession(
     }
 }
 
+std::variant<std::vector<Ort::Value>, std::string> SAM3::runSessionWithOutputMemory(
+    Ort::Session* session,
+    const std::vector<const char*>& inputNames,
+    const std::vector<const char*>& outputNames,
+    const std::vector<Ort::Value>& inputTensors,
+    const Ort::MemoryInfo& outputMemoryInfo,
+    const std::string& debugName)
+{
+    if (!session) {
+        return std::string("[ERROR] runSessionWithOutputMemory(" + debugName
+                           + "): session is null.");
+    }
+    if (inputNames.size() != inputTensors.size()) {
+        return std::string("[ERROR] runSessionWithOutputMemory(" + debugName
+                           + "): input name/tensor counts differ.");
+    }
+    try {
+        Ort::IoBinding binding(*session);
+        for (std::size_t i = 0; i < inputNames.size(); ++i) {
+            binding.BindInput(inputNames[i], inputTensors[i]);
+        }
+        for (const char* outputName : outputNames) {
+            binding.BindOutput(outputName, outputMemoryInfo);
+        }
+        binding.SynchronizeInputs();
+        session->Run(Ort::RunOptions{nullptr}, binding);
+        binding.SynchronizeOutputs();
+        return binding.GetOutputValues();
+    } catch (const std::exception& error) {
+        return std::string("[ERROR] runSessionWithOutputMemory(" + debugName
+                           + ") => " + error.what());
+    }
+}
+
 bool SAM3::initializeImage(const std::string& encoderPath,
                            const std::string& decoderPath,
                            int threadsNumber,
@@ -1415,6 +1495,7 @@ bool SAM3::initializeImage(const std::string& encoderPath,
 {
     clearSessions();
     m_device = device;
+    m_compressEncoderCacheToHalf = compressEncoderCacheToHalf(encoderPath);
 
     if (!modelExists(encoderPath) || !modelExists(decoderPath)) {
         std::cerr << "[ERROR] Model file not found.\n";
@@ -1659,6 +1740,24 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
 {
     clearSessions();
     m_device = device;
+    m_compressEncoderCacheToHalf = compressEncoderCacheToHalf(encoderPath);
+
+#if !defined(__APPLE__)
+    if (envBool("SAM3_ORT_PROPAGATION_IO_BINDING", false)
+        && device.rfind("cuda:", 0) == 0) {
+        int deviceId = 0;
+        try {
+            deviceId = std::stoi(device.substr(5));
+        } catch (...) {
+            deviceId = 0;
+        }
+        m_cudaMemoryInfo =
+            Ort::MemoryInfo("Cuda", OrtDeviceAllocator, deviceId, OrtMemTypeDefault);
+        m_usePropagationIoBinding = true;
+        std::cout << "[INFO] SAM3 propagation I/O binding enabled for attention->decoder on "
+                  << device << ".\n";
+    }
+#endif
 
     if (!modelExists(encoderPath)
         || !modelExists(decoderPath)
@@ -2007,13 +2106,19 @@ bool SAM3::captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const
         return false;
     }
 
-    return captureTensorAsHalf(
+    const auto capture = [this](const Ort::Value& tensor, CachedTensorData* target) {
+        return m_compressEncoderCacheToHalf
+            ? captureTensorAsHalf(tensor, target)
+            : captureTensorAsFloat(tensor, target);
+    };
+
+    return capture(
             m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb0Index)],
             &outputs->imageEmb0)
-        && captureTensorAsHalf(
+        && capture(
             m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb1Index)],
             &outputs->imageEmb1)
-        && captureTensorAsHalf(
+        && capture(
             m_cachedEncoderOutputs[static_cast<size_t>(m_encoderImageEmb2Index)],
             &outputs->imageEmb2);
 }
@@ -2023,6 +2128,15 @@ bool SAM3::restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs)
     if (outputs.imageEmb0.empty()
         || outputs.imageEmb1.empty()
         || outputs.imageEmb2.empty()) {
+        return false;
+    }
+
+    if (!m_compressEncoderCacheToHalf
+        && (outputs.imageEmb0.elementType == CachedTensorElementType::Float16
+            || outputs.imageEmb1.elementType == CachedTensorElementType::Float16
+            || outputs.imageEmb2.elementType == CachedTensorElementType::Float16)) {
+        // Do not let an older lossy disk/RAM entry defeat the exact-cache
+        // policy. The caller will encode once and overwrite the cache.
         return false;
     }
 

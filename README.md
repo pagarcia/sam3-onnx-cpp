@@ -678,11 +678,13 @@ Noninteractive smoke tests:
 | `SAM3_ORT_TRACKER_PRECISION` | `auto`, `fp32`, `fp16` | Video tracker precision. |
 | `SAM3_ORT_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++/Python graph optimization override. |
 | `SAM3_ORT_ENCODER_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++ per-role override for the vision encoder session; takes precedence over `SAM3_ORT_GRAPH_OPT`. On DML the encoder now defaults to normal optimizations while tracker graphs keep safe mode. |
-| `SAM3_ORT_TRACKER_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++ per-role override for tracker sessions (decoder, memory attention, memory encoder); takes precedence over `SAM3_ORT_GRAPH_OPT`. |
+| `SAM3_ORT_TRACKER_GRAPH_OPT` | `disable`, `basic`, `extended`, `all` | C++ per-role override for tracker sessions (decoder, memory attention, memory encoder); takes precedence over `SAM3_ORT_GRAPH_OPT`. On DML the tracker default is `basic` (bisect-validated bit-identical); `extended`/`all` altered fp16 masks and remain opt-in. |
 | `SAM3_ORT_WARMUP` | `auto`, `on`, `off`, `full` | C++ video warm-up after `initializeVideo`. `auto` warms tracker modules on non-CPU devices; `full` also runs one dummy encoder pass. |
 | `SAM3_ORT_CPU_THREADS` | integer, including `0` | C++ CPU thread override; `0` leaves ORT intra-op threads at its default. |
 | `SAM3_ORT_INTRA_OP_THREADS` | integer, including `0` | Python ORT thread override, and C++ fallback when `SAM3_ORT_CPU_THREADS` is unset. |
 | `SAM3_ORT_IO_BINDING` | `auto`, `0`, `1` | Python I/O binding override. |
+| `SAM3_ORT_ENCODER_CACHE_PRECISION` | `auto`, `fp16`, `fp32` | C++ host embedding-cache storage. `auto` keeps FP32/INT8 encoder outputs exact and compresses only FP16 encoder outputs. |
+| `SAM3_ORT_PROPAGATION_IO_BINDING` | `0`, `1` | Experimental C++ CUDA-only `fused_feat` handoff from memory attention to the tracker decoder. Off by default and automatically falls back to ordinary `Run`. |
 
 ## C++ Tensor Input
 
@@ -699,6 +701,31 @@ Image<float> mask = sam.inferMultiFrameTensor(
 ```
 
 The tensor must match the encoder input shape exactly, normally `1 x 3 x H x W`, and use the same normalized RGB layout as the demo preprocessing.
+
+## C++ Tracker State And CUDA Experiment
+
+Tracker memory frames are immutable shared states. Memory snapshots therefore
+copy small handles rather than duplicating the `64 x 72 x 72` feature tensors,
+and confidence-only consumers should call `lastTrackerFrameMetrics()` instead
+of copying `lastTrackerFrameState()`.
+
+The tracker retains multiple conditioning frames and selects at most
+`max_cond_frames_in_attn`, preferring the first frame when the exported
+`keep_first_cond_frame` constant asks for it and otherwise the closest frames.
+Static ONNX memory-slot counts remain the hard upper bound.
+
+`SAM3_ORT_PROPAGATION_IO_BINDING=1` is a benchmark-gated CUDA experiment. It is
+used only when the memory-attention graph exposes exactly one output named
+`fused_feat` with the expected current-vision shape. Binding or downstream
+decoder failure disables it for the remaining run and repeats the frame with
+ordinary host-output `Run` calls. Diagnostics report requested/used/fallback.
+
+The decoder-to-memory-encoder edge is deliberately not device-bound yet:
+multimask candidate selection may replace the selected high-resolution logits,
+and persistent tracker history is currently stored on the host. A fused static
+propagation graph may ship only after CPU/CUDA output parity, multi-conditioning
+parity, cancellation, and cache-hot volume benchmarks pass. Do not treat graph
+fusion alone as an optimization without those measurements.
 
 ## Quality And Performance Notes
 
