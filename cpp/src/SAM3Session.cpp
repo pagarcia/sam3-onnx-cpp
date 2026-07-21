@@ -24,6 +24,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 #ifdef min
 #undef min
 #endif
@@ -68,6 +70,68 @@ AppendDmlProviderFn loadDmlProviderAppendFn()
 
     return reinterpret_cast<AppendDmlProviderFn>(
         GetProcAddress(ortHandle, "OrtSessionOptionsAppendExecutionProvider_DML"));
+}
+
+bool hasDirectMLHardwareAdapter()
+{
+    // Loading these entry points dynamically keeps DirectX an optional runtime
+    // capability instead of adding a hard linker dependency for CPU builds.
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (!dxgi || !d3d12) {
+        if (dxgi) FreeLibrary(dxgi);
+        if (d3d12) FreeLibrary(d3d12);
+        return false;
+    }
+
+    using CreateFactoryFn = HRESULT (WINAPI*)(REFIID, void**);
+    using CreateDeviceFn = HRESULT (WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    const auto createFactory = reinterpret_cast<CreateFactoryFn>(
+        GetProcAddress(dxgi, "CreateDXGIFactory1"));
+    const auto createDevice = reinterpret_cast<CreateDeviceFn>(
+        GetProcAddress(d3d12, "D3D12CreateDevice"));
+    if (!createFactory || !createDevice) {
+        FreeLibrary(d3d12);
+        FreeLibrary(dxgi);
+        return false;
+    }
+
+    IDXGIFactory1* factory = nullptr;
+    bool found = false;
+    if (SUCCEEDED(createFactory(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))
+        && factory) {
+        for (UINT index = 0;; ++index) {
+            IDXGIAdapter1* adapter = nullptr;
+            const HRESULT enumResult = factory->EnumAdapters1(index, &adapter);
+            if (enumResult == DXGI_ERROR_NOT_FOUND)
+                break;
+            if (FAILED(enumResult) || !adapter)
+                continue;
+
+            DXGI_ADAPTER_DESC1 description{};
+            const bool hardware =
+                SUCCEEDED(adapter->GetDesc1(&description))
+                && (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0;
+            if (hardware) {
+                ID3D12Device* device = nullptr;
+                found = SUCCEEDED(createDevice(
+                    adapter,
+                    D3D_FEATURE_LEVEL_11_0,
+                    __uuidof(ID3D12Device),
+                    reinterpret_cast<void**>(&device)));
+                if (device)
+                    device->Release();
+            }
+            adapter->Release();
+            if (found)
+                break;
+        }
+        factory->Release();
+    }
+
+    FreeLibrary(d3d12);
+    FreeLibrary(dxgi);
+    return found;
 }
 #endif
 
@@ -2371,7 +2435,9 @@ bool SAM3::hasCudaDriver()
 bool SAM3::hasDirectMLProvider()
 {
 #if defined(_WIN32)
-    return loadDmlProviderAppendFn() != nullptr;
+    static const bool available =
+        loadDmlProviderAppendFn() != nullptr && hasDirectMLHardwareAdapter();
+    return available;
 #else
     return false;
 #endif
