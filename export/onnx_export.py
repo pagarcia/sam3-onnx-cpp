@@ -259,6 +259,10 @@ def main(args) -> None:
 
     decoder = ImageDecoder(model).eval().cpu()
     decoder_mask = ImageDecoderWithMask(model).eval().cpu()
+    singlemask_decoder = ImageDecoder(model, multimask_output=False).eval().cpu()
+    singlemask_decoder_mask = ImageDecoderWithMask(
+        model, multimask_output=False
+    ).eval().cpu()
     mem_attn = MemAttention(model).eval().cpu()
     mem_enc = MemEncoder(model).eval().cpu()
 
@@ -273,11 +277,27 @@ def main(args) -> None:
     )
 
     for variant in export_variants:
-        export_image_decoder(decoder, str(outdir), variant)
-        export_image_decoder_mask(decoder_mask, str(outdir), variant)
-        export_memory_attention(mem_attn, str(outdir), variant)
-        export_memory_encoder(mem_enc, str(outdir), variant)
-        _save_video_constants(model, outdir, variant)
+        if not args.singlemask_only:
+            export_image_decoder(decoder, str(outdir), variant)
+            export_image_decoder_mask(decoder_mask, str(outdir), variant)
+        export_image_decoder(
+            singlemask_decoder,
+            str(outdir),
+            variant,
+            base_name="image_decoder_singlemask.onnx",
+            base_label="image decoder (true single-mask)",
+        )
+        export_image_decoder_mask(
+            singlemask_decoder_mask,
+            str(outdir),
+            variant,
+            base_name="image_decoder_mask_singlemask.onnx",
+            base_label="image decoder mask (true single-mask)",
+        )
+        if not args.singlemask_only:
+            export_memory_attention(mem_attn, str(outdir), variant)
+            export_memory_encoder(mem_enc, str(outdir), variant)
+            _save_video_constants(model, outdir, variant)
 
     _save_export_metadata(outdir, sam3_repo, sam3_revision, args)
 
@@ -327,5 +347,13 @@ if __name__ == "__main__":
         "--precisions",
         default="fp32,fp16",
         help="Comma-separated precisions to emit for the internal single/multi tracker bundles: fp32 and/or fp16.",
+    )
+    parser.add_argument(
+        "--singlemask-only",
+        action="store_true",
+        help=(
+            "Export only the true single-mask decoder pairs, leaving existing "
+            "decoder, memory, and constants artifacts untouched."
+        ),
     )
     main(parser.parse_args())

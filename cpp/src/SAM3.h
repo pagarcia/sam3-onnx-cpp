@@ -103,8 +103,9 @@ struct SAM3Prompts {
 };
 
 struct SAM3LogitsTensor {
+    std::vector<float> values;
     std::vector<int64_t> shape;
-    bool empty() const noexcept { return shape.empty(); }
+    bool empty() const noexcept { return values.empty() || shape.empty(); }
 };
 
 struct SAM3MaskCandidates {
@@ -112,11 +113,17 @@ struct SAM3MaskCandidates {
     std::vector<Image<float>> masks;
     std::vector<float> scores;
     int selectedIndex = -1;
+    SAM3LogitsTensor selectedMaskLogitsLowRes;
+    std::vector<SAM3LogitsTensor> candidateMaskLogitsLowRes;
     SAM3LogitsTensor selectedMaskLogitsHighRes;
     SAM3LogitsTensor multimaskLogitsHighRes;
+    float objectScoreLogit = 0.0f;
+    bool hasObjectScore = false;
+    bool usedPreviousMaskLogits = false;
+    bool usedSingleMaskDecoder = false;
 
     bool hasCandidates() const { return !masks.empty(); }
-    bool hasSelectedLogits() const { return !selectedMaskLogitsHighRes.empty(); }
+    bool hasSelectedLogits() const { return !selectedMaskLogitsLowRes.empty(); }
     bool hasMultimaskLogits() const { return !multimaskLogitsHighRes.empty(); }
 };
 
@@ -346,7 +353,9 @@ public:
     Image<float> previewConditioningFrame(const SAM3Size& originalImageSize,
                                           const SAM3Prompts& prompts);
     SAM3MaskCandidates previewConditioningFrameCandidates(const SAM3Size& originalImageSize,
-                                                          const SAM3Prompts& prompts);
+                                                          const SAM3Prompts& prompts,
+                                                          const SAM3LogitsTensor* previousMaskLogits = nullptr,
+                                                          bool preferSingleMask = false);
     Image<float> inferMultiFrame(const Image<float>& originalImage,
                                  const SAM3Prompts& prompts);
     Image<float> inferMultiFrameTensor(const std::vector<float>& encoderNchw,
@@ -440,8 +449,10 @@ private:
     bool prepareMaskPrompt(const SAM3Prompts& prompts,
                            const SAM3Size& originalImageSize,
                            PreparedSAM3MaskPrompt* preparedOut) const;
-    SAM3MaskCandidates collectTrackerMaskCandidates(const std::vector<Ort::Value>& decoderOutputs,
-                                                    const SAM3Size& originalImageSize) const;
+    SAM3MaskCandidates collectTrackerMaskCandidates(
+        const std::vector<Ort::Value>& decoderOutputs,
+        const std::vector<SAM3Node>& decoderOutputNodes,
+        const SAM3Size& originalImageSize) const;
 
     Image<float> inferMultiFrameWithEncoderOutputs(std::vector<Ort::Value>& encoderOutputs,
                                                    const SAM3Size& originalImageSize,
@@ -464,6 +475,8 @@ private:
     std::unique_ptr<Ort::Session> m_imageMaskDecoderSession;
     std::unique_ptr<Ort::Session> m_trackerDecoderSession;
     std::unique_ptr<Ort::Session> m_trackerMaskDecoderSession;
+    std::unique_ptr<Ort::Session> m_trackerSingleMaskDecoderSession;
+    std::unique_ptr<Ort::Session> m_trackerSingleMaskWithMaskDecoderSession;
     std::unique_ptr<Ort::Session> m_memoryAttentionSession;
     std::unique_ptr<Ort::Session> m_memoryEncoderSession;
 
@@ -477,6 +490,10 @@ private:
     std::vector<SAM3Node> m_trackerDecoderOutputNodes;
     std::vector<SAM3Node> m_trackerMaskDecoderInputNodes;
     std::vector<SAM3Node> m_trackerMaskDecoderOutputNodes;
+    std::vector<SAM3Node> m_trackerSingleMaskDecoderInputNodes;
+    std::vector<SAM3Node> m_trackerSingleMaskDecoderOutputNodes;
+    std::vector<SAM3Node> m_trackerSingleMaskWithMaskDecoderInputNodes;
+    std::vector<SAM3Node> m_trackerSingleMaskWithMaskDecoderOutputNodes;
     std::vector<SAM3Node> m_memoryAttentionInputNodes;
     std::vector<SAM3Node> m_memoryAttentionOutputNodes;
     std::vector<SAM3Node> m_memoryEncoderInputNodes;
@@ -492,6 +509,10 @@ private:
     std::vector<const char*> m_trackerDecoderOutputNames;
     std::vector<const char*> m_trackerMaskDecoderInputNames;
     std::vector<const char*> m_trackerMaskDecoderOutputNames;
+    std::vector<const char*> m_trackerSingleMaskDecoderInputNames;
+    std::vector<const char*> m_trackerSingleMaskDecoderOutputNames;
+    std::vector<const char*> m_trackerSingleMaskWithMaskDecoderInputNames;
+    std::vector<const char*> m_trackerSingleMaskWithMaskDecoderOutputNames;
     std::vector<const char*> m_memoryAttentionInputNames;
     std::vector<const char*> m_memoryAttentionOutputNames;
     std::vector<const char*> m_memoryEncoderInputNames;

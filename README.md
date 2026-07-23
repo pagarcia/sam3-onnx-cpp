@@ -77,6 +77,10 @@ export script focuses on the pieces that are still needed for video tracking:
   `mask_inputs` as a dense mask prompt for painted-mask or prior-mask
   conditioning. Keeping this as a separate graph lets video propagation
   preserve the original no-mask tracker contract on propagation frames.
+- `image_decoder_singlemask_*.onnx` and
+  `image_decoder_mask_singlemask_*.onnx`: true single-mask-token variants
+  used after the first interactive click. The latter accepts the previous
+  low-resolution logits, matching SAM3's iterative refinement protocol.
 - `memory_attention_*.onnx`: fuses the current frame with previous mask memory.
 - `memory_encoder_*.onnx`: converts a predicted mask back into memory for later
   frames.
@@ -203,11 +207,15 @@ Expected FP32 files:
 ```text
 image_decoder_single.onnx
 image_decoder_mask_single.onnx
+image_decoder_singlemask_single.onnx
+image_decoder_mask_singlemask_single.onnx
 memory_attention_single.onnx
 memory_encoder_single.onnx
 video_constants_single.npz
 image_decoder_multi.onnx
 image_decoder_mask_multi.onnx
+image_decoder_singlemask_multi.onnx
+image_decoder_mask_singlemask_multi.onnx
 memory_attention_multi.onnx
 memory_encoder_multi.onnx
 video_constants_multi.npz
@@ -228,6 +236,9 @@ mask_inputs
 `[1, 1, 288, 288]` at SAM3's prompt-mask resolution for the standard
 `1008x1008` image size. The regular `image_decoder_*` files intentionally keep
 the five-input point-prompt contract used by standard video propagation.
+The runtime discovers the single-mask siblings opportunistically. Bundles
+without them remain compatible but report that single-mask refinement was not
+used.
 
 ## macOS Workflow
 
@@ -306,6 +317,10 @@ python export/onnx_export.py \
   --load-from-hf \
   --precisions fp32
 ```
+
+To add only the two single-mask decoder pairs to an existing bundle, use
+`--singlemask-only`. Older PyTorch exporters that do not support opset 18 can
+set `SAM3_ONNX_OPSET=17`; the generated graphs remain valid for the runtime.
 
 If the upstream SAM3 checkout assumes CUDA during model construction, patch those
 construction-time tensors to use CUDA when available and CPU otherwise. The needed

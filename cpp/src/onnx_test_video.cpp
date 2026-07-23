@@ -638,7 +638,7 @@ void printCandidateSummary(const char* label, const SAM3MaskCandidates& candidat
     }
     std::cout << "]";
     if (candidates.hasSelectedLogits()) {
-        std::cout << " selectedLogits=" << shapeString(candidates.selectedMaskLogitsHighRes.shape);
+        std::cout << " selectedLogits=" << shapeString(candidates.selectedMaskLogitsLowRes.shape);
     }
     if (candidates.hasMultimaskLogits()) {
         std::cout << " multimaskLogits=" << shapeString(candidates.multimaskLogitsHighRes.shape);
@@ -922,11 +922,42 @@ int runOnnxTestVideo(int argc, char** argv)
         }
         anchors[0] = prompts;
         if (diagnostics) {
+            SAM3LogitsTensor previousLogits;
+            if (prompts.points.size() > 1
+                && prompts.points.size() == prompts.pointLabels.size()) {
+                SAM3Prompts firstClick = prompts;
+                firstClick.points.resize(1);
+                firstClick.pointLabels.resize(1);
+                const SAM3MaskCandidates firstCandidates =
+                    previewSam.previewConditioningFrameCandidates(
+                        SAM3Size(firstFrame.cols, firstFrame.rows),
+                        firstClick);
+                printCandidateSummary("preview first-click", firstCandidates);
+                if (firstCandidates.selectedIndex >= 0
+                    && std::size_t(firstCandidates.selectedIndex)
+                           < firstCandidates.candidateMaskLogitsLowRes.size()) {
+                    previousLogits = firstCandidates.candidateMaskLogitsLowRes[
+                        std::size_t(firstCandidates.selectedIndex)];
+                } else {
+                    previousLogits = firstCandidates.selectedMaskLogitsLowRes;
+                }
+            }
             const SAM3MaskCandidates candidates =
                 previewSam.previewConditioningFrameCandidates(
                     SAM3Size(firstFrame.cols, firstFrame.rows),
-                    prompts);
-            printCandidateSummary("preview frame=0", candidates);
+                    prompts,
+                    previousLogits.empty() ? nullptr : &previousLogits,
+                    prompts.points.size() > 1);
+            printCandidateSummary("preview refined", candidates);
+            std::cout << "[DIAG] preview protocol prevLogits="
+                      << (candidates.usedPreviousMaskLogits ? "yes" : "no")
+                      << " singleMask="
+                      << (candidates.usedSingleMaskDecoder ? "yes" : "no")
+                      << " objectScore="
+                      << (candidates.hasObjectScore
+                              ? std::to_string(candidates.objectScoreLogit)
+                              : std::string("n/a"))
+                      << '\n';
         }
 
         CachedEncoderOutputs cachedOutputs;

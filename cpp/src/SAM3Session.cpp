@@ -1117,6 +1117,33 @@ std::string trackerMaskDecoderPathFor(const std::string& decoderPath)
     return maskPath.string();
 }
 
+std::string trackerSingleMaskDecoderPathFor(const std::string& decoderPath,
+                                            bool withPreviousMask)
+{
+    const std::filesystem::path path(decoderPath);
+    const std::string stem = path.stem().string();
+    constexpr const char* prefix = "image_decoder";
+    if (stem.rfind("image_decoder_mask", 0) == 0
+        || stem.rfind("image_decoder_singlemask", 0) == 0
+        || stem.rfind(prefix, 0) != 0) {
+        return {};
+    }
+
+    const std::string suffix =
+        stem.substr(std::char_traits<char>::length(prefix));
+    const std::string singleMaskStem =
+        std::string(withPreviousMask
+                        ? "image_decoder_mask_singlemask"
+                        : "image_decoder_singlemask")
+        + suffix;
+    const std::filesystem::path singleMaskPath =
+        path.parent_path() / (singleMaskStem + path.extension().string());
+    std::error_code error;
+    if (!std::filesystem::exists(singleMaskPath, error))
+        return {};
+    return singleMaskPath.string();
+}
+
 } // namespace
 
 namespace smseg_sam3 {
@@ -1153,6 +1180,8 @@ bool SAM3::clearSessions()
         m_imageMaskDecoderSession.reset();
         m_trackerDecoderSession.reset();
         m_trackerMaskDecoderSession.reset();
+        m_trackerSingleMaskDecoderSession.reset();
+        m_trackerSingleMaskWithMaskDecoderSession.reset();
         m_memoryAttentionSession.reset();
         m_memoryEncoderSession.reset();
 
@@ -1166,6 +1195,10 @@ bool SAM3::clearSessions()
         m_trackerDecoderOutputNodes.clear();
         m_trackerMaskDecoderInputNodes.clear();
         m_trackerMaskDecoderOutputNodes.clear();
+        m_trackerSingleMaskDecoderInputNodes.clear();
+        m_trackerSingleMaskDecoderOutputNodes.clear();
+        m_trackerSingleMaskWithMaskDecoderInputNodes.clear();
+        m_trackerSingleMaskWithMaskDecoderOutputNodes.clear();
         m_memoryAttentionInputNodes.clear();
         m_memoryAttentionOutputNodes.clear();
         m_memoryEncoderInputNodes.clear();
@@ -1181,6 +1214,10 @@ bool SAM3::clearSessions()
         m_trackerDecoderOutputNames.clear();
         m_trackerMaskDecoderInputNames.clear();
         m_trackerMaskDecoderOutputNames.clear();
+        m_trackerSingleMaskDecoderInputNames.clear();
+        m_trackerSingleMaskDecoderOutputNames.clear();
+        m_trackerSingleMaskWithMaskDecoderInputNames.clear();
+        m_trackerSingleMaskWithMaskDecoderOutputNames.clear();
         m_memoryAttentionInputNames.clear();
         m_memoryAttentionOutputNames.clear();
         m_memoryEncoderInputNames.clear();
@@ -1894,6 +1931,36 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
                 &m_trackerMaskDecoderOutputNodes,
                 &m_trackerMaskDecoderInputNames,
                 &m_trackerMaskDecoderOutputNames)) {
+            return false;
+        }
+    }
+    const std::string singleMaskDecoderPath =
+        trackerSingleMaskDecoderPathFor(decoderPath, false);
+    if (!singleMaskDecoderPath.empty()) {
+        if (!initializeNamedSession(
+                &m_trackerSingleMaskDecoderSession,
+                m_env,
+                singleMaskDecoderPath,
+                decoderOptions,
+                &m_trackerSingleMaskDecoderInputNodes,
+                &m_trackerSingleMaskDecoderOutputNodes,
+                &m_trackerSingleMaskDecoderInputNames,
+                &m_trackerSingleMaskDecoderOutputNames)) {
+            return false;
+        }
+    }
+    const std::string singleMaskWithMaskDecoderPath =
+        trackerSingleMaskDecoderPathFor(decoderPath, true);
+    if (!singleMaskWithMaskDecoderPath.empty()) {
+        if (!initializeNamedSession(
+                &m_trackerSingleMaskWithMaskDecoderSession,
+                m_env,
+                singleMaskWithMaskDecoderPath,
+                decoderOptions,
+                &m_trackerSingleMaskWithMaskDecoderInputNodes,
+                &m_trackerSingleMaskWithMaskDecoderOutputNodes,
+                &m_trackerSingleMaskWithMaskDecoderInputNames,
+                &m_trackerSingleMaskWithMaskDecoderOutputNames)) {
             return false;
         }
     }

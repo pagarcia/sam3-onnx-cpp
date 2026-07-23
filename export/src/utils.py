@@ -1,11 +1,12 @@
 import os
+import inspect
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-OPSET = 18
+OPSET = int(os.getenv("SAM3_ONNX_OPSET", "18"))
 OPTIMIZE = False
 RUN_ONNX_CHECKER = False
 
@@ -94,19 +95,21 @@ def _export_model(
             export_path = temp_path
 
     try:
-        torch.onnx.export(
-            model,
-            model_args,
-            export_path,
-            export_params=True,
-            opset_version=OPSET,
-            optimize=OPTIMIZE,
-            dynamo=False,
-            external_data=False,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-        )
+        export_kwargs = {
+            "export_params": True,
+            "opset_version": OPSET,
+            "input_names": input_names,
+            "output_names": output_names,
+            "dynamic_axes": dynamic_axes,
+        }
+        supported = inspect.signature(torch.onnx.export).parameters
+        if "optimize" in supported:
+            export_kwargs["optimize"] = OPTIMIZE
+        if "dynamo" in supported:
+            export_kwargs["dynamo"] = False
+        if "external_data" in supported:
+            export_kwargs["external_data"] = False
+        torch.onnx.export(model, model_args, export_path, **export_kwargs)
         if variant.precision == "fp16":
             _convert_to_fp16(export_path, dst_path, label)
         else:
@@ -129,9 +132,16 @@ def export_image_encoder(model, outdir: str) -> None:
     )
 
 
-def export_image_decoder(model, outdir: str, variant: ExportVariant) -> None:
+def export_image_decoder(
+    model,
+    outdir: str,
+    variant: ExportVariant,
+    *,
+    base_name: str = "image_decoder.onnx",
+    base_label: str = "image decoder",
+) -> None:
     os.makedirs(outdir, exist_ok=True)
-    path = os.path.join(outdir, variant.filename("image_decoder.onnx"))
+    path = os.path.join(outdir, variant.filename(base_name))
 
     point_coords = torch.randn(1, 2, 2, dtype=torch.float32)
     point_labels = torch.tensor([[1, 0]], dtype=torch.int32)
@@ -143,7 +153,7 @@ def export_image_decoder(model, outdir: str, variant: ExportVariant) -> None:
         model,
         (point_coords, point_labels, image_embed, high_res_0, high_res_1),
         path,
-        label=variant.label("image decoder"),
+        label=variant.label(base_label),
         input_names=[
             "point_coords",
             "point_labels",
@@ -168,9 +178,16 @@ def export_image_decoder(model, outdir: str, variant: ExportVariant) -> None:
     )
 
 
-def export_image_decoder_mask(model, outdir: str, variant: ExportVariant) -> None:
+def export_image_decoder_mask(
+    model,
+    outdir: str,
+    variant: ExportVariant,
+    *,
+    base_name: str = "image_decoder_mask.onnx",
+    base_label: str = "image decoder mask",
+) -> None:
     os.makedirs(outdir, exist_ok=True)
-    path = os.path.join(outdir, variant.filename("image_decoder_mask.onnx"))
+    path = os.path.join(outdir, variant.filename(base_name))
 
     point_coords = torch.randn(1, 2, 2, dtype=torch.float32)
     point_labels = torch.tensor([[1, 0]], dtype=torch.int32)
@@ -183,7 +200,7 @@ def export_image_decoder_mask(model, outdir: str, variant: ExportVariant) -> Non
         model,
         (point_coords, point_labels, image_embed, high_res_0, high_res_1, mask_inputs),
         path,
-        label=variant.label("image decoder mask"),
+        label=variant.label(base_label),
         input_names=[
             "point_coords",
             "point_labels",

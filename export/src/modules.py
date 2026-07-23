@@ -197,9 +197,10 @@ class ImageEncoder(nn.Module):
 
 
 class ImageDecoder(nn.Module):
-    def __init__(self, image_model) -> None:
+    def __init__(self, image_model, *, multimask_output: bool = True) -> None:
         super().__init__()
         self.tracker = image_model.inst_interactive_predictor.model
+        self.multimask_output = bool(multimask_output)
 
     @torch.no_grad()
     def _forward(
@@ -228,7 +229,7 @@ class ImageDecoder(nn.Module):
             point_inputs=point_inputs,
             mask_inputs=mask_inputs,
             high_res_features=[high_res_feats_0, high_res_feats_1],
-            multimask_output=True,
+            multimask_output=self.multimask_output,
         )
         return (
             obj_ptr,
