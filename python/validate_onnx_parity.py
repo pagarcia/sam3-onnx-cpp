@@ -2,6 +2,7 @@
 import argparse
 import json
 import tempfile
+from parity_thresholds import check_thresholds as _check_thresholds
 from pathlib import Path
 
 from onnx_runtime_policy import resolve_runtime_caps
@@ -50,32 +51,6 @@ def _resolve_prompt_spec(case: dict):
         "Each validation case must provide one of: prompt object, prompt_json, points, or box."
     )
 
-
-def _check_thresholds(summary: dict, thresholds: dict) -> tuple[bool, list[dict]]:
-    failures = []
-    for metric_name, min_value in thresholds.get("min", {}).items():
-        actual = float(summary.get(metric_name, 0.0))
-        if actual < float(min_value):
-            failures.append(
-                {
-                    "metric": metric_name,
-                    "kind": "min",
-                    "expected": float(min_value),
-                    "actual": actual,
-                }
-            )
-    for metric_name, max_value in thresholds.get("max", {}).items():
-        actual = float(summary.get(metric_name, 0.0))
-        if actual > float(max_value):
-            failures.append(
-                {
-                    "metric": metric_name,
-                    "kind": "max",
-                    "expected": float(max_value),
-                    "actual": actual,
-                }
-            )
-    return len(failures) == 0, failures
 
 
 def main():
