@@ -26,6 +26,14 @@ if(BUILD_TESTING)
   add_test(NAME ArtifactResolverTests COMMAND ArtifactResolverTests)
 endif()
 
+# Environment defaults; explicit CMake cache inputs remain authoritative.
+if(WIN32 AND NOT DEFINED OpenCV_DIR AND DEFINED ENV{OpenCV_DIR})
+  file(TO_CMAKE_PATH "$ENV{OpenCV_DIR}" OpenCV_DIR)
+endif()
+if(WIN32 AND NOT DEFINED ONNXRUNTIME_DIR AND DEFINED ENV{ONNXRUNTIME_ROOT})
+  file(TO_CMAKE_PATH "$ENV{ONNXRUNTIME_ROOT}" ONNXRUNTIME_DIR)
+endif()
+
 if(NOT DEFINED OpenCV_DIR)
   message(FATAL_ERROR "Please set OpenCV_DIR (for example -DOpenCV_DIR=\"C:/Program Files/OpenCV/Release\")")
 endif()

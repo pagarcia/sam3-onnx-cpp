@@ -15,6 +15,28 @@ sam3_env/
 sam3_api_env/
 checkpoints/
 
+# Local credentials, model assets and medical inputs must not enter a commit.
+.env.*
+!.env.example
+!.env.*.example
+.huggingface/
+.hf_token
+stored_tokens
+*.pem
+*.key
+*.p12
+*.pfx
+*.onnx
+*.onnx_data
+*.onnx.data
+*.pt
+*.pth
+*.safetensors
+*.dcm
+*.dicom
+*.nii
+*.nii.gz
+
 # Distribution / packaging
 .Python
 build/
@@ -213,6 +235,7 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+.venv-export/
 
 # PyPI configuration file
 .pypirc

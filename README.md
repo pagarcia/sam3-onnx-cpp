@@ -247,7 +247,7 @@ These commands assume Apple Silicon with Homebrew in `/opt/homebrew`.
 ### 1. Create the Python environment
 
 ```bash
-cd /Users/pgarcia/Documents/sam3-onnx-cpp
+cd /path/to/sam3-onnx-cpp
 python3 -m venv sam3_env
 source sam3_env/bin/activate
 python -m pip install --upgrade pip
@@ -286,8 +286,8 @@ python python/quantize_image_models.py --model encoder --preprocess
 The exporter expects a local SAM3 checkout next to this repo:
 
 ```text
-/Users/pgarcia/Documents/sam3
-/Users/pgarcia/Documents/sam3-onnx-cpp
+/path/to/sam3
+/path/to/sam3-onnx-cpp
 ```
 
 Tracker exports are pinned to the official Meta pre-SAM 3.1 source revision:
@@ -353,7 +353,7 @@ To avoid the file selector:
 python python/onnx_test_image.py \
   --prompt bounding_box \
   --safe \
-  --image /Users/pgarcia/Downloads/kodak_pictures/kodim10.png
+  --image /path/to/image.png
 ```
 
 Expected CPU behavior:
@@ -379,7 +379,7 @@ To avoid the file selector:
 ```bash
 SAM3_ORT_ACCEL=cpu SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
 python python/onnx_test_video.py \
-  --video /Users/pgarcia/Downloads/video_sample.mp4 \
+  --video /path/to/video.mp4 \
   --box 120,80,520,430 \
   --max_frames 10 \
   --safe
@@ -396,7 +396,7 @@ brew install opencv
 Download or unpack ONNX Runtime for macOS arm64, then point CMake at it. Example:
 
 ```bash
-cd /Users/pgarcia/Documents/sam3-onnx-cpp/cpp
+cd /path/to/sam3-onnx-cpp/cpp
 
 cmake -S . -B build_release \
   -DOpenCV_DIR="$(brew --prefix opencv)/lib/cmake/opencv4" \
@@ -415,7 +415,7 @@ cpp/package/Segment.app/Contents/MacOS/Segment
 ### 8. Run C++ demos on macOS
 
 ```bash
-cd /Users/pgarcia/Documents/sam3-onnx-cpp
+cd /path/to/sam3-onnx-cpp
 SEG=cpp/package/Segment.app/Contents/MacOS/Segment
 ```
 
@@ -457,7 +457,7 @@ SAM3_ONNX_VARIANT=fp32 "$SEG" --onnx_test_image \
 
 SAM3_ORT_GRAPH_OPT=disable SAM3_ONNX_VARIANT=fp32 SAM3_ORT_TRACKER_PRECISION=fp32 \
 "$SEG" --onnx_test_video \
-  --video /Users/pgarcia/Downloads/video_sample.mp4 \
+  --video /path/to/video.mp4 \
   --box 120,80,520,430 \
   --max_frames 10 \
   --device cpu \

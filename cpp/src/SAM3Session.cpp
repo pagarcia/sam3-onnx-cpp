@@ -1056,10 +1056,27 @@ bool preloadCudaWindowsRuntime()
     }
 
     const std::vector<std::wstring> searchDirectories = collectCudaSearchDirectories();
-    const std::array<std::wstring, 11> requiredDlls = {
-        L"cudart64_12.dll",
-        L"cublas64_12.dll",
-        L"cublasLt64_12.dll",
+    // CUDA 13 wheels use different DLL names. Preload each complete available
+    // family; the installed ONNX provider determines which ABI it needs.
+    bool cudaRuntimeLoaded = false;
+    for (const int major : {13, 12}) {
+        const std::wstring suffix = std::to_wstring(major) + L".dll";
+        bool complete = true;
+        for (const auto* prefix : {L"cudart64_", L"cublas64_", L"cublasLt64_"}) {
+            if (HMODULE loaded = loadDllFromSearchDirectories(prefix + suffix, searchDirectories)) {
+                loadedModules.push_back(loaded);
+            } else {
+                complete = false;
+            }
+        }
+        cudaRuntimeLoaded = cudaRuntimeLoaded || complete;
+    }
+    if (!cudaRuntimeLoaded) {
+        cached = 0;
+        return false;
+    }
+
+    const std::array<std::wstring, 8> requiredDlls = {
         L"cudnn64_9.dll",
         L"cudnn_adv64_9.dll",
         L"cudnn_cnn64_9.dll",
@@ -1069,7 +1086,10 @@ bool preloadCudaWindowsRuntime()
         L"cudnn_heuristic64_9.dll",
         L"cudnn_ops64_9.dll",
     };
-    const std::array<std::wstring, 6> optionalDlls = {
+    const std::array<std::wstring, 9> optionalDlls = {
+        L"cufft64_12.dll",
+        L"cufftw64_12.dll",
+        L"nvrtc64_130_0.dll",
         L"cufft64_11.dll",
         L"cufftw64_11.dll",
         L"curand64_10.dll",
@@ -2457,10 +2477,9 @@ bool SAM3::hasCudaDriver()
         return false;
     }
 
-    static HMODULE cudartHandle = GetModuleHandleW(L"cudart64_12.dll");
-    if (!cudartHandle) {
-        cudartHandle = loadDllFromSearchDirectories(L"cudart64_12.dll", collectCudaSearchDirectories());
-    }
+    HMODULE cudartHandle = GetModuleHandleW(L"cudart64_13.dll");
+    if (!cudartHandle)
+        cudartHandle = GetModuleHandleW(L"cudart64_12.dll");
     if (!cudartHandle) {
         cached = 0;
         return false;

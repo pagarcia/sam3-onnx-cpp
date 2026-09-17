@@ -33,6 +33,10 @@ int main(int argc, char** argv)
         }
 
         const std::string mode = argv[1];
+        if (mode == "--help" || mode == "-h") {
+            printMainUsage();
+            return 0;
+        }
         if (mode == "--onnx_test_image") {
             return runOnnxTestImage(argc, argv);
         }
