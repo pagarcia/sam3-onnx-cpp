@@ -17,6 +17,12 @@ else()
 endif()
 
 if(BUILD_TESTING)
+  add_executable(SAM3TensorCopyTests tests/SAM3TensorCopyTests.cpp)
+  target_include_directories(SAM3TensorCopyTests PRIVATE src)
+  add_test(NAME SAM3TensorCopyTests COMMAND SAM3TensorCopyTests)
+  add_executable(SAM3CoreMLConfigTests tests/SAM3CoreMLConfigTests.cpp)
+  target_include_directories(SAM3CoreMLConfigTests PRIVATE src)
+  add_test(NAME SAM3CoreMLConfigTests COMMAND SAM3CoreMLConfigTests)
   add_executable(ArtifactResolverTests
     tests/ArtifactResolverTests.cpp
   )
@@ -45,7 +51,11 @@ endif()
 find_package(OpenCV REQUIRED)
 message(STATUS "Found OpenCV ${OpenCV_VERSION} at: ${OpenCV_DIR}")
 include_directories(${OpenCV_INCLUDE_DIRS})
-include_directories(${ONNXRUNTIME_DIR}/include)
+set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_DIR}/include")
+if(EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime/onnxruntime_cxx_api.h")
+  set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime")
+endif()
+include_directories(${ONNXRUNTIME_INCLUDE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR})
 
@@ -96,15 +106,18 @@ add_executable(${TARGET_NAME}
 )
 
 if(APPLE)
+  enable_language(OBJCXX)
+  target_sources(${TARGET_NAME} PRIVATE src/SAM3NativeEncoder.mm)
+  set_source_files_properties(src/SAM3NativeEncoder.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_link_libraries(${TARGET_NAME} PRIVATE
     ${ONNXRUNTIME_LIB}
     ${OpenCV_LIBS}
     "-framework Cocoa"
+    "-framework CoreML"
   )
 
   set_target_properties(${TARGET_NAME} PROPERTIES
     MACOSX_BUNDLE TRUE
-    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Info.plist.in"
     BUILD_RPATH "@loader_path/../Frameworks"
     INSTALL_RPATH "@loader_path/../Frameworks;@executable_path/../Frameworks;${CMAKE_INSTALL_RPATH}"
   )

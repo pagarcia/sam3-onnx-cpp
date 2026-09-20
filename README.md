@@ -754,11 +754,71 @@ fusion alone as an optimization without those measurements.
 - On CPU video, use `--safe` in Python and `SAM3_ORT_GRAPH_OPT=disable` in C++ to avoid aggressive ORT graph rewrites on the exported tracker modules.
 - Keep live CPU video demos to `2` or `3` frames.
 
+## C++ Core ML configuration
+
+The opt-in `coreml` device uses MLProgram through ORT's modern provider API.
+`cpp/src/SAM3CoreML.h` owns the provider settings. No Apple SDK provider header
+is required. Use a
+native arm64 build and an ORT distribution that advertises Core ML. Homebrew
+ORT 1.26 has a reproduced SAM3 external-weight initialization failure fixed
+upstream in [ORT PR 29394](https://github.com/microsoft/onnxruntime/pull/29394);
+The official arm64 ORT 1.30 SDK includes that fix.
+
+- `SAM3_ORT_COREML_COMPUTE_UNITS`: `ALL` (default), `CPUAndGPU`,
+  `CPUAndNeuralEngine`, or `CPUOnly`. These are allowed devices, not proof of
+  complete GPU/ANE execution.
+- `SAM3_ORT_COREML_STATIC_SHAPES=1`: restrict Core ML partitioning to static shapes.
+- `SAM3_ORT_ENCODER_FIXED_BATCH=1`: specialize encoder `batch_size` to one,
+  including for CPU reference runs. This does not rewrite the model.
+- `SAM3_ORT_COREML_SPECIALIZATION`: `Default` or `FastPrediction`.
+- `SAM3_ORT_COREML_PROFILE=1`: enable verbose compute-plan diagnostics.
+- Compilation caching requires **both** `SAM3_ORT_COREML_CACHE_DIR` (absolute)
+  and `SAM3_ORT_COREML_CACHE_KEY` (64-character lowercase SHA256). The caller
+  must verify model graphs, external weights, runtime and settings and hash
+  that identity. Path-only keys are unsafe; leave caching disabled when that
+  identity is unavailable.
+
+Boolean controls accept exactly `0` or `1`; invalid provider settings fail
+explicitly. Low-precision GPU accumulation is disabled. Keep CPU references and
+mask comparisons when experimenting with FP16 or graph optimizations.
+
+Homebrew build example:
+
+```sh
+cmake -S cpp -B cpp/build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DONNXRUNTIME_DIR=/path/to/onnxruntime-osx-arm64-1.30.0 \
+  -DOpenCV_DIR=/opt/homebrew/opt/opencv/lib/cmake/opencv4
+cmake --build cpp/build-mac --parallel 4
+ctest --test-dir cpp/build-mac --output-on-failure
+```
+
+### Direct native Core ML encoder
+
+The C++ library also accepts `coreml-native` (CPU and GPU allowed) and
+`coreml-native-cpu` (CPU only) when initializing a video or image pipeline.
+Pass a compiled `.mlmodelc` directory as the encoder path and the usual FP32
+ONNX tracker paths. This is an explicit encoder-only option; tracking remains
+on CPU and automatic device selection remains unchanged.
+
+The compiled model must expose FP32 `image` with shape `[1,3,1008,1008]` and
+FP32 `embedding0`, `embedding1`, `embedding2` with shapes `[1,32,288,288]`,
+`[1,64,144,144]`, `[1,256,72,72]`. It must return the unconditioned final image
+features: the runtime adds the no-memory embedding where needed. Supply a model
+exported from the same checkpoint as the tracker and independently compare
+features and masks before deployment. This backend requires macOS 15 or later.
+
+One native model avoids ONNX/Core ML graph partitioning. Its session persists
+across predictions, and returned tensors own their memory so existing feature
+caches remain usable. The adapter checks tensor contracts and finite values,
+copies padded output strides correctly and does not silently substitute another
+backend after an explicit initialization failure. No Python is used at runtime.
+
 ## Known Issues And Next Steps
 
-- macOS is currently CPU-first. ONNX Runtime may list CoreML as an available
-  provider, but the SAM3 Python and C++ paths still need a validated CoreML
-  integration. The first useful target is encoder acceleration.
+- macOS remains CPU-first. C++ now registers Core ML using MLProgram and the
+  configuration above; the Python provider path is unchanged. Full segmentation
+  qualification is required before selecting Core ML automatically.
 - SAM3 video on CPU is slow because the 1008x1008 vision encoder and memory
   attention are expensive. CUDA, TensorRT, FP16 tracker artifacts, and I/O
   binding are the main acceleration paths to harden next.

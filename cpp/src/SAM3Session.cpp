@@ -1,4 +1,6 @@
 #include "SAM3.h"
+#include "SAM3CoreML.h"
+#include "SAM3NativeEncoder.h"
 
 #include <algorithm>
 #include <array>
@@ -1196,6 +1198,7 @@ bool SAM3::clearSessions()
 {
     try {
         m_encoderSession.reset();
+        m_nativeEncoder.reset();
         m_imageDecoderSession.reset();
         m_imageMaskDecoderSession.reset();
         m_trackerDecoderSession.reset();
@@ -1386,6 +1389,12 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
     options.SetInterOpNumThreads(safeInterOpThreads);
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
     options.SetGraphOptimizationLevel(resolvedOpt.level);
+    if (role == SAM3SessionRole::Encoder
+        && SAM3CoreMLConfig::booleanEnvironment("SAM3_ORT_ENCODER_FIXED_BATCH")) {
+        // Applies to CPU references too: shape specialization is an independent
+        // experiment from provider placement and never rewrites model files.
+        Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(options, "batch_size", 1));
+    }
     if (enableCpuArena) {
         options.EnableCpuMemArena();
     } else {
@@ -1413,6 +1422,8 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
             cudaOptions.device_id = 0;
         }
         options.AppendExecutionProvider_CUDA(cudaOptions);
+#else
+        throw std::runtime_error("CUDA EP is not available on macOS");
 #endif
         return;
     }
@@ -1451,17 +1462,19 @@ void SAM3::setupSessionOptions(Ort::SessionOptions& options,
         return;
     }
 
-    if (device.rfind("coreml", 0) == 0) {
+    if (device == "coreml") {
 #ifdef __APPLE__
-        ortThrowIf(
-            OrtSessionOptionsAppendExecutionProvider_CoreML(options, 0),
-            "Append CoreML EP failed");
+        const auto config = SAM3CoreMLConfig::fromEnvironment();
+        if (config.profileComputePlan) options.SetLogSeverityLevel(0);
+        options.AppendExecutionProvider("CoreML", config.providerOptions());
         return;
+#else
+        throw std::runtime_error("CoreML EP is only available on macOS");
 #endif
-        return;
     }
 
     // CPU EP is registered by ONNX Runtime by default.
+    if (device != "cpu") throw std::runtime_error("Unknown SAM3 device: " + device);
 }
 
 std::vector<SAM3Node> SAM3::getSessionNodes(Ort::Session* session, bool isInput)
@@ -1500,6 +1513,24 @@ int SAM3::findNameIndex(const std::vector<const char*>& names, const std::string
         }
     }
     return -1;
+}
+
+bool SAM3::initializeEncoder(const std::string& path, int threads, const std::string& device)
+{
+    if (device == "coreml-native" || device == "coreml-native-cpu") {
+        m_nativeEncoder = SAM3NativeEncoder::create(path, device == "coreml-native-cpu");
+        m_encoderInputNodes = {{"image", {1, 3, 1008, 1008}}};
+        m_encoderOutputNodes = {{"image_embeddings.0", {1, 32, 288, 288}},
+                                {"image_embeddings.1", {1, 64, 144, 144}},
+                                {"image_embeddings.2", {1, 256, 72, 72}}};
+        return true;
+    }
+    Ort::SessionOptions options;
+    setupSessionOptions(options, threads,
+        device == "cpu" ? ORT_ENABLE_ALL : ORT_ENABLE_EXTENDED,
+        device, SAM3SessionRole::Encoder);
+    return initializeNamedSession(&m_encoderSession, m_env, path, options,
+        &m_encoderInputNodes, &m_encoderOutputNodes, &m_encoderInputNames, &m_encoderOutputNames);
 }
 
 bool SAM3::initializeNamedSession(std::unique_ptr<Ort::Session>* sessionOut,
@@ -1623,31 +1654,16 @@ bool SAM3::initializeImage(const std::string& encoderPath,
         return false;
     }
 
-    Ort::SessionOptions encoderOptions;
     Ort::SessionOptions decoderOptions;
     const GraphOptimizationLevel optLevel =
         device == "cpu" ? GraphOptimizationLevel::ORT_ENABLE_ALL : GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
     setupSessionOptions(
-        encoderOptions,
-        threadsNumber,
-        optLevel,
-        device,
-        SAM3SessionRole::Encoder);
-    setupSessionOptions(
         decoderOptions,
         threadsNumber,
         optLevel,
-        device);
+        device.rfind("coreml-native", 0) == 0 ? "cpu" : device);
 
-    if (!initializeNamedSession(
-            &m_encoderSession,
-            m_env,
-            encoderPath,
-            encoderOptions,
-            &m_encoderInputNodes,
-            &m_encoderOutputNodes,
-            &m_encoderInputNames,
-            &m_encoderOutputNames)) {
+    if (!initializeEncoder(encoderPath, threadsNumber, device)) {
         return false;
     }
 
@@ -1889,7 +1905,6 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
         return false;
     }
 
-    Ort::SessionOptions encoderOptions;
     Ort::SessionOptions decoderOptions;
     Ort::SessionOptions memoryAttentionOptions;
     Ort::SessionOptions memoryEncoderOptions;
@@ -1897,36 +1912,22 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
         device == "cpu" ? GraphOptimizationLevel::ORT_ENABLE_ALL : GraphOptimizationLevel::ORT_ENABLE_EXTENDED;
 
     setupSessionOptions(
-        encoderOptions,
-        threadsNumber,
-        optLevel,
-        device,
-        SAM3SessionRole::Encoder);
-    setupSessionOptions(
         decoderOptions,
         threadsNumber,
         optLevel,
-        device);
+        device.rfind("coreml-native", 0) == 0 ? "cpu" : device);
     setupSessionOptions(
         memoryAttentionOptions,
         threadsNumber,
         optLevel,
-        device);
+        device.rfind("coreml-native", 0) == 0 ? "cpu" : device);
     setupSessionOptions(
         memoryEncoderOptions,
         threadsNumber,
         optLevel,
-        device);
+        device.rfind("coreml-native", 0) == 0 ? "cpu" : device);
 
-    if (!initializeNamedSession(
-            &m_encoderSession,
-            m_env,
-            encoderPath,
-            encoderOptions,
-            &m_encoderInputNodes,
-            &m_encoderOutputNodes,
-            &m_encoderInputNames,
-            &m_encoderOutputNames)) {
+    if (!initializeEncoder(encoderPath, threadsNumber, device)) {
         return false;
     }
     if (!initializeNamedSession(
@@ -2330,6 +2331,7 @@ bool SAM3::restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs)
 
 bool SAM3::preprocessImage(const Image<float>& originalImage)
 {
+    m_lastEncoderError.clear();
     try {
         const SAM3Size targetSize = getInputSize();
         const Image<float> encoderImage =
@@ -2339,7 +2341,8 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
         const std::vector<float> encoderData = encoderImage.getDataPlanarFormat();
         return preprocessImageTensor(encoderData);
     } catch (const std::exception& error) {
-        std::cerr << "[ERROR] preprocessImage => " << error.what() << '\n';
+        m_lastEncoderError = std::string("preprocessImage: ") + error.what();
+        std::cerr << "[ERROR] " << m_lastEncoderError << '\n';
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
@@ -2350,34 +2353,32 @@ bool SAM3::preprocessImage(const Image<float>& originalImage)
 
 bool SAM3::preprocessImageTensor(const std::vector<float>& encoderNchw)
 {
+    m_lastEncoderError.clear();
     try {
         const std::size_t expected = computeElementCount(m_inputShapeEncoder);
         if (expected == 0 || encoderNchw.size() != expected) {
             throw std::runtime_error("encoder tensor does not match the model input shape");
         }
-        Ort::Value inputTensor =
-            createTensor<float>(m_memoryInfo, encoderNchw, m_inputShapeEncoder);
-        std::vector<Ort::Value> inputs;
-        inputs.push_back(std::move(inputTensor));
-
-        auto result = runSession(
-            m_encoderSession.get(),
-            m_encoderInputNames,
-            m_encoderOutputNames,
-            inputs,
-            "encoder");
-        if (result.index() == 1) {
-            std::cerr << std::get<std::string>(result) << '\n';
-            return false;
+        if (m_nativeEncoder) {
+            m_cachedEncoderOutputs = m_nativeEncoder->run(encoderNchw);
+        } else {
+            Ort::Value inputTensor =
+                createTensor<float>(m_memoryInfo, encoderNchw, m_inputShapeEncoder);
+            std::vector<Ort::Value> inputs;
+            inputs.push_back(std::move(inputTensor));
+            auto result = runSession(m_encoderSession.get(), m_encoderInputNames,
+                                     m_encoderOutputNames, inputs, "encoder");
+            if (result.index() == 1)
+                throw std::runtime_error(std::get<std::string>(result));
+            m_cachedEncoderOutputs = std::move(std::get<0>(result));
         }
-
-        m_cachedEncoderOutputs = std::move(std::get<0>(result));
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;
         invalidateNoMemoryImageEmbeddingCache();
         return true;
     } catch (const std::exception& error) {
-        std::cerr << "[ERROR] preprocessImageTensor => " << error.what() << '\n';
+        m_lastEncoderError = std::string("preprocessImageTensor: ") + error.what();
+        std::cerr << "[ERROR] " << m_lastEncoderError << '\n';
         m_cachedEncoderOutputs.clear();
         m_cachedEncoderHostCopy = CachedEncoderOutputs();
         m_hasCachedEncoderHostCopy = false;

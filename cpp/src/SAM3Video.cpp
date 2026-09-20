@@ -534,16 +534,11 @@ SAM3MaskCandidates SAM3::collectTrackerMaskCandidates(
         return -1;
     };
     const int predMaskIndex = exactOutputIndex("pred_mask");
-    const int predMaskHighResIndex =
-        exactOutputIndex("pred_mask_high_res");
-    const int predMultimasksIndex =
-        exactOutputIndex("pred_multimasks");
-    const int predMultimasksHighResIndex =
-        exactOutputIndex("pred_multimasks_high_res");
+    const int predMaskHighResIndex = exactOutputIndex("pred_mask_high_res");
+    const int predMultimasksIndex = exactOutputIndex("pred_multimasks");
+    const int predMultimasksHighResIndex = exactOutputIndex("pred_multimasks_high_res");
     const int iouScoresIndex = exactOutputIndex("iou_scores");
-    const int objectScoreIndex =
-        exactOutputIndex("object_score_logits");
-
+    const int objectScoreIndex = exactOutputIndex("object_score_logits");
     if (predMaskHighResIndex < 0
         || decoderOutputs.size() <= static_cast<size_t>(predMaskHighResIndex)) {
         return result;
@@ -578,37 +573,30 @@ SAM3MaskCandidates SAM3::collectTrackerMaskCandidates(
             decoderOutputs[static_cast<size_t>(iouScoresIndex)]);
     }
     result.selectedIndex = bestScoreIndex(result.scores, result.masks.size());
-
     if (predMaskIndex >= 0
         && decoderOutputs.size() > static_cast<size_t>(predMaskIndex)) {
         copyMaskPlaneTensor(
-            decoderOutputs[static_cast<size_t>(predMaskIndex)],
-            0,
+            decoderOutputs[static_cast<size_t>(predMaskIndex)], 0,
             &result.selectedMaskLogitsLowRes.values,
             &result.selectedMaskLogitsLowRes.shape);
     }
     if (predMultimasksIndex >= 0
         && decoderOutputs.size() > static_cast<size_t>(predMultimasksIndex)) {
-        const Ort::Value& logits =
-            decoderOutputs[static_cast<size_t>(predMultimasksIndex)];
+        const Ort::Value& logits = decoderOutputs[static_cast<size_t>(predMultimasksIndex)];
         result.candidateMaskLogitsLowRes.resize(result.masks.size());
         for (std::size_t i = 0; i < result.candidateMaskLogitsLowRes.size(); ++i) {
             SAM3LogitsTensor& candidate = result.candidateMaskLogitsLowRes[i];
-            if (!copyMaskPlaneTensor(
-                    logits,
-                    static_cast<int>(i),
-                    &candidate.values,
-                    &candidate.shape)) {
+            if (!copyMaskPlaneTensor(logits, static_cast<int>(i),
+                                     &candidate.values, &candidate.shape))
                 candidate = SAM3LogitsTensor{};
-            }
         }
     }
     if (objectScoreIndex >= 0
         && decoderOutputs.size() > static_cast<size_t>(objectScoreIndex)) {
-        const std::vector<float> scores = tensorFloatValues(
+        const std::vector<float> objectScores = tensorFloatValues(
             decoderOutputs[static_cast<size_t>(objectScoreIndex)]);
-        if (!scores.empty() && std::isfinite(scores.front())) {
-            result.objectScoreLogit = scores.front();
+        if (!objectScores.empty() && std::isfinite(objectScores.front())) {
+            result.objectScoreLogit = objectScores.front();
             result.hasObjectScore = true;
         }
     }

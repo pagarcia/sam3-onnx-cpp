@@ -26,9 +26,16 @@ stored_tokens
 *.key
 *.p12
 *.pfx
+*.provisionprofile
+*.mobileprovision
 *.onnx
 *.onnx_data
 *.onnx.data
+*.mlmodel
+*.mlmodelc/
+*.mlpackage/
+*.npz
+*.npy
 *.pt
 *.pth
 *.safetensors
@@ -40,6 +47,7 @@ stored_tokens
 # Distribution / packaging
 .Python
 build/
+/build-mac*/
 /cpp/build*/
 /cpp/package/
 /cpp/.vs/
@@ -54,6 +62,7 @@ build/
 /cpp/*.vcxproj.filters
 /cpp/*.vcxproj.user
 /cpp/Info.plist.in
+*.dSYM/
 develop-eggs/
 dist/
 downloads/

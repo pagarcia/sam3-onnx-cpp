@@ -3,9 +3,6 @@
 
 #include <onnxruntime_cxx_api.h>
 #include <cpu_provider_factory.h>
-#ifdef __APPLE__
-#include <coreml_provider_factory.h>
-#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -320,6 +317,8 @@ struct SAM3RuntimeMetadata {
     std::vector<SAM3Node> imageDecoderOutputNodes;
 };
 
+class SAM3NativeEncoder;
+
 class SAM3 {
 public:
     SAM3();
@@ -345,6 +344,7 @@ public:
 
     bool preprocessImage(const Image<float>& originalImage);
     bool preprocessImageTensor(const std::vector<float>& encoderNchw);
+    const std::string& lastEncoderError() const noexcept { return m_lastEncoderError; }
     bool captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const;
     bool restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs);
 
@@ -393,6 +393,7 @@ public:
 private:
     bool clearSessions();
     void warmupVideoRuntime(bool includeEncoder);
+    bool initializeEncoder(const std::string& path, int threads, const std::string& device);
     bool initializeNamedSession(std::unique_ptr<Ort::Session>* sessionOut,
                                 const Ort::Env& env,
                                 const std::string& modelPath,
@@ -471,6 +472,7 @@ private:
     Ort::Env m_env{ORT_LOGGING_LEVEL_WARNING, "smseg_sam3"};
 
     std::unique_ptr<Ort::Session> m_encoderSession;
+    std::unique_ptr<SAM3NativeEncoder> m_nativeEncoder;
     std::unique_ptr<Ort::Session> m_imageDecoderSession;
     std::unique_ptr<Ort::Session> m_imageMaskDecoderSession;
     std::unique_ptr<Ort::Session> m_trackerDecoderSession;
@@ -584,6 +586,7 @@ private:
     bool m_usePropagationIoBinding = false;
     bool m_propagationIoBindingDisabledAfterFailure = false;
     std::string m_device = "cpu";
+    std::string m_lastEncoderError;
 };
 
 } // namespace smseg_sam3
