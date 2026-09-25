@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "SAM3NativeModel.h"
 
 namespace smseg_sam3 {
 
@@ -16,6 +17,7 @@ public:
     virtual std::vector<Ort::Value> run(const std::vector<float>& nchw) = 0;
     static std::unique_ptr<SAM3NativeEncoder> create(const std::string& compiledModel,
                                                    bool cpuOnly = false);
+
 };
 
 #ifndef __APPLE__

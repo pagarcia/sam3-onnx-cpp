@@ -1,4 +1,5 @@
 #include "SAM3.h"
+#include "SAM3CudaInputCache.h"
 #include "SAM3CoreML.h"
 #include "SAM3NativeEncoder.h"
 
@@ -1196,6 +1197,9 @@ bool SAM3::modelExists(const std::string& modelPath) const
 
 bool SAM3::clearSessions()
 {
+    // Allocator and device tensors must be released before their owning session.
+    m_cudaInputCache.reset();
+    m_useCudaInputCache = true;
     try {
         m_encoderSession.reset();
         m_nativeEncoder.reset();
@@ -1584,6 +1588,40 @@ std::variant<std::vector<Ort::Value>, std::string> SAM3::runSession(
     }
 
     try {
+        // Cache only immutable feature tensors, and only in sessions on the
+        // same CUDA device as the tracker decoder. Ordinary Run remains the
+        // fallback if allocation, binding or execution rejects this optimization.
+        const bool cacheSession = m_usePropagationIoBinding &&
+            (session == m_trackerDecoderSession.get() || session == m_trackerMaskDecoderSession.get() ||
+             session == m_trackerSingleMaskDecoderSession.get() || session == m_trackerSingleMaskWithMaskDecoderSession.get());
+        if (cacheSession && m_useCudaInputCache && envBool("SAM3_ORT_CUDA_INPUT_CACHE", true) && inputNames.size() == inputTensors.size()) {
+            try {
+                if (!m_cudaInputCache)
+                    m_cudaInputCache = std::make_unique<SAM3CudaInputCache>(*m_trackerDecoderSession,
+                        m_cudaMemoryInfo.GetDeviceId());
+                Ort::IoBinding binding(*session);
+                for (size_t i = 0; i < inputTensors.size(); ++i) {
+                    const auto& input = inputTensors[i];
+                    bool feature = false;
+                    if (input.GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_CPU &&
+                        input.GetTensorTypeAndShapeInfo().GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                        const auto pointer = input.GetTensorData<float>();
+                        for (const auto& cached : m_cachedEncoderOutputs)
+                            if (cached && cached.GetTensorData<float>() == pointer) { feature = true; break; }
+                    }
+                    binding.BindInput(inputNames[i], feature ? m_cudaInputCache->get(input) : input);
+                }
+                for (const auto* name : outputNames) binding.BindOutput(name, m_memoryInfo);
+                binding.SynchronizeInputs();
+                session->Run(Ort::RunOptions{nullptr}, binding);
+                binding.SynchronizeOutputs();
+                return binding.GetOutputValues();
+            } catch (const std::exception& error) {
+                std::cerr << "[WARN] CUDA feature cache disabled: " << error.what() << '\n';
+                m_cudaInputCache.reset();
+                m_useCudaInputCache = false;
+            }
+        }
         auto outputs = session->Run(
             Ort::RunOptions{nullptr},
             inputNames.data(),
@@ -1880,7 +1918,7 @@ bool SAM3::initializeVideo(const std::string& encoderPath,
     m_compressEncoderCacheToHalf = compressEncoderCacheToHalf(encoderPath);
 
 #if !defined(__APPLE__)
-    if (envBool("SAM3_ORT_PROPAGATION_IO_BINDING", false)
+    if (envBool("SAM3_ORT_PROPAGATION_IO_BINDING", true)
         && device.rfind("cuda:", 0) == 0) {
         int deviceId = 0;
         try {
@@ -2387,8 +2425,16 @@ bool SAM3::preprocessImageTensor(const std::vector<float>& encoderNchw)
     }
 }
 
+uint64_t SAM3::cudaFeatureCacheHits() const noexcept {
+    return m_cudaInputCache ? m_cudaInputCache->hits : 0;
+}
+uint64_t SAM3::cudaFeatureUploadBytes() const noexcept {
+    return m_cudaInputCache ? m_cudaInputCache->uploaded_bytes : 0;
+}
+
 void SAM3::invalidateNoMemoryImageEmbeddingCache()
 {
+    if (m_cudaInputCache) m_cudaInputCache->clear();
     m_noMemoryImageEmbedScratch.clear();
     m_noMemoryImageEmbedCacheShape.clear();
     m_noMemoryImageEmbedCacheSource = nullptr;

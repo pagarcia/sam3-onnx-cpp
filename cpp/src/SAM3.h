@@ -345,6 +345,8 @@ public:
     bool preprocessImage(const Image<float>& originalImage);
     bool preprocessImageTensor(const std::vector<float>& encoderNchw);
     const std::string& lastEncoderError() const noexcept { return m_lastEncoderError; }
+    uint64_t cudaFeatureCacheHits() const noexcept;
+    uint64_t cudaFeatureUploadBytes() const noexcept;
     bool captureCachedEncoderOutputs(CachedEncoderOutputs* outputs) const;
     bool restoreCachedEncoderOutputs(const CachedEncoderOutputs& outputs);
 
@@ -481,6 +483,7 @@ private:
     std::unique_ptr<Ort::Session> m_trackerSingleMaskWithMaskDecoderSession;
     std::unique_ptr<Ort::Session> m_memoryAttentionSession;
     std::unique_ptr<Ort::Session> m_memoryEncoderSession;
+    std::unique_ptr<class SAM3CudaInputCache> m_cudaInputCache;
 
     std::vector<SAM3Node> m_encoderInputNodes;
     std::vector<SAM3Node> m_encoderOutputNodes;
@@ -584,6 +587,7 @@ private:
     Ort::MemoryInfo m_memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     Ort::MemoryInfo m_cudaMemoryInfo{nullptr};
     bool m_usePropagationIoBinding = false;
+    bool m_useCudaInputCache = true;
     bool m_propagationIoBindingDisabledAfterFailure = false;
     std::string m_device = "cpu";
     std::string m_lastEncoderError;
