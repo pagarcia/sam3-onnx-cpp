@@ -12,7 +12,7 @@ public `facebookresearch/sam3` source at the revision pinned in
 `python/sam3_revision.py`. By default the checkout is `../sam3`. To reuse another
 checkout, pass `-Sam3Repo C:/path/to/sam3`; use the same path with the exporter's
 `--sam3-repo` option. Setup synchronizes that checkout to the pinned revision.
-No private repository is required and setup does not download model weights.
+Setup does not download model weights.
 
 Run `export/onnx_export.py` using `.venv-export/Scripts/python.exe`; its Windows
 compatibility shim handles optional unavailable Triton modules.

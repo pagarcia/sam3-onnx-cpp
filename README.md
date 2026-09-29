@@ -32,7 +32,7 @@ CUDA 1.30.0, but changed synthetic masks (minimum IoU about 0.99885) and showed
 slower inference in the initial comparisons. **It is not release-qualified.**
 An isolated NSIS compression comparison reduced its download contribution
 from about 817 MB to 413 MB; none of that experimental saving is enabled in
-the shipping manifests.
+the default model downloads or exports.
 Representative scan comparisons, provider profiling, memory measurements and
 repeatable timing are required before any deployment.
 
