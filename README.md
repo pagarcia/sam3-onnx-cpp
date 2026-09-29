@@ -14,6 +14,28 @@ Important distinction:
 
 For live CPU demos, keep video very short with `--max_frames 10` or `--max_frames 20`.
 
+### Experimental GPU weight storage
+
+`python/probe_encoder_weight_compression.py` creates a **separate research
+candidate**, preserving FP16 activations while storing constant MatMul weights
+as per-column INT8. Standard DequantizeLinear/Cast nodes reconstruct weights at
+load/execution time. It does not replace the default encoder or alter export
+recipes, and does not imply reduced execution memory or faster inference.
+
+```powershell
+.venv-export/Scripts/python.exe python/probe_encoder_weight_compression.py --source C:/path/to/vision_encoder_fp16.onnx --output build/encoder-storage-probe
+```
+
+Use a new output directory. The September 29, 2026 experiment reduced the
+encoder from 936 MB to 493 MB uncompressed. It loaded on DirectML 1.24.4 and
+CUDA 1.30.0, but changed synthetic masks (minimum IoU about 0.99885) and showed
+slower inference in the initial comparisons. **It is not release-qualified.**
+An isolated NSIS compression comparison reduced its download contribution
+from about 817 MB to 413 MB; none of that experimental saving is enabled in
+the shipping manifests.
+Representative scan comparisons, provider profiling, memory measurements and
+repeatable timing are required before any deployment.
+
 ## Table Of Contents
 
 - [How The Pieces Fit](#how-the-pieces-fit)
