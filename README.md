@@ -872,6 +872,53 @@ On Windows:
 .\sam3_env\Scripts\python.exe .\python\api_test_image.py --prompt seed_points
 ```
 
+## Lossless tensor storage experiments
+
+`python/compact_tensor_storage.py` writes a separate ONNX candidate whose
+byte-identical tensors share external storage. It includes Constant attributes
+and initializers, keeps the original files, and verifies that reloading restores
+the same complete graph and tensor values. It does not quantize the model.
+
+```bash
+python python/compact_tensor_storage.py --source models/model.onnx --output candidates/model
+python -m unittest discover -s python -p test_compact_tensor_storage.py
+```
+
+The output folder must not exist or be inside the source model directory.
+Keep the generated graph and weight companion together. The `storage.json`
+receipt records hashes, duplicate bytes and alignment overhead. Installed-size
+savings do not predict compressed-download savings. Test loading, masks, memory
+and warmed timing on each intended execution provider before deploying a candidate;
+external Constant storage is not assumed compatible with every backend.
+
+## Selective encoder quantization experiments
+
+`python/probe_encoder_weight_compression.py` can restrict experimental INT8
+weight storage to matrices used by matching nodes. For example, this candidate
+keeps attention weights and the first/last four encoder blocks at FP16:
+
+```bash
+python python/probe_encoder_weight_compression.py --source models/vision_encoder_fp16.onnx --output candidates/mlp-middle24 --include-node-regex '/mlp/' --exclude-node-regex '/layers\.(?:[0-3]|2[89]|3[01])/'
+python -m unittest discover -s python -p test_encoder_weight_compression.py
+```
+
+These expressions target the 32-block encoder export's node names. Every
+consumer of a shared weight must match the inclusion pattern, and none may
+match the exclusion pattern. Check the receipt's selected matrices and consuming
+nodes when using a different export. No match fails instead of writing a
+purportedly quantized model.
+
+This changes numerical weights; it is **not lossless** or a qualified default.
+Choosing MLP layers is a hypothesis, not evidence that they are insensitive.
+Activations and MatMul operators stay FP16; weights are restored using standard
+ONNX operators. This is a storage experiment, not an INT8 compute speedup, and
+can increase loading/runtime cost or memory. Per-matrix weight errors in the
+receipt do not establish mask accuracy. Compare fixed prompts, candidate mask
+selection, propagation, memory and warmed timings on each target provider, then
+validate on held-out cases before adopting a candidate. Output must be a new
+folder outside the source directory; deployed models are never selected
+automatically.
+
 ## License
 
 See [LICENSE](LICENSE).
